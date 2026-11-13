@@ -342,9 +342,8 @@ fn navigation(root: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette, rect: Rect) 
         }
     }
     if !overflow.is_empty() {
-        let current = overflow.iter().find(|t| t.id == cx.s.page);
-        let active = current.is_some();
-        let more = Tab { id: "more", title: current.map_or("More", |t| t.title), icon: current.map_or(Icon::More, |t| t.icon) };
+        let more = Tab { id: "more", title: "More", icon: Icon::More };
+        let active = overflow.iter().any(|t| t.id == cx.s.page);
         let r = tab(ui, p, &more, active, width, icons_only);
         let popup = ui.make_persistent_id("more-pages");
         egui::Popup::from_toggle_button_response(&r)
