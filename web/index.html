@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>rproxy</title>
+<style>html,body{margin:0;overflow:hidden}canvas{position:fixed;inset:0;width:100%;height:100%;display:block}#runway{height:1000vh}body{background:#f3f4f7;color:#1c212a;font:14px system-ui}@media (prefers-color-scheme:dark){body{background:#111317;color:#e6e9ef}}#status{position:fixed;top:1em;left:1em}</style>
+<canvas id="app" aria-label="rproxy"></canvas><div id="runway" aria-hidden="true"></div><div id="status" role="status">Loading rproxy…</div>
+<script type="module">
+import init, { start } from "./rproxy_remote.js";
+// Programmatic page scrolling (assistive tools, automation) becomes a wheel
+// event over the middle of the canvas, where the page content scrolls.
+// Real wheel events go to the canvas directly and never scroll the page.
+const canvas = document.getElementById("app");
+const middle = () => Math.round(window.innerHeight * 4.5);
+window.scrollTo(0, middle());
+window.addEventListener("scroll", () => {
+  const delta = window.scrollY - middle();
+  if (delta === 0) return;
+  window.scrollTo(0, middle());
+  const [x, y] = [window.innerWidth / 2, window.innerHeight / 2];
+  canvas.dispatchEvent(new WheelEvent("wheel", { clientX: x, clientY: y, deltaY: delta, deltaMode: 0, bubbles: true, cancelable: true }));
+});
+window.addEventListener("resize", () => window.scrollTo(0, middle()));
+try { await init(); await start(canvas); }
+catch (error) { document.getElementById("status").textContent = "Could not open rproxy. " + error; }
+</script></html>

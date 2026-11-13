@@ -1,0 +1,13 @@
+[package]
+name = "plugin-inbounds"
+version = "0.2.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rproxy-kernel = { path = "../../crates/kernel" }
+plugin-servers = { path = "../servers" }
+plugin-subscriptions = { path = "../subscriptions" }
+serde = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }

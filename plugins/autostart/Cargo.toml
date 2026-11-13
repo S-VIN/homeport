@@ -1,0 +1,8 @@
+[package]
+name = "plugin-autostart"
+version = "0.2.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rproxy-kernel = { path = "../../crates/kernel" }

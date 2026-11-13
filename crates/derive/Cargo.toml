@@ -1,0 +1,13 @@
+[package]
+name = "rproxy-derive"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Derive relational table mappings for rproxy"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+quote = "1.0.47"
+syn = "3"

@@ -1,0 +1,13 @@
+[package]
+name = "plugin-auto-select"
+version = "0.2.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rproxy-kernel = { path = "../../crates/kernel" }
+plugin-servers = { path = "../servers" }
+plugin-health-checks = { path = "../health-checks" }
+plugin-subscriptions = { path = "../subscriptions" }
+serde = { workspace = true }
+tokio = { workspace = true }

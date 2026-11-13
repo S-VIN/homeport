@@ -1,0 +1,34 @@
+{
+	admin off
+	http_port {$HTTP_PORT}
+	https_port {$HTTPS_PORT}
+	default_bind {$CADDY_BIND}
+	email "{$ACME_EMAIL}"
+}
+
+https://{$RPROXY_PANEL_DOMAIN}:{$HTTPS_PORT}, https://{$RPROXY_AUTH_DOMAIN}:{$HTTPS_PORT} {
+	# HTTP-01 leaves TCP 443 available for VLESS/REALITY.
+	tls {
+		issuer acme {
+			disable_tlsalpn_challenge
+		}
+	}
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy same-origin
+		X-Frame-Options DENY
+	}
+
+	@auth host {$RPROXY_AUTH_DOMAIN}
+	handle @auth {
+		reverse_proxy 127.0.0.1:{$TINYAUTH_PORT}
+	}
+	handle {
+		forward_auth 127.0.0.1:{$TINYAUTH_PORT} {
+			uri /api/auth/caddy
+		}
+		reverse_proxy 127.0.0.1:{$RPROXY_UI_PORT} {
+			stream_timeout {$WS_MAX_DURATION}
+		}
+	}
+}

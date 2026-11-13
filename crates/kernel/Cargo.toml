@@ -1,0 +1,23 @@
+[package]
+name = "rproxy-kernel"
+version = "0.2.0"
+edition = "2021"
+publish = false
+description = "rproxy kernel: plugins, state, ops, events, UI zones and the mihomo core"
+
+[dependencies]
+rproxy-derive = { path = "../derive" }
+rproxy-kit = { path = "../kit" }
+rproxy-mihomo = { path = "../mihomo" }
+egui = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { version = "0.7.20", features = ["rt"] }
+futures-util = { workspace = true }
+rusqlite = { version = "0.42", features = ["bundled", "fallible_uint"] }
+uuid = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,95 @@
+name: Desktop application
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  web:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !/assets/mihomo/*/*/
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: .cache/wasm-bindgen
+      - run: python3 scripts/build.py --web-only
+      - uses: actions/upload-artifact@v7
+        with:
+          name: web-painter
+          path: web/pkg
+          if-no-files-found: error
+          retention-days: 7
+  build:
+    needs: web
+    name: ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: linux, arch: x64, runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu}
+          - {os: linux, arch: arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu}
+          - {os: win32, arch: x64, runner: windows-latest, target: x86_64-pc-windows-msvc}
+          - {os: win32, arch: arm64, runner: windows-11-arm, target: aarch64-pc-windows-msvc}
+          - {os: darwin, arch: x64, runner: macos-26-intel, target: x86_64-apple-darwin}
+          - {os: darwin, arch: arm64, runner: macos-26, target: aarch64-apple-darwin}
+    env:
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !/assets/mihomo/*/*/
+            /assets/mihomo/${{ matrix.os }}/${{ matrix.arch }}/
+      - name: Rust target
+        run: rustup target add ${{ matrix.target }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v8
+        with:
+          name: web-painter
+          path: web/pkg
+      - name: Linux dependencies
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libxcursor-dev libxrandr-dev libgl1-mesa-dev libegl1-mesa-dev \
+            flatpak flatpak-builder imagemagick zstd
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Windows installer tools
+        if: matrix.os == 'win32'
+        shell: pwsh
+        run: choco install nsis --no-progress -y
+      - name: Build
+        run: python scripts/build.py --native-only --release
+      - name: Packages
+        run: python scripts/package.py --os ${{ matrix.os }} --arch ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rproxy-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            dist/*.exe
+            dist/*.zip
+            dist/*.dmg
+            dist/*.AppImage
+            dist/*.flatpak
+            dist/*.pkg.tar.zst
+            dist/*-SHA256SUMS.txt
+          if-no-files-found: error
+          # Installers and archives are already compressed.
+          compression-level: 0

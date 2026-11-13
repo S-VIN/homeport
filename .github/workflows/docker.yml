@@ -1,0 +1,103 @@
+name: Docker image
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+  packages: write
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  IMAGE_NAME: ghcr.io/s-vin/rproxy
+jobs:
+  build:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: amd64, core: x64, runner: ubuntu-24.04}
+          - {arch: arm64, core: arm64, runner: ubuntu-24.04-arm}
+    outputs:
+      tags: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !/assets/mihomo/*/*/
+            /assets/mihomo/linux/${{ matrix.core }}/
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=sha
+      - id: image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+          cache-to: type=gha,scope=docker-${{ matrix.arch }},mode=max
+      - name: Export image digest
+        shell: python
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          import os
+          from pathlib import Path
+          Path('digests').mkdir()
+          Path('digests', os.environ['IMAGE_DIGEST'].removeprefix('sha256:')).touch()
+      - uses: actions/upload-artifact@v7
+        with:
+          name: image-digest-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 7
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: image-digest-*
+          path: digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish multi-platform image
+        shell: python
+        env:
+          IMAGE_TAGS: ${{ needs.build.outputs.tags }}
+        run: |
+          import os
+          import subprocess
+          from pathlib import Path
+          command = ['docker', 'buildx', 'imagetools', 'create']
+          for tag in os.environ['IMAGE_TAGS'].splitlines():
+              command += ['--tag', tag]
+          command += [f"{os.environ['IMAGE_NAME']}@sha256:{p.name}" for p in sorted(Path('digests').iterdir())]
+          subprocess.run(command, check=True)

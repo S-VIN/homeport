@@ -1,0 +1,3 @@
+# Vendored executable bytes must survive checkout unchanged on every platform.
+/assets/mihomo/**/mihomo binary
+/assets/mihomo/**/mihomo.exe binary

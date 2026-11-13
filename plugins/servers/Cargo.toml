@@ -1,0 +1,10 @@
+[package]
+name = "plugin-servers"
+version = "0.2.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rproxy-kernel = { path = "../../crates/kernel" }
+serde = { workspace = true }
+serde_json = { workspace = true }

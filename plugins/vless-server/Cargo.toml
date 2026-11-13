@@ -1,0 +1,25 @@
+[package]
+name = "plugin-vless-server"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rproxy-kernel = { path = "../../crates/kernel" }
+plugin-servers = { path = "../servers" }
+plugin-routing = { path = "../routing" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+futures-util = { workspace = true }
+rustls-acme = { version = "0.15.4", default-features = false, features = ["ring", "tls12", "webpki-roots"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem", "crypto"] }
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+getrandom = "0.4"
+base64 = "0.23"
+hyper = { version = "1.12", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1.21", features = ["tokio", "server-auto"] }
+http-body-util = "0.1.5"
+bytes = "1.12"

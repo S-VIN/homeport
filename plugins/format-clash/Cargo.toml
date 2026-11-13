@@ -1,0 +1,12 @@
+[package]
+name = "plugin-format-clash"
+version = "0.2.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rproxy-kernel = { path = "../../crates/kernel" }
+plugin-servers = { path = "../servers" }
+plugin-subscriptions = { path = "../subscriptions" }
+serde_json = { workspace = true }
+serde_yaml_ng = "0.10.0"
