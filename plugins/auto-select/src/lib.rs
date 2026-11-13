@@ -27,6 +27,7 @@ pub static PLUGIN: Plugin = Plugin {
     requires: &["servers", "health-checks", "subscriptions"],
     required: false,
     default_enabled: true,
+    platforms: Platform::ALL,
     setup,
 };
 
@@ -374,6 +375,15 @@ async fn failed_over(cx: &Cx, w: &World, p: &Policy, current: Id) -> Option<Id> 
     (id != current && p.auto.backups.contains(&id)).then_some(id)
 }
 
+/// What to do about the current server.
+enum Verdict {
+    Stay,
+    /// Look for a server whose value is above the given one.
+    Search(Reason, f64),
+    /// mihomo already failed over from the first server to the second.
+    Adopt(Id, Id),
+}
+
 async fn decide(cx: Cx, trigger: Trigger) -> Result<()> {
     let w = World::new(cx.snapshot());
     let time = now();
@@ -402,126 +412,13 @@ async fn decide(cx: Cx, trigger: Trigger) -> Result<()> {
             m.better_runs = 0;
         }
     }
-    let mut above = 0.;
-    let current = w.current().cloned();
-    let reason = match &current {
-        // Retry an empty connection with backoff; events (new servers, a check) retry at once.
-        None => (!watch || time >= p.auto.retry_at).then_some(Reason::Empty),
-        Some(c) if w.excluded(c) => {
-            p.auto.next_check = time + CHECK_INTERVAL;
-            (!watch || time >= p.auto.retry_at).then_some(Reason::Failure)
-        }
-        Some(c) => match &trigger {
-            Trigger::Enabled | Trigger::Priorities => {
-                above = p.value(&w, c) + MARGIN;
-                Some(if matches!(trigger, Trigger::Enabled) { Reason::Enabled } else { Reason::Priorities })
+    match verdict(&cx, &w, &mut p, &trigger, time).await? {
+        Verdict::Stay => {}
+        Verdict::Adopt(from, backup) => return adopt(&cx, &w, p, from, backup).await,
+        Verdict::Search(reason, above) => {
+            if search(&cx, &w, &mut p, reason, above).await? {
+                return Ok(());
             }
-            Trigger::Checked(_) => {
-                above = p.value(&w, c) + MARGIN;
-                let ahead = p.candidates(&w, time, above, false, w.selected);
-                for s in &w.servers {
-                    let m = p.memory(s.id);
-                    m.better_runs = if ahead.contains(&s.id) { m.better_runs.saturating_add(1) } else { 0 };
-                }
-                if std::mem::take(&mut p.auto.provisional) {
-                    Some(Reason::Refined)
-                } else {
-                    p.may_switch(time, 3600).then_some(Reason::Improvement)
-                }
-            }
-            Trigger::Watch => {
-                if p.auto.watched != Some(c.id) {
-                    p.reset_watch(Some(c.id), time);
-                }
-                // A passing probe also tells mihomo the server is alive again (same URL),
-                // so only a failed one confirms a failover that mihomo made.
-                let q = quick(&cx, c.id).await;
-                cx.checkpoint()?;
-                if !q.as_ref().is_some_and(|q| q.passed()) {
-                    if let Some(backup) = failed_over(&cx, &w, &p, c.id).await {
-                        return adopt(&cx, &w, p, c.id, backup).await;
-                    }
-                }
-                let time = now();
-                match q.filter(|q| q.passed()) {
-                    Some(q) => {
-                        p.auto.failures = 0;
-                        if time < p.auto.next_check {
-                            None
-                        } else {
-                            p.auto.next_check = time + CHECK_INTERVAL;
-                            let rating = f64::from(q.health.rating.unwrap_or(0));
-                            p.auto.degradations = if rating < p.score(&w, c) - 20. { p.auto.degradations.saturating_add(1) } else { 0 };
-                            if p.auto.degradations >= 2 && p.may_switch(time, 900) {
-                                let ideal = q.results.iter().all(|r| r.passed) && q.health.bytes_per_sec.unwrap_or(0) >= health::FULL_SPEED;
-                                above = rating + if ideal { 1000. * (w.level(c) + 1) as f64 } else { 0. } + MARGIN;
-                                Some(Reason::Degradation)
-                            } else {
-                                None
-                            }
-                        }
-                    }
-                    None => {
-                        p.auto.failures = p.auto.failures.saturating_add(1);
-                        p.auto.degradations = 0;
-                        (p.auto.failures >= FAILURES && time >= p.auto.retry_at).then_some(Reason::Failure)
-                    }
-                }
-            }
-            Trigger::Servers => None,
-        },
-    };
-    if let Some(reason) = reason {
-        let mut candidates = p.candidates(&w, now(), above, reason.urgent(), w.selected);
-        if matches!(reason, Reason::Improvement) {
-            candidates.retain(|id| p.memory.iter().any(|m| m.id == *id && m.better_runs >= 2));
-        }
-        // Urgent searches go through every candidate, a batch at a time; others try the best batch.
-        let limit = if reason.urgent() { candidates.len() } else { candidates.len().min(BATCH) };
-        let mut failed = Vec::new();
-        for batch in candidates[..limit].chunks(BATCH) {
-            let mut probes = Probes::start(&cx, batch);
-            let mut from = 0;
-            while let Some(i) = cx.or_cancel(probes.next(from)).await? {
-                failed.extend(batch[from..i].iter().copied());
-                from = i + 1;
-                let id = batch[i];
-                let latest = World::new(cx.snapshot());
-                if !cx.get(&AUTO).enabled || latest.selected != w.selected {
-                    return Ok(());
-                }
-                if cx.call(Select { id: Some(id), auto: true }).await.is_err() {
-                    failed.push(id);
-                    continue;
-                }
-                drop(probes);
-                let mut next = p.clone();
-                next.switched(w.selected, id, reason, &failed, now());
-                let after = World { selected: Some(id), ..World::new(cx.snapshot()) };
-                next.auto.backups = next.backups(&after, now(), Some(id));
-                next.auto.provisional = after.rating(id).is_none();
-                if next.auto.provisional {
-                    // Rate everything soon so the provisional choice can be refined.
-                    let _ = cx.spawn(health::CheckAll);
-                }
-                return save(&cx, &after, next).await;
-            }
-            failed.extend(batch[from..].iter().copied());
-        }
-        if reason.urgent() {
-            // Nothing answered (often the network itself): keep what is connected
-            // (its fallback group still works) and retry with backoff.
-            p.auto.misses = p.auto.misses.saturating_add(1);
-            let wait = backoff(p.auto.misses);
-            p.auto.retry_at = now() + wait;
-            p.auto.last_reason = Some(if candidates.is_empty() {
-                "No eligible server: check subscriptions and filters".into()
-            } else {
-                format!("No server answers; retrying in {wait} s")
-            });
-        }
-        if matches!(reason, Reason::Degradation) {
-            p.auto.degradations = 0;
         }
     }
     // Keep the backups current. Their order is the fallback group's, so change it
@@ -534,6 +431,133 @@ async fn decide(cx: Cx, trigger: Trigger) -> Result<()> {
         p.auto.backups = p.backups(&w, time, w.selected);
     }
     save(&cx, &w, p).await
+}
+
+/// Whether the trigger is a reason to look for another server.
+async fn verdict(cx: &Cx, w: &World, p: &mut Policy, trigger: &Trigger, time: u64) -> Result<Verdict> {
+    let watch = matches!(trigger, Trigger::Watch);
+    let Some(c) = w.current().cloned() else {
+        // Retry an empty connection with backoff; events (new servers, a check) retry at once.
+        return Ok(if !watch || time >= p.auto.retry_at { Verdict::Search(Reason::Empty, 0.) } else { Verdict::Stay });
+    };
+    if w.excluded(&c) {
+        p.auto.next_check = time + CHECK_INTERVAL;
+        return Ok(if !watch || time >= p.auto.retry_at { Verdict::Search(Reason::Failure, 0.) } else { Verdict::Stay });
+    }
+    let above = p.value(w, &c) + MARGIN;
+    Ok(match trigger {
+        Trigger::Enabled => Verdict::Search(Reason::Enabled, above),
+        Trigger::Priorities => Verdict::Search(Reason::Priorities, above),
+        Trigger::Checked(_) => {
+            let ahead = p.candidates(w, time, above, false, w.selected);
+            for s in &w.servers {
+                let m = p.memory(s.id);
+                m.better_runs = if ahead.contains(&s.id) { m.better_runs.saturating_add(1) } else { 0 };
+            }
+            if std::mem::take(&mut p.auto.provisional) {
+                Verdict::Search(Reason::Refined, above)
+            } else if p.may_switch(time, 3600) {
+                Verdict::Search(Reason::Improvement, above)
+            } else {
+                Verdict::Stay
+            }
+        }
+        Trigger::Watch => watch_current(cx, w, p, &c, time).await?,
+        Trigger::Servers => Verdict::Stay,
+    })
+}
+
+/// The periodic check of the connected server: is it alive, and still good?
+async fn watch_current(cx: &Cx, w: &World, p: &mut Policy, c: &Server, time: u64) -> Result<Verdict> {
+    if p.auto.watched != Some(c.id) {
+        p.reset_watch(Some(c.id), time);
+    }
+    // A passing probe also tells mihomo the server is alive again (same URL),
+    // so only a failed one confirms a failover that mihomo made.
+    let q = quick(cx, c.id).await;
+    cx.checkpoint()?;
+    if !q.as_ref().is_some_and(|q| q.passed()) {
+        if let Some(backup) = failed_over(cx, w, p, c.id).await {
+            return Ok(Verdict::Adopt(c.id, backup));
+        }
+    }
+    let time = now();
+    let Some(q) = q.filter(|q| q.passed()) else {
+        p.auto.failures = p.auto.failures.saturating_add(1);
+        p.auto.degradations = 0;
+        let failed = p.auto.failures >= FAILURES && time >= p.auto.retry_at;
+        return Ok(if failed { Verdict::Search(Reason::Failure, 0.) } else { Verdict::Stay });
+    };
+    p.auto.failures = 0;
+    if time < p.auto.next_check {
+        return Ok(Verdict::Stay);
+    }
+    p.auto.next_check = time + CHECK_INTERVAL;
+    let rating = f64::from(q.health.rating.unwrap_or(0));
+    p.auto.degradations = if rating < p.score(w, c) - 20. { p.auto.degradations.saturating_add(1) } else { 0 };
+    if p.auto.degradations < 2 || !p.may_switch(time, 900) {
+        return Ok(Verdict::Stay);
+    }
+    let ideal = q.results.iter().all(|r| r.passed) && q.health.bytes_per_sec.unwrap_or(0) >= health::FULL_SPEED;
+    Ok(Verdict::Search(Reason::Degradation, rating + if ideal { 1000. * (w.level(c) + 1) as f64 } else { 0. } + MARGIN))
+}
+
+/// Probe candidates above `above` and switch to the first that answers.
+/// True when the decision is finished (switched and saved, or overtaken).
+async fn search(cx: &Cx, w: &World, p: &mut Policy, reason: Reason, above: f64) -> Result<bool> {
+    let mut candidates = p.candidates(w, now(), above, reason.urgent(), w.selected);
+    if matches!(reason, Reason::Improvement) {
+        candidates.retain(|id| p.memory.iter().any(|m| m.id == *id && m.better_runs >= 2));
+    }
+    // Urgent searches go through every candidate, a batch at a time; others try the best batch.
+    let limit = if reason.urgent() { candidates.len() } else { candidates.len().min(BATCH) };
+    let mut failed = Vec::new();
+    for batch in candidates[..limit].chunks(BATCH) {
+        let mut probes = Probes::start(cx, batch);
+        let mut from = 0;
+        while let Some(i) = cx.or_cancel(probes.next(from)).await? {
+            failed.extend(batch[from..i].iter().copied());
+            from = i + 1;
+            let id = batch[i];
+            let latest = World::new(cx.snapshot());
+            if !cx.get(&AUTO).enabled || latest.selected != w.selected {
+                return Ok(true);
+            }
+            if cx.call(Select { id: Some(id), auto: true }).await.is_err() {
+                failed.push(id);
+                continue;
+            }
+            drop(probes);
+            let mut next = p.clone();
+            next.switched(w.selected, id, reason, &failed, now());
+            let after = World { selected: Some(id), ..World::new(cx.snapshot()) };
+            next.auto.backups = next.backups(&after, now(), Some(id));
+            next.auto.provisional = after.rating(id).is_none();
+            if next.auto.provisional {
+                // Rate everything soon so the provisional choice can be refined.
+                let _ = cx.spawn(health::CheckAll);
+            }
+            save(cx, &after, next).await?;
+            return Ok(true);
+        }
+        failed.extend(batch[from..].iter().copied());
+    }
+    if reason.urgent() {
+        // Nothing answered (often the network itself): keep what is connected
+        // (its fallback group still works) and retry with backoff.
+        p.auto.misses = p.auto.misses.saturating_add(1);
+        let wait = backoff(p.auto.misses);
+        p.auto.retry_at = now() + wait;
+        p.auto.last_reason = Some(if candidates.is_empty() {
+            "No eligible server: check subscriptions and filters".into()
+        } else {
+            format!("No server answers; retrying in {wait} s")
+        });
+    }
+    if matches!(reason, Reason::Degradation) {
+        p.auto.degradations = 0;
+    }
+    Ok(false)
 }
 
 /// mihomo already moved traffic to `backup`: make it the selection.

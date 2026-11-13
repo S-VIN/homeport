@@ -62,6 +62,37 @@ impl Store {
             conn: Arc::new(Mutex::new(conn)),
         })
     }
+    /// Write a consistent copy of the whole database to `path` (must not exist).
+    pub fn backup_to(&self, path: &Path) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| Error::new("storage", "Database lock poisoned"))?;
+        let target = path
+            .to_str()
+            .ok_or_else(|| Error::msg("Backup path is not valid UTF-8."))?;
+        conn.execute("VACUUM INTO ?1", [target]).map_err(db)?;
+        Ok(())
+    }
+    /// Replace the whole database with the copy at `path`. The copy must be an
+    /// rproxy database; nothing changes when it is not.
+    pub fn restore_from(&self, path: &Path) -> Result<()> {
+        let src = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(db)?;
+        let ours: bool = src
+            .query_row("SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'kernel_plugins'", [], |r| r.get(0))
+            .map_err(db)?;
+        if !ours {
+            return Err(Error::msg("This file is not an rproxy backup."));
+        }
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| Error::new("storage", "Database lock poisoned"))?;
+        rusqlite::backup::Backup::new(&src, &mut conn)
+            .and_then(|b| b.run_to_completion(256, std::time::Duration::ZERO, None))
+            .map_err(db)
+    }
     /// Register at startup before serving requests. A failed upgrade leaves the old data intact.
     pub fn register<T: Table + DeserializeOwned>(&self) -> Result<()> {
         let mut conn = self

@@ -109,11 +109,17 @@ docker compose up -d
 
 **Actions → Docker image → Run workflow** публикует
 `ghcr.io/s-vin/rproxy:latest` для `linux/amd64` и `linux/arm64`.
-Тег `v0.2.0` публикует версионный тег `0.2.0`. Каждый образ содержит свой
+Тег `v0.2.0` публикует версионный тег `0.2.0` (и `latest`). Каждый образ содержит свой
 проверенный бинарник mihomo из Git; скачивания mihomo при сборке нет.
 Архитектуры собираются параллельно на нативных x64/ARM64 runners с отдельными
 кэшами слоёв. После успеха обеих сборок публикуется общий multi-platform тег.
-Workflow не запускает тесты и не собирает дополнительный тестовый образ.
+Тесты и Clippy выполняет workflow `Desktop application`; Docker workflow их не повторяет.
+
+`docker/Dockerfile` собирает в одном build-этапе WASM-клиент и серверный бинарник
+(`--no-default-features`, без символов), выбирает ядро по `TARGETARCH` и копирует
+в `debian:bookworm-slim` только бинарник, ядро и его лицензию. Cache mounts хранят
+реестр Cargo, `target/` и wasm-bindgen между локальными сборками; в GitHub Actions
+переиспользуются только слои из кэша `gha`.
 
 Для скачивания образа без входа сделайте пакет публичным в GitHub Packages.
 Для приватного пакета выполните на VDS `docker login ghcr.io` с токеном,
@@ -129,6 +135,8 @@ python3 -m venv /tmp/rproxy-tests
 /tmp/rproxy-tests/bin/pip install aiohttp
 /tmp/rproxy-tests/bin/python scripts/test-docker-auth.py
 ```
+
+Без плагина `docker compose` укажите отдельный бинарник Compose: `COMPOSE_BIN=/путь/docker-compose`.
 
 Тест запускает настоящий Compose с временными данными, произвольными
 loopback-портами и локальным CA. Проверяет вход, неверный пароль, защиту

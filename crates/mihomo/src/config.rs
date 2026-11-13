@@ -45,6 +45,12 @@ pub enum Rule {
     IpCidr { net: IpNet, target: Target, no_resolve: bool },
     GeoIp(String, Target),
     InName(String, Target),
+    /// Match a [`RuleProvider`] by name. IP sets resolve domains unless `no_resolve`.
+    RuleSet {
+        name: String,
+        target: Target,
+        no_resolve: bool,
+    },
 }
 impl Rule {
     pub fn wire(&self) -> String {
@@ -61,6 +67,17 @@ impl Rule {
             }
             Self::GeoIp(c, t) => format!("GEOIP,{c},{}", t.wire()),
             Self::InName(n, t) => format!("IN-NAME,{n},{}", t.wire()),
+            Self::RuleSet {
+                name,
+                target,
+                no_resolve,
+            } => {
+                format!(
+                    "RULE-SET,{name},{}{}",
+                    target.wire(),
+                    if *no_resolve { ",no-resolve" } else { "" }
+                )
+            }
         }
     }
     fn target(&self) -> &Target {
@@ -72,7 +89,7 @@ impl Rule {
             | Self::DomainRegex(_, t)
             | Self::GeoIp(_, t)
             | Self::InName(_, t) => t,
-            Self::IpCidr { target, .. } => target,
+            Self::IpCidr { target, .. } | Self::RuleSet { target, .. } => target,
         }
     }
 }
@@ -157,6 +174,30 @@ pub struct Dns {
     pub nameservers: Vec<String>,
 }
 
+/// What a rule set contains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuleBehavior {
+    Domain,
+    IpCidr,
+}
+/// A rule set downloaded and refreshed by the core (mihomo `rule-providers`).
+/// Files are kept in the core's home folder (`rules/<name>.mrs`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuleProvider {
+    pub name: String,
+    pub behavior: RuleBehavior,
+    /// URL of a binary `.mrs` rule set.
+    pub url: String,
+    pub interval_secs: u32,
+}
+
+/// Capture all traffic of the machine through a virtual interface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tun {
+    /// Block traffic that would bypass the tunnel (Linux, Windows).
+    pub strict_route: bool,
+}
+
 /// One plugin's contribution.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Fragment {
@@ -167,6 +208,9 @@ pub struct Fragment {
     pub dns: Option<Dns>,
     /// Detect domains from TLS/HTTP/QUIC so domain rules match connections by IP.
     pub sniff: bool,
+    pub rule_providers: Vec<RuleProvider>,
+    /// At most one plugin may turn the tunnel on.
+    pub tun: Option<Tun>,
 }
 impl Fragment {
     pub fn rules(stage: Stage, rules: impl IntoIterator<Item = Rule>) -> Self {
@@ -192,6 +236,8 @@ pub struct Config {
     pub listeners: Vec<Listener>,
     pub dns: Option<Dns>,
     pub sniff: bool,
+    pub rule_providers: Vec<RuleProvider>,
+    pub tun: Option<Tun>,
 }
 
 impl Config {
@@ -227,10 +273,27 @@ impl Config {
                 cfg.dns = Some(dns);
             }
             cfg.sniff |= f.sniff;
+            if let Some(t) = f.tun {
+                if cfg.tun.is_some() {
+                    return Err(format!(
+                        "{owner}: the tunnel is already configured by another plugin"
+                    ));
+                }
+                cfg.tun = Some(t);
+            }
+            for p in f.rule_providers {
+                match cfg.rule_providers.iter().find(|o| o.name == p.name) {
+                    Some(o) if *o == p => {}
+                    Some(_) => {
+                        return Err(format!("{owner}: rule set {} is defined twice", p.name))
+                    }
+                    None => cfg.rule_providers.push(p),
+                }
+            }
             cfg.proxies.extend(f.proxies);
             cfg.groups.extend(f.groups);
             for l in f.listeners {
-                if reserved(&l.name, "checks") {
+                if reserved(&l.name, "checks") || l.name == ROUTED {
                     return Err(format!("{owner}: listener name {} is reserved", l.name));
                 }
                 if let Some(other) = cfg.listeners.iter().find(|o| o.port == l.port && overlaps(o.listen, l.listen)) {
@@ -256,6 +319,9 @@ impl Config {
         };
         if let Some(r) = cfg.rules.iter().find(|r| !known(r.target())) {
             return Err(format!("A rule references an unknown target: {}", r.wire()));
+        }
+        if let Some(r) = cfg.rules.iter().find(|r| matches!(r, Rule::RuleSet { name, .. } if !cfg.rule_providers.iter().any(|p| p.name == *name))) {
+            return Err(format!("A rule references an unknown rule set: {}", r.wire()));
         }
         for p in &cfg.proxies {
             if let Some(via) = p.options.get("dialer-proxy") {
@@ -296,6 +362,10 @@ pub fn overlaps(a: IpAddr, b: IpAddr) -> bool {
     a == b || a.is_unspecified() || b.is_unspecified()
 }
 
+/// The kernel's own SOCKS listener that follows the ordinary rules, for the
+/// app's downloads that should go where user traffic goes.
+pub const ROUTED: &str = "routed";
+
 /// Kernel-owned additions: isolated check lanes. Lane `i` is the SOCKS listener
 /// `checks-i` on `check_ports[i]`, routed to the select group `test-i`.
 pub struct System<'a> {
@@ -304,6 +374,8 @@ pub struct System<'a> {
     pub check_password: &'a str,
     /// Current target of every lane (same length as `check_ports`).
     pub check_targets: &'a [Option<Target>],
+    /// Port of the [`ROUTED`] listener (same login as the lanes); `None` = no listener.
+    pub routed_port: Option<u16>,
 }
 
 pub fn render(cfg: &Config, sys: &System<'_>, listeners: &[&Listener]) -> Value {
@@ -373,6 +445,12 @@ pub fn render(cfg: &Config, sys: &System<'_>, listeners: &[&Listener]) -> Value 
             "users": [{"username": "check", "password": sys.check_password}]}));
         rules.push(format!("IN-NAME,checks-{lane},test-{lane}"));
     }
+    if let Some(port) = sys.routed_port {
+        ls.push(
+            json!({"name": ROUTED, "type": "socks", "listen": "127.0.0.1", "port": port,
+            "users": [{"username": "check", "password": sys.check_password}]}),
+        );
+    }
     for l in listeners {
         let kind = match &l.kind {
             ListenerKind::Mixed => "mixed",
@@ -407,7 +485,31 @@ pub fn render(cfg: &Config, sys: &System<'_>, listeners: &[&Listener]) -> Value 
         "profile": {"store-selected": false, "store-fake-ip": false},
         "proxies": proxies, "proxy-groups": groups, "listeners": ls, "rules": rules,
     });
-    root.as_object_mut().unwrap().extend(sys.controller.as_object().unwrap().clone());
+    root.as_object_mut()
+        .unwrap()
+        .extend(sys.controller.as_object().unwrap().clone());
+    if !cfg.rule_providers.is_empty() {
+        let providers: serde_json::Map<String, Value> = cfg
+            .rule_providers
+            .iter()
+            .map(|p| {
+                let behavior = match p.behavior {
+                    RuleBehavior::Domain => "domain",
+                    RuleBehavior::IpCidr => "ipcidr",
+                };
+                let v = json!({"type": "http", "behavior": behavior, "format": "mrs", "url": p.url,
+                    "path": format!("rules/{}.mrs", p.name), "interval": p.interval_secs, "proxy": "DIRECT"});
+                (p.name.clone(), v)
+            })
+            .collect();
+        root["rule-providers"] = Value::Object(providers);
+    }
+    if let Some(t) = &cfg.tun {
+        root["tun"] = json!({
+            "enable": true, "stack": "mixed", "auto-route": true, "auto-detect-interface": true,
+            "strict-route": t.strict_route, "dns-hijack": ["any:53", "tcp://any:53"],
+        });
+    }
     if cfg.sniff {
         root["sniffer"] = json!({
             "enable": true, "parse-pure-ip": true,
@@ -495,7 +597,13 @@ mod tests {
             ..Default::default()
         };
         let cfg = Config::compose([("servers", f)]).unwrap();
-        let sys = System { controller: &json!({"external-controller-unix": "/s"}), check_ports: &[], check_password: "p", check_targets: &[] };
+        let sys = System {
+            controller: &json!({"external-controller-unix": "/s"}),
+            check_ports: &[],
+            check_password: "p",
+            check_targets: &[],
+            routed_port: None,
+        };
         let doc = render(&cfg, &sys, &[]);
         let main = &doc["proxy-groups"][0];
         assert_eq!(main["type"], "fallback");
@@ -510,7 +618,13 @@ mod tests {
     fn check_lanes_have_own_listener_group_and_rule() {
         let cfg = Config::compose([("servers", Fragment { proxies: vec![proxy("a"), proxy("b")], ..Default::default() })]).unwrap();
         let targets = [None, Some(Target::Proxy("b".into()))];
-        let sys = System { controller: &json!({"external-controller-unix": "/s"}), check_ports: &[1001, 1002], check_password: "p", check_targets: &targets };
+        let sys = System {
+            controller: &json!({"external-controller-unix": "/s"}),
+            check_ports: &[1001, 1002],
+            check_password: "p",
+            check_targets: &targets,
+            routed_port: None,
+        };
         let doc = render(&cfg, &sys, &[]);
         let groups = doc["proxy-groups"].as_array().unwrap();
         assert_eq!(groups[0]["name"], "test-0");

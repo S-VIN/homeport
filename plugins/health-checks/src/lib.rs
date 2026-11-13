@@ -28,6 +28,7 @@ pub static PLUGIN: Plugin = Plugin {
     requires: &["servers"],
     required: false,
     default_enabled: true,
+    platforms: Platform::ALL,
     setup,
 };
 
@@ -120,20 +121,18 @@ pub static CONFIG: State<Settings> = State::new("health-checks.settings");
 pub static CHECKING: State<bool> = State::new("health-checks.checking");
 
 /// Servers being measured right now (rows show a spinner).
-static IN_FLIGHT: std::sync::Mutex<Vec<Id>> = std::sync::Mutex::new(Vec::new());
-pub fn checking(server: Id) -> bool {
-    IN_FLIGHT.lock().unwrap().contains(&server)
-}
-struct Flight(Id);
+pub static IN_FLIGHT: State<Vec<Id>> = State::new("health-checks.in-flight");
+/// Marks a server as being measured until dropped.
+struct Flight(Cx, Id);
 impl Flight {
-    fn start(id: Id) -> Self {
-        IN_FLIGHT.lock().unwrap().push(id);
-        Self(id)
+    fn start(cx: &Cx, id: Id) -> Self {
+        cx.update_live(&IN_FLIGHT, |l| l.push(id));
+        Self(cx.clone(), id)
     }
 }
 impl Drop for Flight {
     fn drop(&mut self) {
-        IN_FLIGHT.lock().unwrap().retain(|x| *x != self.0);
+        self.0.update_live(&IN_FLIGHT, |l| l.retain(|x| *x != self.1));
     }
 }
 
@@ -352,6 +351,7 @@ async fn check_all(cx: &Cx) -> Result<()> {
 }
 
 fn setup(p: &mut Setup) -> Result<()> {
+    p.live(&IN_FLIGHT, Vec::new);
     p.list(&TESTS).validate(|_, t, _, others| {
         let url = url::Url::parse(t.url.trim())
             .ok()
@@ -393,21 +393,16 @@ fn setup(p: &mut Setup) -> Result<()> {
             }
         };
         set(true).await?;
-        // A separate task turns a panic into an error, so the flag is always reset.
-        let result = tokio::spawn({
-            let cx = cx.clone();
-            async move { check_all(&cx).await }
-        })
-        .await
-        .unwrap_or_else(|_| Err(Error::msg("Server check crashed.")));
+        // A panic becomes an error, so the flag is always reset.
+        use futures_util::FutureExt;
+        let result = std::panic::AssertUnwindSafe(check_all(&cx)).catch_unwind().await.unwrap_or_else(|_| Err(Error::msg("Server check crashed.")));
         set(false).await?;
         result
     });
     p.handle(|cx: Cx, op: CheckServer| async move {
         let snap = cx.snapshot();
         let Some(s) = server(&snap, op.id).filter(|s| !skipped(&snap, s)) else { return Ok(None) };
-        let _flight = Flight::start(s.id);
-        cx.kernel().repaint();
+        let _flight = Flight::start(&cx, s.id);
         let (ping, results) = cx.or_cancel(measure(&cx, s.id, &probes(&snap))).await?;
         // Only configured tests are stored; the default probe only measures latency.
         let results: Vec<Measurement> = results.into_iter().filter(|m| m.test != Id::NIL).collect();
@@ -525,7 +520,7 @@ fn ui(p: &mut Setup) {
             None => {
                 kit::caption(ui, "Rating").on_hover_text("0–100 from latency, tests and speed");
             }
-            Some(s) if checking(s.id) => {
+            Some(s) if cx.live(&IN_FLIGHT).contains(&s.id) => {
                 kit::spinner(ui).on_hover_text("Checking…");
             }
             Some(s) => {
@@ -554,7 +549,7 @@ fn ui(p: &mut Setup) {
         let snap = cx.snapshot().clone();
         let pal = kit::colors(ui);
         let h = health(&snap, s.id);
-        if checking(s.id) {
+        if cx.live(&IN_FLIGHT).contains(&s.id) {
             kit::property_with(ui, "Check", |ui| {
                 kit::spinner(ui);
                 ui.label(egui::RichText::new("Checking…").color(pal.muted));

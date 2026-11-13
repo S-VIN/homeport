@@ -37,6 +37,27 @@ pub(crate) struct Service {
     pub spec: Arc<dyn Fn(&Snapshot) -> Option<Arc<dyn Any + Send + Sync>> + Send + Sync>,
     pub same: Arc<dyn Fn(&(dyn Any + Send + Sync), &(dyn Any + Send + Sync)) -> bool + Send + Sync>,
     pub run: Arc<dyn Fn(Cx, Arc<dyn Any + Send + Sync>) -> BoxFut<()> + Send + Sync>,
+    pub stop: Option<Arc<dyn Fn(Cx, Arc<dyn Any + Send + Sync>) -> BoxFut<()> + Send + Sync>>,
+}
+
+/// Returned by [`Setup::service`] to add a cleanup step.
+pub struct ServiceSetup<'a, S> {
+    service: &'a mut Service,
+    _spec: std::marker::PhantomData<fn(S)>,
+}
+impl<S: Clone + Send + Sync + 'static> ServiceSetup<'_, S> {
+    /// Undo what a run did, after it stopped: its spec changed, it was turned
+    /// off, or the app quits. The next run starts only after this finished.
+    pub fn on_stop<F, Fut>(self, f: F)
+    where
+        F: Fn(Cx, S) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.service.stop = Some(Arc::new(move |cx, s| {
+            let s = s.downcast_ref::<S>().expect("service spec type").clone();
+            Box::pin(f(cx, s))
+        }));
+    }
 }
 pub(crate) struct PageEntry {
     pub plugin: usize,
@@ -128,12 +149,12 @@ impl<'a> Setup<'a> {
     pub fn plugin_id(&self) -> &'static str {
         self.plugin.map_or("kernel", |p| self.reg.plugins[p].id)
     }
-    /// True if another plugin is enabled (for optional integrations).
     /// The app's data folder, for files a plugin must keep outside SQLite
     /// (certificates, caches). Use a subfolder named after the plugin id.
     pub fn data_dir(&self) -> std::path::PathBuf {
         self.reg.data_dir.clone()
     }
+    /// True if another plugin is enabled (for optional integrations).
     pub fn enabled(&self, plugin: &str) -> bool {
         self.reg.plugin_index(plugin).is_some()
     }
@@ -178,6 +199,14 @@ impl<'a> Setup<'a> {
     pub fn memory<T: Clone + Send + Sync + 'static>(&mut self, s: &'static State<T>, init: impl Fn() -> T + Send + Sync + 'static) {
         self.reg.declare(s.name, self.plugin);
         self.reg.memory.push((s.name, Box::new(move || Arc::new(init()) as Value)));
+    }
+    /// Live state: readings that change often and are never saved (traffic,
+    /// what is being checked right now). No transaction and no core config:
+    /// `cx.set_live` / `cx.update_live` replace it and repaint the UI; read it
+    /// with `cx.live(&S)` (or `snap.live`). Not available to `p.core`.
+    pub fn live<T: Send + Sync + 'static>(&mut self, s: &'static State<T>, init: impl Fn() -> T + Send + Sync + 'static) {
+        self.reg.declare(s.name, self.plugin);
+        self.reg.memory.push((s.name, Box::new(move || Arc::new(crate::state::Live::new(init())) as Value)));
     }
     /// Custom persistence for data that does not fit one table.
     pub fn persist<T: Send + Sync + 'static>(
@@ -276,7 +305,6 @@ impl<'a> Setup<'a> {
         let f = Arc::new(f);
         self.on(move |cx, e: crate::Changed| {
             let hit = e.states.iter().any(|s| states.contains(s));
-            let _ = &states;
             let f = f.clone();
             async move {
                 if hit {
@@ -309,13 +337,14 @@ impl<'a> Setup<'a> {
         let name = format!("{}/{name}", self.plugin_id());
         let make = Arc::new(make);
         let fallback = name.clone();
+        let last_error = Arc::new(std::sync::Mutex::new(None));
         self.reg.schedules.push(crate::setup::Schedule {
             plugin,
             name,
             every: Arc::new(every),
             task: Arc::new(move |cx| {
                 let make = make.clone();
-                cx.task_with(make().job().unwrap_or_else(|| crate::JobSpec::new(fallback.clone())), move || make())
+                cx.task_with(make().job().unwrap_or_else(|| crate::JobSpec::new(fallback.clone())), Some(last_error.clone()), move || make())
             }),
         });
     }
@@ -324,7 +353,7 @@ impl<'a> Setup<'a> {
     /// After each commit the spec is recomputed; when it changes the task is
     /// stopped and started again with the new spec. Kernel shutdown stops it.
     /// An error ends the task and is shown as a notice.
-    pub fn service<S, F, Fut>(&mut self, name: &str, spec: impl Fn(&Snapshot) -> Option<S> + Send + Sync + 'static, run: F)
+    pub fn service<S, F, Fut>(&mut self, name: &str, spec: impl Fn(&Snapshot) -> Option<S> + Send + Sync + 'static, run: F) -> ServiceSetup<'_, S>
     where
         S: Clone + PartialEq + Send + Sync + 'static,
         F: Fn(Cx, S) -> Fut + Send + Sync + 'static,
@@ -341,7 +370,9 @@ impl<'a> Setup<'a> {
                 let s = s.downcast_ref::<S>().expect("service spec type").clone();
                 Box::pin(run(cx, s))
             }),
+            stop: None,
         });
+        ServiceSetup { service: self.reg.services.last_mut().expect("just pushed"), _spec: std::marker::PhantomData }
     }
 
     // ---- UI ---------------------------------------------------------------

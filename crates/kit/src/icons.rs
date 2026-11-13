@@ -55,8 +55,8 @@ pub enum Icon {
     Link,
     Eye,
     EyeOff,
-    /// Any glyph of the Phosphor regular font (codepoint from phosphoricons.com).
-    Glyph(char),
+    /// An empty circle (something off or not chosen).
+    Circle,
 }
 
 impl Icon {
@@ -105,7 +105,7 @@ impl Icon {
             Icon::Link => ('\u{E2E2}', false),
             Icon::Eye => ('\u{E220}', false),
             Icon::EyeOff => ('\u{E224}', false),
-            Icon::Glyph(c) => (c, false),
+            Icon::Circle => ('\u{E18A}', false),
         })
     }
 }

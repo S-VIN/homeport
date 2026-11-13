@@ -133,6 +133,10 @@ impl<'a> UiCx<'a> {
     pub fn get<T: Send + Sync + 'static>(&self, s: &State<T>) -> Arc<T> {
         self.snap.get(s)
     }
+    /// The latest value of a live state (see [`Setup::live`](crate::Setup::live)).
+    pub fn live<T: Send + Sync + 'static>(&self, s: &State<T>) -> Arc<T> {
+        self.snap.live(s)
+    }
     pub fn try_get<T: Send + Sync + 'static>(&self, s: &State<T>) -> Option<Arc<T>> {
         self.snap.try_get(s)
     }
@@ -273,6 +277,10 @@ impl<'a> UiCx<'a> {
     }
     pub fn core_status(&self) -> CoreStatus {
         self.k.core.status()
+    }
+    /// Typed controller API of the running core.
+    pub fn core(&self) -> crate::core::CoreApi {
+        self.k.core_api()
     }
     /// Draw every contribution to a zone.
     pub fn slot<P: 'static>(&mut self, ui: &mut egui::Ui, slot: &Slot<P>, props: &P) {

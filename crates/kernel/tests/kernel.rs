@@ -54,6 +54,7 @@ static A: Plugin = Plugin {
     requires: &[],
     required: true,
     default_enabled: true,
+    platforms: Platform::ALL,
     setup: |p| {
         p.list(&PARENTS).validate(|_, item, _, others| {
             item.name = item.name.trim().to_owned();
@@ -85,6 +86,7 @@ static B: Plugin = Plugin {
     requires: &["a"],
     required: false,
     default_enabled: true,
+    platforms: Platform::ALL,
     setup: |p| {
         p.collection(&CHILDREN);
         p.cascade(&PARENTS, &CHILDREN, |c| c.parent);

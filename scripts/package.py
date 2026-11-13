@@ -20,6 +20,12 @@ ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / 'dist'
 APP_ID = 'io.github.rproxy.Rproxy'
 VERSION = tomllib.loads((ROOT / 'Cargo.toml').read_text())['package']['version']
+# linuxdeploy is pinned to a release; its digests come from that release's assets.
+LINUXDEPLOY = 'https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-{}.AppImage'
+LINUXDEPLOY_SHA256 = {
+    'x86_64': 'c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d',
+    'aarch64': '620095110d693282b8ebeb244a95b5e911cf8f65f76c88b4b47d16ae6346fcff',
+}
 
 
 # Native package metadata lives beside the packaging code; generated files go to dist/.
@@ -138,7 +144,15 @@ def macos(arch, name):
     run('codesign', '--force', '--sign', '-', app)
     run('codesign', '--verify', '--deep', '--strict', app)
     (image / 'Applications').symlink_to('/Applications', target_is_directory=True)
-    run('hdiutil', 'create', '-volname', 'rproxy', '-srcfolder', image, '-ov', '-format', 'UDZO', DIST / (name + '.dmg'))
+    # hdiutil sometimes fails with "Resource busy" on CI runners; a retry succeeds.
+    for attempt in range(3):
+        try:
+            run('hdiutil', 'create', '-volname', 'rproxy', '-srcfolder', image, '-ov', '-format', 'UDZO', DIST / (name + '.dmg'))
+            break
+        except subprocess.CalledProcessError:
+            if attempt == 2:
+                raise
+            time.sleep(10)
 
 
 def linux(arch, name):
@@ -161,7 +175,8 @@ def linux(arch, name):
         'sdk': 'org.freedesktop.Sdk', 'command': 'rproxy',
         'finish-args': ['--share=network', '--share=ipc', '--socket=wayland', '--socket=fallback-x11',
                         '--device=dri', '--talk-name=org.kde.StatusNotifierWatcher'],
-        'modules': [{'name': 'rproxy', 'buildsystem': 'simple',
+        # Cargo already stripped debuginfo; this also avoids a host eu-strip (elfutils).
+        'modules': [{'name': 'rproxy', 'buildsystem': 'simple', 'build-options': {'no-debuginfo': True},
                      'build-commands': ['cp -a usr/. /app/'],
                      'sources': [{'type': 'dir', 'path': str(appdir)}]}],
     }
@@ -189,13 +204,9 @@ def linux(arch, name):
     run('tar', '--zstd', '-cf', DIST / (name + '.pkg.tar.zst'), '-C', pkg, '.')
 
     tool = DIST / f'linuxdeploy-{native_arch}.AppImage'
-    # Verify the downloaded executable against the digest supplied by GitHub's release API.
-    with urlopen('https://api.github.com/repos/linuxdeploy/linuxdeploy/releases/tags/continuous', timeout=120) as response:
-        release = json.load(response)
-    asset = next(a for a in release['assets'] if a['name'] == tool.name)
-    with urlopen(asset['browser_download_url'], timeout=120) as response:
+    with urlopen(LINUXDEPLOY.format(native_arch), timeout=120) as response:
         content = response.read()
-    if asset.get('digest') != 'sha256:' + hashlib.sha256(content).hexdigest():
+    if hashlib.sha256(content).hexdigest() != LINUXDEPLOY_SHA256[native_arch]:
         raise RuntimeError('linuxdeploy SHA256 verification failed')
     tool.write_bytes(content)
     tool.chmod(0o755)
@@ -226,8 +237,12 @@ def check_packages(system, arch):
         if system == 'linux':
             env = dict(os.environ, APPIMAGE_EXTRACT_AND_RUN='1')
             smoke(artifact('.AppImage'), temp / 'appimage', env=env)
+            # A repeated check replaces the bundle installed by the previous one.
+            subprocess.run(['flatpak', 'uninstall', '--user', '-y', APP_ID], capture_output=True)
             check_run('flatpak', 'install', '--user', '-y', artifact('.flatpak'))
-            check_run('flatpak', 'run', APP_ID, '--smoke-test', '--data-dir', '/tmp/rproxy-smoke')
+            # flatpak run needs a session bus; headless CI runners have none.
+            bus = [] if os.environ.get('DBUS_SESSION_BUS_ADDRESS') else ['dbus-run-session', '--']
+            check_run(*bus, 'flatpak', 'run', APP_ID, '--smoke-test', '--data-dir', '/tmp/rproxy-smoke')
             check_run('tar', '--zstd', '-xf', artifact('.pkg.tar.zst'), '-C', temp)
             smoke(temp / 'opt/rproxy/rproxy', temp / 'pacman')
         elif system == 'darwin':

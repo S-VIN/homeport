@@ -1,6 +1,6 @@
-//! The rproxy application: the list of compiled-in plugins.
-//! Compiled-in plugins. Dependencies are resolved by the kernel; the order here
-//! only breaks ties (e.g. which handler runs first among equals).
+//! The rproxy application: the list of compiled-in plugins. Dependencies are
+//! resolved by the kernel; the order here only breaks ties (e.g. which handler
+//! runs first among equals).
 //! To add a plugin: add its crate to Cargo.toml and one line here.
 use rproxy_kernel::Plugin;
 
@@ -18,7 +18,9 @@ pub fn catalog() -> Vec<&'static Plugin> {
         &plugin_auto_select::PLUGIN,
         &plugin_exit_server::PLUGIN,
         &plugin_vless_server::PLUGIN,
-        #[cfg(all(feature = "desktop", target_os = "linux"))]
+        &plugin_connections::PLUGIN,
+        // Desktop integration; the plugin itself declares the systems it supports.
+        #[cfg(feature = "desktop")]
         &plugin_autostart::PLUGIN,
     ]
     .into_iter()

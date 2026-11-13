@@ -43,6 +43,8 @@ pub(crate) struct Core {
     free: std::sync::Mutex<Vec<usize>>,
     status: RwLock<CoreStatus>,
     changes: Changes,
+    /// mihomo's home folder: rule-set caches and an updated core survive restarts.
+    pub(crate) home: std::path::PathBuf,
 }
 
 pub(crate) fn compose(reg: &Registry, snap: &Snapshot) -> Result<Config> {
@@ -50,8 +52,9 @@ pub(crate) fn compose(reg: &Registry, snap: &Snapshot) -> Result<Config> {
 }
 
 impl Core {
-    pub fn new(changes: Changes) -> Self {
+    pub fn new(changes: Changes, home: std::path::PathBuf) -> Self {
         Self {
+            home,
             proc: Mutex::new(None),
             lanes: Arc::new(Semaphore::new(mihomo::CHECK_LANES)),
             free: std::sync::Mutex::new((0..mihomo::CHECK_LANES).rev().collect()),
@@ -77,7 +80,9 @@ impl Core {
         let result: Result<(Mihomo, mihomo::ApplyReport)> = async {
             let cfg = compose(reg, snap)?;
             let ports: Vec<u16> = cfg.listeners.iter().map(|l| l.port).collect();
-            let mut m = Mihomo::start(&ports).await.map_err(Error::msg)?;
+            let mut m = Mihomo::start(&ports, &self.home)
+                .await
+                .map_err(Error::msg)?;
             match m.apply(&cfg).await {
                 Ok(report) => Ok((m, report)),
                 Err(e) => {
@@ -137,6 +142,8 @@ impl Core {
     pub async fn stop(&self) {
         if let Some(mut m) = self.proc.lock().await.take() {
             m.stop().await;
+            // Not running until started again.
+            self.set(|s| s.state = CoreState::Starting);
         }
     }
     async fn with<R>(&self, f: impl AsyncFnOnce(&mut Mihomo) -> mihomo::process::Result<R>) -> Result<R> {
@@ -246,5 +253,64 @@ impl CoreApi {
     }
     pub async fn version(&self) -> Result<String> {
         self.core.controller().await?.version().await.map_err(Error::msg)
+    }
+    /// HTTP client whose requests follow the ordinary rules, like user traffic
+    /// (for downloads that may be blocked on the direct path).
+    pub async fn routed_http(&self) -> Result<reqwest::Client> {
+        self.core.with(async |m| m.routed_client()).await
+    }
+    /// Send a request directly (giving up quickly where `what` is blocked), then
+    /// through the ordinary route. `send` builds the request on the given client.
+    pub async fn direct_or_routed<F, Fut>(&self, what: &str, send: F) -> Result<reqwest::Response>
+    where
+        F: Fn(reqwest::Client) -> Fut,
+        Fut: std::future::Future<Output = reqwest::Result<reqwest::Response>>,
+    {
+        let direct = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| Error::msg(e.to_string()))?;
+        let direct_error = match send(direct).await.and_then(|r| r.error_for_status()) {
+            Ok(r) => return Ok(r),
+            Err(e) => e,
+        };
+        let routed = self.routed_http().await.map_err(|_| Error::msg(format!("Cannot reach {what}: {direct_error}")))?;
+        send(routed)
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| Error::msg(format!("Cannot reach {what} directly or through the selected server: {e}")))
+    }
+    /// Rule sets known to the core: `{name: {ruleCount, updatedAt, …}}`.
+    pub async fn rule_providers(&self) -> Result<serde_json::Value> {
+        let v = self
+            .core
+            .controller()
+            .await?
+            .rule_providers()
+            .await
+            .map_err(Error::msg)?;
+        Ok(v["providers"].clone())
+    }
+    pub async fn update_rule_provider(&self, name: &str) -> Result<()> {
+        self.core
+            .controller()
+            .await?
+            .update_rule_provider(name)
+            .await
+            .map_err(Error::msg)
+    }
+    /// The core executable that runs (an installed update or the bundled one).
+    pub fn executable(&self) -> std::path::PathBuf {
+        mihomo::executable(&self.core.home)
+    }
+    /// The running general settings (`GET /configs`).
+    pub async fn configs(&self) -> Result<serde_json::Value> {
+        self.core
+            .controller()
+            .await?
+            .configs()
+            .await
+            .map_err(Error::msg)
     }
 }

@@ -1,3 +1,4 @@
+# Only what `cargo build --bin rproxy` and scripts/build.py, scripts/mihomo.py need.
 .git
 .agents
 .claude
@@ -22,6 +23,10 @@ web/pkg
 /*.md
 /scripts/package.py
 /scripts/test-docker-auth.py
+# Tests are not built into the image; editing them must not invalidate the build layer.
+/tests/
+/crates/*/tests/
+/plugins/*/tests/
 
 # Docker images only use the two Linux cores.
 /assets/mihomo/win32/

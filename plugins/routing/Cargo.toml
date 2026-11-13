@@ -8,3 +8,4 @@ publish = false
 rproxy-kernel = { path = "../../crates/kernel" }
 plugin-servers = { path = "../servers" }
 serde = { workspace = true }
+tokio = { workspace = true }

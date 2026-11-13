@@ -35,6 +35,25 @@ pub fn helper(ui: &mut Ui, text: &str) {
     ui.add_space(theme::SPACE_M);
 }
 /// `1 server`, `2 servers`.
+/// `1.2 MB`, `640 KB`, `12 B` (decimal units, like file managers).
+pub fn bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut unit = 0;
+    while v >= 1000. && unit < UNITS.len() - 1 {
+        v /= 1000.;
+        unit += 1;
+    }
+    if unit == 0 || v >= 100. {
+        format!("{v:.0} {}", UNITS[unit])
+    } else {
+        format!("{v:.1} {}", UNITS[unit])
+    }
+}
+/// `1.2 MB/s`.
+pub fn rate(bytes_per_sec: u64) -> String {
+    format!("{}/s", bytes(bytes_per_sec))
+}
 pub fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }

@@ -11,7 +11,42 @@ use rproxy_kernel::{
     prelude::*,
     sql_text,
 };
-use std::{collections::HashMap, fmt, net::IpAddr, str::FromStr};
+use std::{collections::HashMap, fmt, net::IpAddr, str::FromStr, time::Duration};
+
+pub mod system_proxy;
+
+/// How this device uses the listeners.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Device {
+    /// Capture all traffic of the machine with a virtual interface (TUN).
+    pub tun: bool,
+    /// The listener the operating system's proxy settings point at.
+    pub system_proxy: Option<Id>,
+}
+pub static DEVICE: State<Device> = State::new("inbounds.device");
+/// Whether the tunnel is up (`None` until checked).
+pub static TUN_UP: State<Option<bool>> = State::new("inbounds.tun-up");
+/// Result of the last system proxy change: what was set, or why it failed.
+pub static SYSTEM_PROXY: State<Option<std::result::Result<String, String>>> =
+    State::new("inbounds.system-proxy");
+
+struct ReadTun;
+impl Op for ReadTun {
+    type Reply = ();
+    fn job(&self) -> Option<JobSpec> {
+        Some(JobSpec::keyed("inbounds/tun", "Check the tunnel").quiet())
+    }
+}
+
+/// A listener the system proxy can use: on, and without a login (system
+/// settings cannot pass credentials to SOCKS5).
+pub fn system_proxy_port(snap: &Snapshot) -> Option<u16> {
+    let id = snap.get(&DEVICE).system_proxy?;
+    snap.get(&INBOUNDS)
+        .iter()
+        .find(|i| i.id == id && i.enabled && i.login.is_none())
+        .map(|i| i.port)
+}
 
 pub static PLUGIN: Plugin = Plugin {
     id: "inbounds",
@@ -21,6 +56,7 @@ pub static PLUGIN: Plugin = Plugin {
     requires: &["servers"],
     required: false,
     default_enabled: true,
+    platforms: Platform::ALL,
     setup,
 };
 
@@ -116,44 +152,81 @@ fn setup(p: &mut Setup) -> Result<()> {
         }
         Ok(())
     });
+    p.editable_setting(&DEVICE);
+    p.live(&TUN_UP, || None);
+    p.live(&SYSTEM_PROXY, || None);
+    p.handle(|cx: Cx, _: ReadTun| async move {
+        let up = cx
+            .core()
+            .configs()
+            .await
+            .ok()
+            .map(|c| c["tun"]["enable"].as_bool().unwrap_or(false));
+        cx.set_live(&TUN_UP, up);
+        Ok(())
+    });
+    p.every(
+        "tun",
+        |s| s.get(&DEVICE).tun.then_some(Duration::from_secs(3)),
+        || ReadTun,
+    );
+    // Point the system proxy at the chosen listener; put it back when the choice
+    // changes or the app quits (only if rproxy had changed it).
+    p.service("system-proxy", system_proxy_port, |cx: Cx, port: u16| async move {
+        let result = tokio::task::spawn_blocking(move || system_proxy::apply(Some(port))).await.map_err(|e| Error::msg(e.to_string()))?;
+        cx.set_live(&SYSTEM_PROXY, Some(result));
+        std::future::pending().await
+    })
+    .on_stop(|cx: Cx, _| async move {
+        if matches!(*cx.live(&SYSTEM_PROXY), Some(Ok(_))) {
+            let _ = tokio::task::spawn_blocking(|| system_proxy::apply(None)).await;
+        }
+        cx.set_live(&SYSTEM_PROXY, None);
+        Ok(())
+    });
     p.core(|snap| {
-        Fragment::listeners(snap.get(&INBOUNDS).iter().filter(|i| i.enabled).map(|i| Listener {
-            name: i.id.to_string(),
-            kind: ListenerKind::Mixed,
-            listen: i.listen.0,
-            port: i.port,
-            udp: true,
-            users: i.login.clone().zip(i.password.clone()).into_iter().collect(),
-            optional: true,
-        }))
+        let device = snap.get(&DEVICE);
+        let tunnel = device.tun.then_some(mihomo::Tun {
+            strict_route: false,
+        });
+        let mut f =
+            Fragment::listeners(snap.get(&INBOUNDS).iter().filter(|i| i.enabled).map(|i| {
+                Listener {
+                    name: i.id.to_string(),
+                    kind: ListenerKind::Mixed,
+                    listen: i.listen.0,
+                    port: i.port,
+                    udp: true,
+                    users: i
+                        .login
+                        .clone()
+                        .zip(i.password.clone())
+                        .into_iter()
+                        .collect(),
+                    optional: true,
+                }
+            }));
+        if tunnel.is_some() {
+            // The tunnel answers DNS itself; the system resolver is the fallback.
+            f.dns = Some(mihomo::Dns {
+                enable: true,
+                nameservers: vec!["https://1.1.1.1/dns-query".into(), "system".into()],
+            });
+            f.sniff = true;
+        }
+        f.tun = tunnel;
+        f
     });
     // Unreachable provider: retry through a working listener (traffic leaves via the selected server).
     p.wrap(|cx: Cx, f: Fetch, next: Next<Fetch>| async move {
         let direct = next.run(&cx, f.clone()).await;
         let Err(e) = &direct else { return direct };
-        if e.cancelled() || !f.url.starts_with("http") {
+        if e.cancelled() || !f.url.starts_with("http") || cx.get(&servers::SELECTED).is_none() {
             return direct;
         }
-        let snap = cx.snapshot();
-        let status = cx.core().status();
-        if !status.running() || snap.get(&servers::SELECTED).is_none() {
-            return direct;
-        }
-        let Some(i) = snap.get(&INBOUNDS).iter().find(|i| i.enabled && error(&status, i).is_none()).cloned() else {
-            return direct;
-        };
-        let mut proxy = reqwest::Proxy::all(format!("http://{}", mihomo::local_address(i.listen.0, i.port))).map_err(|_| Error::msg("Invalid listener address."))?;
-        if let (Some(u), Some(p)) = (&i.login, &i.password) {
-            proxy = proxy.basic_auth(u, p);
-        }
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .proxy(proxy)
-            .user_agent("v2rayN/7.0")
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|_| Error::msg("Cannot initialize HTTP client."))?;
-        plugin_subscriptions::http_get(&client, &f.url).await
+        // Retry the way user traffic goes: through the selected server.
+        let Ok(routed) = cx.core().routed_http().await else { return direct };
+        plugin_subscriptions::http_get(&routed, &f.url).await
     });
 
     p.page::<InboundsPage>(PageSpec { id: "inbounds", title: "Listeners", icon: Icon::Listeners, order: 50 });
@@ -176,15 +249,7 @@ fn setup(p: &mut Setup) -> Result<()> {
     p.fill(&PANELS, "listeners", 20, |ui, cx, _| {
         let pal = kit::colors(ui);
         let status = cx.core_status();
-        let mut open = false;
-        rproxy_kernel::shell::panel_title(ui, "Listeners · HTTP and SOCKS5", |ui| {
-            if cx.page() != "inbounds" {
-                open = kit::Button::ghost("Manage").tone(kit::Tone::Accent).show(ui).clicked();
-            }
-        });
-        if open {
-            cx.navigate("inbounds");
-        }
+        rproxy_kernel::shell::panel_title_page(ui, cx, "Listeners · HTTP and SOCKS5", "inbounds");
         let list = cx.get(&INBOUNDS);
         if !list.iter().any(|i| i.enabled) {
             kit::hint(ui, "No listener is on.");
@@ -210,13 +275,15 @@ fn setup(p: &mut Setup) -> Result<()> {
     Ok(())
 }
 
+/// Lock icon and "Login" / "No auth" (left to right in any parent layout).
 fn auth_label(ui: &mut egui::Ui, i: &Inbound) {
     let pal = kit::colors(ui);
-    ui.spacing_mut().item_spacing.x = 4.;
     let (icon, text) = if i.login.is_some() { (Icon::Lock, "Login") } else { (Icon::Unlock, "No auth") };
-    // Right-to-left callers get the text first.
-    ui.label(egui::RichText::new(text).size(theme::SMALL).color(pal.muted));
-    kit::icon(ui, icon, 14., pal.muted);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.;
+        kit::icon(ui, icon, 14., pal.muted);
+        ui.label(egui::RichText::new(text).size(theme::SMALL).color(pal.muted));
+    });
 }
 
 /// Text fields of a listener being edited (the password is only kept here, never shown).
@@ -261,6 +328,96 @@ struct InboundsPage {
 const TOGGLE: f32 = 30.;
 const AUTH: f32 = 84.;
 
+/// TUN hint: what to do when the tunnel cannot start on this platform.
+fn tun_hint(core: &std::path::Path) -> String {
+    if cfg!(windows) {
+        "The tunnel needs administrator rights: start rproxy as administrator.".into()
+    } else if cfg!(target_os = "macos") {
+        "The tunnel needs administrator rights: start rproxy with sudo.".into()
+    } else {
+        format!("The tunnel needs network admin rights. Run once: sudo setcap cap_net_admin,cap_net_bind_service+ep {}", core.display())
+    }
+}
+
+/// System proxy and TUN: how this computer itself uses rproxy.
+fn device_card(ui: &mut egui::Ui, cx: &mut UiCx, rows: &[Inbound]) {
+    let device = (*cx.get(&DEVICE)).clone();
+    let eligible: Vec<&Inbound> = rows
+        .iter()
+        .filter(|i| i.enabled && i.login.is_none())
+        .collect();
+    kit::settings_card(ui, |ui| {
+        let current = device
+            .system_proxy
+            .and_then(|id| rows.iter().find(|i| i.id == id));
+        let label = current.map_or_else(|| "Off".to_owned(), |i| i.address());
+        kit::settings_row(
+            ui,
+            "System proxy",
+            "Point this computer's proxy settings at a listener without a login",
+            |ui| {
+                kit::select(ui, "system-proxy", &label, 170., |ui| {
+                    if ui
+                        .selectable_label(device.system_proxy.is_none(), "Off")
+                        .clicked()
+                    {
+                        cx.update("system-proxy", &DEVICE, |d| d.system_proxy = None);
+                    }
+                    for i in &eligible {
+                        let id = i.id;
+                        if ui
+                            .selectable_label(device.system_proxy == Some(id), i.address())
+                            .clicked()
+                        {
+                            cx.update("system-proxy", &DEVICE, move |d| d.system_proxy = Some(id));
+                        }
+                    }
+                });
+            },
+        );
+        if device.system_proxy.is_some() {
+            match (&*cx.live(&SYSTEM_PROXY), system_proxy_port(cx.snapshot())) {
+                (_, None) => kit::tone_text(
+                    ui,
+                    "The chosen listener is off or needs a login, so the system proxy is not set.",
+                    kit::Tone::Warning,
+                ),
+                (Some(Err(e)), _) => kit::tone_text(ui, e, kit::Tone::Danger),
+                (Some(Ok(what)), _) => kit::tone_text(
+                    ui,
+                    format!("Set for {what}. Turning it off restores direct connections."),
+                    kit::Tone::Neutral,
+                ),
+                (None, _) => kit::tone_text(ui, "Applying…", kit::Tone::Neutral),
+            };
+        }
+        let mut tun = device.tun;
+        kit::settings_row(
+            ui,
+            "Capture all traffic",
+            "Route every app through rproxy with a virtual network interface (TUN)",
+            |ui| {
+                if kit::toggle(ui, &mut tun, "").changed() {
+                    cx.update("tun", &DEVICE, move |d| d.tun = tun);
+                }
+            },
+        );
+        if device.tun {
+            match *cx.live(&TUN_UP) {
+                Some(true) => kit::tone_text(
+                    ui,
+                    "The tunnel is up: all apps go through rproxy and its rules.",
+                    kit::Tone::Neutral,
+                ),
+                Some(false) => {
+                    kit::tone_text(ui, tun_hint(&cx.core().executable()), kit::Tone::Danger)
+                }
+                None => kit::tone_text(ui, "Starting the tunnel…", kit::Tone::Neutral),
+            };
+        }
+    });
+}
+
 impl Page for InboundsPage {
     fn ui(&mut self, ui: &mut egui::Ui, cx: &mut UiCx) {
         let rows = cx.get(&INBOUNDS);
@@ -271,6 +428,8 @@ impl Page for InboundsPage {
         let counter = if rows.is_empty() { String::new() } else { kit::plural(rows.len(), "listener", "listeners") };
         kit::page_header(ui, "Listeners", &counter, |_| {});
         kit::helper(ui, "Point a browser or app at one of these addresses as an HTTP or SOCKS5 proxy. Set a login with the pencil.");
+        device_card(ui, cx, &rows);
+        ui.add_space(theme::SECTION_GAP);
         // Add bar: address and port; authentication is set in the row editor.
         let add_key = ("inbound", "add");
         match cx.outcome(add_key) {
@@ -354,12 +513,7 @@ impl InboundsPage {
                     kit::cell(ui, w, |ui| {
                         ui.add(egui::Label::new(egui::RichText::new(i.address()).color(if i.enabled { pal.foreground } else { pal.muted })).truncate());
                     });
-                    kit::cell(ui, AUTH, |ui| {
-                        ui.spacing_mut().item_spacing.x = 4.;
-                        let (icon, text) = if i.login.is_some() { (Icon::Lock, "Login") } else { (Icon::Unlock, "No auth") };
-                        kit::icon(ui, icon, 14., pal.muted);
-                        ui.label(egui::RichText::new(text).size(theme::SMALL).color(pal.muted));
-                    });
+                    kit::cell(ui, AUTH, |ui| auth_label(ui, i));
                     ui.spacing_mut().item_spacing.x = 0.;
                     if kit::icon_button_ex(ui, if open { Icon::Close } else { Icon::Edit }, if open { "Close editor" } else { "Edit address and login" }, true, emphasis, false).clicked() {
                         if open {

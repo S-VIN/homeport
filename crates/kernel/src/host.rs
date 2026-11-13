@@ -73,7 +73,20 @@ impl Host {
                 tokio::spawn(async move { h.restart().await });
             }
         });
-        let k = Kernel::start(self.catalog.clone(), self.store.clone(), self.dir.clone(), restart).await?;
+        let me = self.me.clone();
+        let restore = Arc::new(move |path: PathBuf| {
+            if let Some(h) = me.upgrade() {
+                tokio::spawn(async move { h.restore(&path).await });
+            }
+        });
+        let k = Kernel::start(
+            self.catalog.clone(),
+            self.store.clone(),
+            self.dir.clone(),
+            restart,
+            restore,
+        )
+        .await?;
         // Repaint every open session when state, jobs or notices change.
         let mut changes = k.changes();
         let me = self.me.clone();
@@ -115,6 +128,42 @@ impl Host {
             *self.failure.lock().unwrap() = result.err().map(|e| e.message);
             self.repaint();
         })
+    }
+
+    /// Replace the database with the backup at `path` and start the kernel again.
+    /// The state before the restore is kept as an automatic backup.
+    pub fn restore<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(self.restore_inner(path))
+    }
+    async fn restore_inner(&self, path: &Path) {
+        let _r = self.restarting.lock().await;
+        // Keep the current state first; if that fails, nothing changes.
+        if let Some(k) = self.try_kernel() {
+            if let Err(e) = k.back_up_keeping(true, Some(path)) {
+                k.notify_error("Couldn't restore the backup", &format!("The current settings could not be saved first: {}", e.message));
+                return;
+            }
+        }
+        let old = self.current.write().unwrap().take();
+        if let Some(k) = &old {
+            k.shutdown().await;
+        }
+        drop(old);
+        let result = self.store.restore_from(path);
+        let launched = self.launch().await;
+        *self.failure.lock().unwrap() = launched.err().map(|e| e.message);
+        if let (Err(e), Some(k)) = (result, self.try_kernel()) {
+            k.notify_error("Couldn't restore the backup", &e.message);
+        } else if let Some(k) = self.try_kernel() {
+            k.notify(
+                "Settings restored",
+                "The backup replaced the current settings.",
+            );
+        }
+        self.repaint();
     }
 
     pub async fn shutdown(&self) {

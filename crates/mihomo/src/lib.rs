@@ -5,8 +5,11 @@
 pub mod config;
 pub mod process;
 pub use config::*;
-pub use process::{local_address, ApplyReport, Controller, Delay, Mihomo, CHECK_LANES};
 pub use ipnet;
+pub use process::{
+    bundled, executable, installed, local_address, ApplyReport, Controller, Delay, Mihomo, BINARY,
+    CHECK_LANES,
+};
 
 #[cfg(windows)]
 mod windows_job;

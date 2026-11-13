@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+futures-util = { workspace = true }
 rproxy-kernel = { path = "../../crates/kernel" }
 plugin-servers = { path = "../servers" }
 serde = { workspace = true }

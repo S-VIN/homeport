@@ -96,6 +96,8 @@ pub async fn run(
         })?;
     let fallback = self_signed(&spec.domain)?;
     let report = Arc::new(report);
+    // Helpers live only as long as this run: dropping it (a service restart) stops them.
+    let mut helpers = tokio::task::JoinSet::new();
     let acme = if spec.acme {
         let _ = std::fs::create_dir_all(&spec.cache);
         let mut config = AcmeConfig::new([spec.domain.clone()])
@@ -110,7 +112,7 @@ pub async fn run(
             "Getting a certificate from Let's Encrypt…".into(),
         ));
         let report = report.clone();
-        tokio::spawn(async move {
+        helpers.spawn(async move {
             while let Some(event) = state.next().await {
                 match event {
                     Ok(EventOk::DeployedCachedCert | EventOk::DeployedNewCert) => {
@@ -143,7 +145,7 @@ pub async fn run(
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
     if spec.redirect_http {
         let domain = spec.domain.clone();
-        tokio::spawn(async move {
+        helpers.spawn(async move {
             // Optional: most hosts need root or CAP_NET_BIND_SERVICE for port 80.
             if let Ok(plain) = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 80))).await {
                 serve(plain, None, domain).await;
@@ -158,6 +160,8 @@ async fn serve(listener: TcpListener, tls: Option<tokio_rustls::TlsAcceptor>, do
     let domain: Arc<str> = domain.into();
     loop {
         let Ok((tcp, _)) = listener.accept().await else {
+            // E.g. out of file descriptors: back off instead of spinning.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             continue;
         };
         let (tls, domain) = (tls.clone(), domain.clone());

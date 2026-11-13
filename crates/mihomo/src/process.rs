@@ -140,6 +140,32 @@ impl Controller {
     pub async fn close_all(&self) -> Result<()> {
         self.send(self.http.delete(self.url("connections"))).await.map(drop)
     }
+    /// `GET /providers/rules`: `{providers: {name: {ruleCount, updatedAt, …}}}`.
+    pub async fn rule_providers(&self) -> Result<Value> {
+        self.send(self.http.get(self.url("providers/rules")))
+            .await?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
+    }
+    /// Download a rule set again now.
+    pub async fn update_rule_provider(&self, name: &str) -> Result<()> {
+        self.send(
+            self.http
+                .put(self.url(&format!("providers/rules/{name}")))
+                .timeout(Duration::from_secs(60)),
+        )
+        .await
+        .map(drop)
+    }
+    /// `GET /configs`: the running general settings (e.g. whether TUN is up).
+    pub async fn configs(&self) -> Result<Value> {
+        self.send(self.http.get(self.url("configs")))
+            .await?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 impl Controller {
     fn url(&self, path: &str) -> String { format!("{}/{path}", self.base) }
@@ -153,6 +179,7 @@ pub struct Mihomo {
     endpoint: Value,
     ctl: Controller,
     check_ports: Vec<u16>,
+    routed_port: u16,
     check_password: String,
     applied: Option<(Config, Vec<Listener>)>,
     check_targets: Vec<Option<Target>>,
@@ -160,8 +187,28 @@ pub struct Mihomo {
     last_errors: BTreeMap<String, String>,
 }
 
-fn executable() -> PathBuf {
-    let binary = if cfg!(windows) { "mihomo.exe" } else { "mihomo" };
+/// File name of the core executable on this platform.
+pub const BINARY: &str = if cfg!(windows) {
+    "mihomo.exe"
+} else {
+    "mihomo"
+};
+
+/// An updated core installed into the home directory (`<home>/bin/mihomo`).
+pub fn installed(home: &Path) -> PathBuf {
+    home.join("bin").join(BINARY)
+}
+
+/// The core to run: an installed update if present, otherwise the bundled one.
+pub fn executable(home: &Path) -> PathBuf {
+    Some(installed(home))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(bundled)
+}
+
+/// The core shipped with this build.
+pub fn bundled() -> PathBuf {
+    let binary = BINARY;
     let platform = match std::env::consts::OS {
         "windows" => "win32",
         "macos" => "darwin",
@@ -193,7 +240,10 @@ pub fn local_address(listen: IpAddr, port: u16) -> SocketAddr {
 }
 
 impl Mihomo {
-    pub async fn start(reserved_ports: &[u16]) -> Result<Self> {
+    /// Start the core. `home` keeps files between runs (rule sets, an updated core);
+    /// the control socket and generated config live in a private temporary folder.
+    pub async fn start(reserved_ports: &[u16], home: &Path) -> Result<Self> {
+        fs::create_dir_all(home).map_err(|e| format!("Cannot create {}: {e}", home.display()))?;
         let mut builder = tempfile::Builder::new();
         builder.prefix("rproxy-");
         #[cfg(unix)]
@@ -204,7 +254,7 @@ impl Mihomo {
         // Keep every probe socket open until all lanes have distinct ports.
         let mut probes = Vec::new();
         let mut check_ports = Vec::new();
-        while check_ports.len() < CHECK_LANES {
+        while check_ports.len() < CHECK_LANES + 1 {
             let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|e| e.to_string())?;
             let port = probe.local_addr().map_err(|e| e.to_string())?.port();
             if !reserved_ports.contains(&port) {
@@ -213,6 +263,7 @@ impl Mihomo {
             probes.push(probe);
         }
         drop(probes);
+        let routed_port = check_ports.pop().expect("one port for the routed listener");
         let http = Client::builder().no_proxy().timeout(Duration::from_secs(4));
         #[cfg(unix)]
         let (http, base, endpoint) = (
@@ -237,8 +288,11 @@ impl Mihomo {
             "dns": {"enable": false}, "log-level": "silent"});
         initial.as_object_mut().unwrap().extend(endpoint.as_object().unwrap().clone());
         fs::write(&path, initial.to_string()).map_err(|e| e.to_string())?;
-        let mut cmd = Command::new(executable());
-        cmd.arg("-d").arg(dir.path()).arg("-f").arg(path)
+        let mut cmd = Command::new(executable(home));
+        cmd.arg("-d")
+            .arg(home)
+            .arg("-f")
+            .arg(path)
             .stdin(Stdio::null())
             .kill_on_drop(true);
         // RPROXY_MIHOMO_LOG=debug|info|warning shows the core's log on stderr.
@@ -275,6 +329,7 @@ impl Mihomo {
             endpoint,
             ctl: Controller { http, base },
             check_ports,
+            routed_port,
             check_password: format!("{:016x}{:016x}", rand(), rand()),
             applied: None,
             check_targets: vec![None; CHECK_LANES],
@@ -335,6 +390,18 @@ impl Mihomo {
             .build()
             .map_err(|_| "Cannot create test client.".to_string())
     }
+    /// HTTP client whose traffic follows the ordinary rules (like the user's).
+    pub fn routed_client(&self) -> Result<Client> {
+        let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{}", self.routed_port))
+            .map_err(|_| "Invalid routed listener.".to_string())?
+            .basic_auth("check", &self.check_password);
+        Client::builder()
+            .no_proxy()
+            .proxy(proxy)
+            .connect_timeout(Duration::from_secs(20))
+            .build()
+            .map_err(|_| "Cannot create routed client.".to_string())
+    }
     pub async fn route_checks(&mut self, lane: usize, target: Option<Target>) -> Result<()> {
         if lane >= self.check_targets.len() {
             return Err("Unknown check lane.".into());
@@ -388,7 +455,10 @@ impl Mihomo {
                 continue;
             }
             let addr = SocketAddr::new(l.listen, l.port);
-            let free = !self.check_ports.contains(&l.port) && TcpListener::bind(addr).is_ok() && UdpSocket::bind(addr).is_ok();
+            let free = !self.check_ports.contains(&l.port)
+                && l.port != self.routed_port
+                && TcpListener::bind(addr).is_ok()
+                && UdpSocket::bind(addr).is_ok();
             // A wildcard and a specific address on the same port collide with our own old socket.
             let ours_overlap = previous.iter().any(|p| p.port == l.port && overlaps(p.listen, l.listen));
             if free || ours_overlap {
@@ -438,6 +508,7 @@ impl Mihomo {
                 check_ports: &self.check_ports,
                 check_password: &self.check_password,
                 check_targets: &self.check_targets,
+                routed_port: Some(self.routed_port),
             },
             listeners,
         );

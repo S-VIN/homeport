@@ -26,6 +26,7 @@ pub static PLUGIN: Plugin = Plugin {
     requires: &["servers"],
     required: false,
     default_enabled: true,
+    platforms: Platform::ALL,
     setup,
 };
 
@@ -116,14 +117,18 @@ pub static SECTIONS: Slot<()> = Slot::new("subscriptions.sections", "Subscriptio
 pub const MAX_BYTES: usize = 10 * 1024 * 1024;
 
 /// Sources being downloaded right now (rows show a spinner).
-static LOADING: std::sync::Mutex<Vec<Id>> = std::sync::Mutex::new(Vec::new());
-pub fn loading(source: Id) -> bool {
-    LOADING.lock().unwrap().contains(&source)
+pub static LOADING: State<Vec<Id>> = State::new("subscriptions.loading");
+/// Marks a source as loading until dropped.
+struct Loading(Cx, Id);
+impl Loading {
+    fn start(cx: &Cx, id: Id) -> Self {
+        cx.update_live(&LOADING, |l| l.push(id));
+        Self(cx.clone(), id)
+    }
 }
-struct Loading(Id);
 impl Drop for Loading {
     fn drop(&mut self) {
-        LOADING.lock().unwrap().retain(|x| *x != self.0);
+        self.0.update_live(&LOADING, |l| l.retain(|x| *x != self.1));
     }
 }
 
@@ -153,6 +158,9 @@ fn validate(snap: &Snapshot, s: &mut Source, others: &[Source]) -> Result<()> {
 pub async fn http_get(client: &reqwest::Client, url: &str) -> Result<String> {
     let mut res = client
         .get(url)
+        // Providers pick the document format by client; this one gets plain share links.
+        .header(reqwest::header::USER_AGENT, "v2rayN/7.0")
+        .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
         .and_then(|r| r.error_for_status())
@@ -183,6 +191,7 @@ pub async fn http_get(client: &reqwest::Client, url: &str) -> Result<String> {
 }
 
 fn setup(p: &mut Setup) -> Result<()> {
+    p.live(&LOADING, Vec::new);
     p.list(&SOURCES).validate(|snap, s, _, others| validate(snap, s, others));
     p.editable_setting(&SETTINGS);
 
@@ -206,9 +215,7 @@ fn setup(p: &mut Setup) -> Result<()> {
     });
     p.handle(|cx: Cx, op: RefreshSource| async move {
         let Some(source) = cx.get(&SOURCES).iter().find(|s| s.id == op.id).cloned() else { return Ok(()) };
-        LOADING.lock().unwrap().push(source.id);
-        let _loading = Loading(source.id);
-        cx.kernel().repaint();
+        let _loading = Loading::start(&cx, source.id);
         let result: Result<usize> = async {
             let body = cx.or_cancel(cx.call(Fetch { source: source.id, url: source.url.clone() })).await??;
             let proxies = if body.trim().trim_start_matches('\u{feff}').trim().is_empty() {
@@ -337,6 +344,7 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
         cx.job_button(ui, Icon::Refresh, "Refresh all", 104., !sources.is_empty(), || RefreshAll);
     });
     kit::helper(ui, "Higher subscriptions win ties when Auto select picks a server. Each color tags that subscription's servers.");
+    let loading = cx.live(&LOADING);
     ListEditor::new(&SOURCES)
         .add_form("Add subscription", || Source::new(""), |ui, s, width| {
             let r = kit::input(ui, "url", &mut s.url, "Subscription URL or link (vless://…)", width, false);
@@ -348,7 +356,7 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
         .column(Column::edit("Subscription", "Subscription URL", |s: &mut Source| &mut s.url).display(Source::label))
         .column(
             Column::custom("Servers", 56., |ui, cx, s: &Source| {
-                if loading(s.id) {
+                if loading.contains(&s.id) {
                     kit::spinner(ui);
                 } else {
                     let n = cx.get(&servers::SERVERS).iter().filter(|x| x.source == s.id).count();
@@ -357,7 +365,7 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
             })
             .right(),
         )
-        .subtitle(|rows, i| Some(status(&rows[i], loading(rows[i].id))))
+        .subtitle(|rows, i| Some(status(&rows[i], loading.contains(&rows[i].id))))
         .empty(Icon::Subscriptions, "No subscriptions", "Paste a subscription URL or a vless:// link above to load servers.")
         .show(ui, cx);
     cx.slot(ui, &SECTIONS, &());

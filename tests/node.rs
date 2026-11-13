@@ -149,7 +149,7 @@ async fn node(dir: &std::path::Path) -> (Arc<Host>, String, u16) {
         .unwrap();
     until(&k, "camouflage site", |k| {
         matches!(
-            *k.snapshot().get(&vless::CERTIFICATE),
+            *k.snapshot().live(&vless::CERTIFICATE),
             vless::site::Certificate::SelfSigned(_)
         )
     })

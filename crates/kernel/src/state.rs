@@ -40,6 +40,14 @@ pub(crate) struct Cell {
     pub rev: u64,
 }
 
+/// A live state's cell: one per kernel, shared by every snapshot, replaced in place.
+pub(crate) struct Live<T>(pub(crate) std::sync::RwLock<Arc<T>>);
+impl<T> Live<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Self(std::sync::RwLock::new(Arc::new(value)))
+    }
+}
+
 /// An immutable view of all state at one revision. Cheap to clone.
 #[derive(Clone)]
 pub struct Snapshot {
@@ -60,8 +68,15 @@ impl Snapshot {
             c.value
                 .clone()
                 .downcast::<T>()
-                .unwrap_or_else(|_| panic!("state {} read with the wrong type", s.name))
+                .unwrap_or_else(|_| panic!("state {} read with the wrong type (a live state is read with `live`)", s.name))
         })
+    }
+    /// The latest value of a live state (see [`Setup::live`](crate::Setup::live)).
+    pub fn live<T: Send + Sync + 'static>(&self, s: &State<T>) -> Arc<T> {
+        self.live_cell(s).0.read().unwrap().clone()
+    }
+    pub(crate) fn live_cell<T: Send + Sync + 'static>(&self, s: &State<T>) -> Arc<Live<T>> {
+        self.get(&State::<Live<T>>::new(s.name))
     }
     /// Revision of one cell; changes whenever the cell is written.
     pub fn revision<T>(&self, s: &State<T>) -> u64 {

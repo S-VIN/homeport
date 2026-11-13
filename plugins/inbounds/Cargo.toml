@@ -11,3 +11,6 @@ plugin-subscriptions = { path = "../subscriptions" }
 serde = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinInet"] }

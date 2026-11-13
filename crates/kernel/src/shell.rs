@@ -96,8 +96,7 @@ pub(crate) fn frame(root: &mut egui::Ui, k: &Arc<Kernel>, s: &mut SessionState) 
         .frame(egui::Frame::NONE.fill(p.background).inner_margin(egui::Margin { left: theme::PADDING as i8, right: theme::PADDING as i8, top: 8, bottom: 4 }))
         .show(root, |ui| page(ui, &mut cx));
     if let Some(rect) = panels_rect {
-        let inner = rect.shrink2(vec2(0., 0.));
-        let mut ui = root.new_child(egui::UiBuilder::new().max_rect(inner).layout(Layout::top_down(Align::Min)));
+        let mut ui = root.new_child(egui::UiBuilder::new().max_rect(rect).layout(Layout::top_down(Align::Min)));
         egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: theme::PADDING as i8, top: 10, bottom: 6 }).show(&mut ui, |ui| {
             egui::ScrollArea::vertical().id_salt("panels-scroll").auto_shrink([false, false]).show(ui, |ui| panels(ui, &mut cx, true, None));
         });
@@ -193,6 +192,19 @@ pub fn panel_title(ui: &mut egui::Ui, title: &str, right: impl FnOnce(&mut egui:
         ui.with_layout(Layout::right_to_left(Align::Center), right);
     });
     ui.add_space(2.);
+}
+
+/// Panel title with a "Manage" button that opens `page` (hidden on that page).
+pub fn panel_title_page(ui: &mut egui::Ui, cx: &mut UiCx, title: &str, page: &'static str) {
+    let mut open = false;
+    panel_title(ui, title, |ui| {
+        if cx.page() != page {
+            open = kit::Button::ghost("Manage").tone(Tone::Accent).show(ui).clicked();
+        }
+    });
+    if open {
+        cx.navigate(page);
+    }
 }
 
 /// Panel cards. `only`: the panels of one plugin (a chip's popover); all when it has none.
@@ -457,13 +469,18 @@ fn settings(ui: &mut egui::Ui, cx: &mut UiCx) {
         }
     });
     plugin_manager(ui, cx);
+    backups(ui, cx);
     kit::section(ui, "About", None);
     let status = cx.core_status();
     let p = theme::palette(ui);
     kit::card(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 0.;
-        kit::property(ui, "Version", &format!("rproxy {}", env!("CARGO_PKG_VERSION")));
-        kit::property(ui, "Core", &status.version.clone().map_or_else(|| "Offline".into(), |v| format!("mihomo {v}")));
+        kit::property(
+            ui,
+            "Version",
+            &format!("rproxy {}", env!("CARGO_PKG_VERSION")),
+        );
+        core_row(ui, cx, &status);
         let dir = cx.k.data_dir.display().to_string();
         kit::property_with(ui, "Data folder", |ui| {
             let w = ui.available_width() - theme::CONTROL - theme::HORIZONTAL_GAP;
@@ -476,6 +493,135 @@ fn settings(ui: &mut egui::Ui, cx: &mut UiCx) {
             }
         });
     });
+}
+
+/// Backups of every setting and list: make one, restore or delete.
+fn backups(ui: &mut egui::Ui, cx: &mut UiCx) {
+    let k = cx.k.clone();
+    let list = k.backups();
+    kit::section(ui, "Backups", Some("Every setting and list. A copy is made daily (the last 7 are kept) and before each restore."));
+    let armed_id = egui::Id::unique("backup-armed");
+    let mut armed: Option<std::path::PathBuf> = ui.data(|d| d.get_temp(armed_id)).flatten();
+    kit::settings_card(ui, |ui| {
+        kit::settings_row(
+            ui,
+            "Back up now",
+            &format!("Saved in {}", crate::backup::folder(&k.data_dir).display()),
+            |ui| {
+                if kit::Button::secondary("Back up")
+                    .icon(Icon::Add)
+                    .show(ui)
+                    .clicked()
+                {
+                    if let Err(e) = k.start_backup() {
+                        cx.notify_error(&e.message);
+                    }
+                }
+            },
+        );
+        for b in list.iter().take(10) {
+            let label = format!(
+                "{}{}",
+                crate::backup::stamp(b.created),
+                if b.auto { " · automatic" } else { "" }
+            );
+            kit::settings_row(ui, &label, &format!("{} · UTC", kit::bytes(b.size)), |ui| {
+                if armed.as_ref() == Some(&b.path) {
+                    if kit::Button::ghost("Cancel").show(ui).clicked() {
+                        armed = None;
+                    }
+                    if kit::Button::secondary("Restore and restart").tone(Tone::Danger).show(ui).on_hover_text("Replace every setting with this copy; the current ones are backed up first").clicked() {
+                        armed = None;
+                        if let Err(e) = k.restore_backup(&b.path) {
+                            cx.notify_error(&e.message);
+                        }
+                    }
+                } else {
+                    if kit::icon_button(ui, Icon::Delete, "Delete this backup", true).clicked() {
+                        if let Err(e) = k.delete_backup(&b.path) {
+                            cx.notify_error(&e.message);
+                        }
+                    }
+                    if kit::Button::ghost("Restore").show(ui).clicked() {
+                        armed = Some(b.path.clone());
+                    }
+                }
+            });
+        }
+    });
+    ui.data_mut(|d| d.insert_temp(armed_id, armed));
+}
+
+/// The core version with update actions: check, update, or go back to the bundled core.
+fn core_row(ui: &mut egui::Ui, cx: &mut UiCx, status: &crate::core::CoreStatus) {
+    let k = cx.k.clone();
+    let running = k
+        .board()
+        .runs
+        .iter()
+        .find(|r| r.key == "kernel/core-update" && r.phase.active())
+        .cloned();
+    let updates = k.core_updates();
+    let installed = updates.installed;
+    let current = status.version.clone().unwrap_or_default();
+    let version = crate::updates::version_of(&current)
+        .map(|v| v.iter().map(u32::to_string).collect::<Vec<_>>().join("."));
+    let label = match &version {
+        Some(v) if installed => format!("mihomo {v} · updated"),
+        Some(v) => format!("mihomo {v}"),
+        None => "Offline".to_owned(),
+    };
+    let available = updates
+        .latest
+        .as_ref()
+        .filter(|r| crate::updates::newer(&r.version, &current))
+        .cloned();
+    kit::property_with(ui, "Core", |ui| {
+        ui.label(RichText::new(label).color(theme::palette(ui).foreground));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let result = if let Some(run) = &running {
+                let text = match run.total {
+                    Some(total) if total > 0 => format!("{}%", run.done * 100 / total),
+                    _ => "Working…".to_owned(),
+                };
+                kit::spinner(ui);
+                kit::caption(ui, text);
+                Ok(())
+            } else if let Some(r) = &available {
+                if kit::Button::secondary(&format!("Update to {}", r.version))
+                    .show(ui)
+                    .on_hover_text(
+                        "Download from the mihomo releases on GitHub, verify and restart the core",
+                    )
+                    .clicked()
+                {
+                    k.install_core_update()
+                } else {
+                    Ok(())
+                }
+            } else {
+                let mut result = Ok(());
+                if kit::Button::ghost("Check for update").show(ui).clicked() {
+                    result = k.check_core_update();
+                }
+                if installed
+                    && kit::Button::ghost("Use bundled")
+                        .show(ui)
+                        .on_hover_text("Remove the update and run the core shipped with rproxy")
+                        .clicked()
+                {
+                    result = k.remove_core_update();
+                }
+                result
+            };
+            if let Err(e) = result {
+                k.notify_error("Core update", &e.message);
+            }
+        });
+    });
+    if let (Some(at), None, None) = (updates.checked, &available, &running) {
+        kit::property(ui, "", &format!("Up to date · checked {}", kit::age(at)));
+    }
 }
 
 /// Where a plugin's own UI lives, as a link for its row in the plugin manager.
@@ -523,7 +669,9 @@ fn plugin_manager(ui: &mut egui::Ui, cx: &mut UiCx) {
                 let mut on = crate::kernel::is_enabled(pl, &saved);
                 // Enabled but not running: either a missing dependency (reason) or a pending restart.
                 let reason = cx.k.disabled_reasons.iter().find(|(id, _)| id == pl.id).map(|(_, why)| why.clone()).filter(|_| on && running.is_none());
-                let restart = on != running.is_some() && reason.is_none();
+                // Not for this system: the plugin's own platforms, no switch.
+                let unsupported = (!pl.supported()).then(|| pl.platforms_note().unwrap_or_default());
+                let restart = on != running.is_some() && reason.is_none() && unsupported.is_none();
                 let link = running.and_then(|i| plugin_link(cx, i));
                 let mut changed = false;
                 kit::settings_item(
@@ -532,7 +680,9 @@ fn plugin_manager(ui: &mut egui::Ui, cx: &mut UiCx) {
                     |ui| {
                         ui.label(RichText::new(pl.name).color(p.foreground));
                         ui.add(egui::Label::new(RichText::new(pl.description).size(theme::SMALL).color(p.muted)).wrap());
-                        if let Some(why) = &reason {
+                        if let Some(only) = &unsupported {
+                            ui.label(RichText::new(format!("Not available on this system · {only}")).size(theme::SMALL).color(p.muted));
+                        } else if let Some(why) = &reason {
                             kit::tone_text(ui, format!("Inactive · {why}"), Tone::Warning);
                         } else if let Some((page, text)) = &link {
                             if *page == SETTINGS_PAGE {
@@ -545,6 +695,9 @@ fn plugin_manager(ui: &mut egui::Ui, cx: &mut UiCx) {
                     |ui| {
                         if restart {
                             kit::badge(ui, "Restart required", Tone::Warning);
+                        }
+                        if unsupported.is_some() {
+                            return;
                         }
                         changed = kit::toggle(ui, &mut on, "").on_hover_text(if on { format!("Turn off the {} plugin", pl.name) } else { format!("Turn on the {} plugin", pl.name) }).changed();
                     },

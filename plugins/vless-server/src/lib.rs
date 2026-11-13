@@ -32,6 +32,7 @@ pub static PLUGIN: Plugin = Plugin {
     requires: &["servers"],
     required: false,
     default_enabled: false,
+    platforms: Platform::ALL,
     setup,
 };
 
@@ -97,17 +98,9 @@ impl Op for SetEnabled {
     type Reply = ();
 }
 
-fn random<const N: usize>() -> [u8; N] {
-    let mut b = [0; N];
-    getrandom::fill(&mut b).expect("system randomness");
-    b
-}
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
 pub fn generate_keys() -> Keys {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    let secret = x25519_dalek::StaticSecret::from(random::<32>());
+    let secret = x25519_dalek::StaticSecret::from(random_bytes::<32>());
     let public = x25519_dalek::PublicKey::from(&secret);
     let site_port = std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
@@ -115,8 +108,8 @@ pub fn generate_keys() -> Keys {
     Keys {
         private_key: URL_SAFE_NO_PAD.encode(secret.to_bytes()),
         public_key: URL_SAFE_NO_PAD.encode(public.as_bytes()),
-        short_id: hex(&random::<8>()),
-        path: format!("/{}", hex(&random::<6>())),
+        short_id: hex(&random_bytes::<8>()),
+        path: format!("/{}", hex(&random_bytes::<6>())),
         site_port,
     }
 }
@@ -152,7 +145,13 @@ fn private_name(d: &str) -> bool {
 
 /// What is missing before the server can run.
 pub fn problem(snap: &Snapshot) -> Option<&'static str> {
-    let c = snap.get(&CONFIG);
+    if snap.get(&CLIENTS).is_empty() {
+        return Some("Add a client to connect with.");
+    }
+    settings_problem(&snap.get(&CONFIG), &snap.get(&KEYS))
+}
+/// What blocks the server apart from clients.
+fn settings_problem(c: &Settings, keys: &Keys) -> Option<&'static str> {
     if !valid_domain(&c.domain) {
         return Some("Enter your domain. Its DNS record must point to this machine.");
     }
@@ -167,10 +166,7 @@ pub fn problem(snap: &Snapshot) -> Option<&'static str> {
     if c.port == 0 {
         return Some("Choose a port, usually 443.");
     }
-    if snap.get(&CLIENTS).is_empty() {
-        return Some("Add a client to connect with.");
-    }
-    if snap.get(&KEYS).private_key.is_empty() {
+    if keys.private_key.is_empty() {
         return Some("Keys are not generated yet.");
     }
     None
@@ -241,7 +237,7 @@ fn listener(snap: &Snapshot) -> Option<Listener> {
 fn setup(p: &mut Setup) -> Result<()> {
     p.editable_setting(&CONFIG);
     p.setting(&KEYS);
-    p.memory(&CERTIFICATE, || site::Certificate::Starting);
+    p.live(&CERTIFICATE, || site::Certificate::Starting);
     p.list(&CLIENTS).validate(|_, c, _, others| {
         c.name = c.name.trim().to_owned();
         if c.name.is_empty() {
@@ -272,10 +268,9 @@ fn setup(p: &mut Setup) -> Result<()> {
                     })
                 });
             }
-            if on {
-                if let Some(why) = problem(w.base()).filter(|w| !w.starts_with("Add a client")) {
-                    bail!("{why}");
-                }
+            // A missing client was just added above.
+            if let Some(why) = settings_problem(&w.get(&CONFIG), &w.get(&KEYS)).filter(|_| on) {
+                bail!("{why}");
             }
             w.update(&CONFIG, |c| c.enabled = on);
             Ok(())
@@ -310,25 +305,7 @@ fn setup(p: &mut Setup) -> Result<()> {
             })
         },
         |cx: Cx, spec: site::Spec| async move {
-            // Certificate changes are stored in order by one writer task.
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            let writer = tokio::spawn(async move {
-                while let Some(state) = rx.recv().await {
-                    let _ = cx
-                        .write(move |w| {
-                            w.set(&CERTIFICATE, state);
-                            Ok(())
-                        })
-                        .await;
-                }
-            });
-            let result = site::run(spec, move |state| {
-                let _ = tx.send(state);
-            })
-            .await
-            .map_err(Error::msg);
-            writer.abort();
-            result
+            site::run(spec, move |state| cx.set_live(&CERTIFICATE, state)).await.map_err(Error::msg)
         },
     );
     ui(p);
@@ -363,7 +340,7 @@ fn status_rows(ui: &mut egui::Ui, cx: &mut UiCx) {
             Icon::Error,
             pal.danger,
             "Listener",
-            &format!("{e} Ports below 1024 need root or CAP_NET_BIND_SERVICE."),
+            &format!("{e}{}", if cfg!(target_os = "linux") && c.port < 1024 { " Ports below 1024 need root or CAP_NET_BIND_SERVICE." } else { "" }),
         ),
         None if listener(&snap).is_some() && core.running() => line(
             ui,
@@ -375,7 +352,7 @@ fn status_rows(ui: &mut egui::Ui, cx: &mut UiCx) {
         None => line(ui, Icon::Info, pal.muted, "Listener", "Off"),
     }
     if c.website == Website::Builtin {
-        let (icon, color, text) = match &*snap.get(&CERTIFICATE) {
+        let (icon, color, text) = match &*snap.live(&CERTIFICATE) {
             _ if !c.enabled => (Icon::Info, pal.muted, "Starts with the server".to_owned()),
             site::Certificate::Starting => (Icon::Info, pal.muted, "Starting…".to_owned()),
             site::Certificate::SelfSigned(why) => (Icon::Warning, pal.warning, format!("Self-signed for now. {why}")),

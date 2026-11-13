@@ -10,3 +10,6 @@ plugin-servers = { path = "../servers" }
 plugin-format-uri = { path = "../format-uri" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+reqwest = { workspace = true }
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+base64 = "0.23"

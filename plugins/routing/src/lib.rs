@@ -2,9 +2,115 @@
 //! Ordered routing rules: domains (with `*`), IPs, CIDR networks and IPv4 prefixes
 //! like `192.168.*`, each sent via the selected server, directly or blocked.
 //! Rules become typed mihomo rules in the `User` stage; the first match wins.
+//!
+//! Geo rules (`geosite:category-ru`, `geoip:ru`) use rule sets from the
+//! MetaCubeX geo database. The core downloads them, keeps them in its home
+//! folder and refreshes them daily; the page can refresh them on demand.
 use plugin_servers as servers;
+use rproxy_kernel::mihomo::{RuleBehavior, RuleProvider};
 use rproxy_kernel::{kit, mihomo::ipnet::IpNet, prelude::*, ui::Column, ui::ListEditor};
-use std::net::{IpAddr, Ipv4Addr};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr},
+    time::Duration,
+};
+
+/// Where geo rule sets come from (a CDN mirror of MetaCubeX/meta-rules-dat).
+pub const GEO_SOURCE: &str = "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo";
+const GEO_REFRESH: u32 = 86_400;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Geo {
+    Site,
+    Ip,
+}
+/// `geosite:NAME` or `geoip:CODE` (already normalized to lowercase).
+pub fn geo(pattern: &str) -> Option<(Geo, &str)> {
+    let (kind, name) = pattern.split_once(':')?;
+    let kind = match kind {
+        "geosite" => Geo::Site,
+        "geoip" => Geo::Ip,
+        _ => return None,
+    };
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"-_!@.".contains(&c));
+    valid.then_some((kind, name))
+}
+/// The rule set behind a geo pattern.
+pub fn provider(kind: Geo, name: &str) -> RuleProvider {
+    let (folder, prefix, behavior) = match kind {
+        Geo::Site => ("geosite", "geosite", RuleBehavior::Domain),
+        Geo::Ip => ("geoip", "geoip", RuleBehavior::IpCidr),
+    };
+    RuleProvider {
+        name: format!("{prefix}-{name}"),
+        behavior,
+        url: format!("{GEO_SOURCE}/{folder}/{name}.mrs"),
+        interval_secs: GEO_REFRESH,
+    }
+}
+
+/// Download state of one geo rule set, from the core.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GeoStatus {
+    pub rules: u64,
+    pub updated: Option<String>,
+}
+/// Rule set name → state (refreshed every minute while geo rules exist).
+pub static GEO: State<HashMap<String, GeoStatus>> = State::new("routing.geo");
+
+/// Download every geo rule set again now (job "Update geo data").
+pub struct UpdateGeo;
+impl Op for UpdateGeo {
+    type Reply = ();
+    fn job(&self) -> Option<JobSpec> {
+        Some(JobSpec::keyed("routing/geo", "Update geo data").page("routing"))
+    }
+}
+struct RefreshGeo;
+impl Op for RefreshGeo {
+    type Reply = ();
+    fn job(&self) -> Option<JobSpec> {
+        Some(JobSpec::keyed("routing/geo-status", "Read geo data status").quiet())
+    }
+}
+fn geo_providers(snap: &Snapshot) -> Vec<RuleProvider> {
+    let mut out: Vec<RuleProvider> = Vec::new();
+    for r in snap.get(&RULES).iter() {
+        if let Some((kind, name)) = geo(&r.pattern) {
+            let p = provider(kind, name);
+            if !out.iter().any(|o| o.name == p.name) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+async fn read_geo(cx: &Cx) -> Result<()> {
+    let all = cx.core().rule_providers().await?;
+    let status: HashMap<String, GeoStatus> = geo_providers(&cx.snapshot())
+        .into_iter()
+        .map(|p| {
+            let v = &all[&p.name];
+            let updated = v["updatedAt"]
+                .as_str()
+                .filter(|t| !t.starts_with("0001"))
+                .map(str::to_owned);
+            (
+                p.name,
+                GeoStatus {
+                    rules: v["ruleCount"].as_u64().unwrap_or(0),
+                    updated,
+                },
+            )
+        })
+        .collect();
+    cx.set_live(&GEO, status);
+    Ok(())
+}
 
 pub static PLUGIN: Plugin = Plugin {
     id: "routing",
@@ -14,6 +120,7 @@ pub static PLUGIN: Plugin = Plugin {
     requires: &["servers"],
     required: false,
     default_enabled: true,
+    platforms: Platform::ALL,
     setup,
 };
 
@@ -45,7 +152,14 @@ fn target(r: Route, via: &Target) -> Target {
 pub fn core_rule(rule: &Rule, via: &Target) -> Result<CoreRule> {
     let (pattern, network) = rule_pattern(&rule.pattern)?;
     let t = target(rule.action, via);
-    Ok(if pattern == "*" {
+    Ok(if let Some((kind, name)) = geo(&pattern) {
+        // IP sets resolve domains, so they also match sites by name.
+        CoreRule::RuleSet {
+            name: provider(kind, name).name,
+            target: t,
+            no_resolve: false,
+        }
+    } else if pattern == "*" {
         CoreRule::Match(t)
     } else if let Some(net) = network {
         CoreRule::IpCidr { net, target: t, no_resolve: true }
@@ -86,8 +200,13 @@ pub fn rule_pattern(pattern: &str) -> Result<(String, Option<IpNet>)> {
             p.push(c);
         }
     }
-    if p == "*" {
+    if p == "*" || geo(&p).is_some() {
         return Ok((p, None));
+    }
+    if p.starts_with("geosite:") || p.starts_with("geoip:") {
+        return Err(Error::msg(
+            "Enter a geo list name, for example geosite:category-ru or geoip:ru.",
+        ));
     }
     if let Ok(net) = p.parse::<IpNet>() {
         return Ok((net.trunc().to_string(), Some(net.trunc())));
@@ -147,9 +266,54 @@ fn setup(p: &mut Setup) -> Result<()> {
         rule.pattern = pattern;
         Ok(())
     });
+    p.live(&GEO, HashMap::new);
     p.core(|snap| {
         let via = servers::route(snap);
-        Fragment::rules(Stage::User, snap.get(&RULES).iter().filter_map(|r| core_rule(r, &via).ok()))
+        Fragment {
+            rule_providers: geo_providers(snap),
+            ..Fragment::rules(
+                Stage::User,
+                snap.get(&RULES)
+                    .iter()
+                    .filter_map(|r| core_rule(r, &via).ok()),
+            )
+        }
+    });
+    p.handle(|cx: Cx, _: UpdateGeo| async move {
+        let sets = geo_providers(&cx.snapshot());
+        let total = Some(sets.len() as u64);
+        let mut failed = Vec::new();
+        for (i, p) in sets.iter().enumerate() {
+            cx.checkpoint()?;
+            if cx.core().update_rule_provider(&p.name).await.is_err() {
+                failed.push(p.name.clone());
+            }
+            cx.progress(i as u64 + 1, total);
+        }
+        let _ = read_geo(&cx).await;
+        if !failed.is_empty() {
+            bail!("Could not download {}.", failed.join(", "));
+        }
+        cx.summary(kit::plural(
+            sets.len(),
+            "geo list updated",
+            "geo lists updated",
+        ));
+        Ok(())
+    });
+    p.handle(|cx: Cx, _: RefreshGeo| async move { read_geo(&cx).await });
+    p.every(
+        "geo-status",
+        |s| (!geo_providers(s).is_empty()).then_some(Duration::from_secs(60)),
+        || RefreshGeo,
+    );
+    // New geo rules download in the background; show their state soon after.
+    p.on_change([RULES.name], |cx: Cx| async move {
+        if !geo_providers(&cx.snapshot()).is_empty() {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            read_geo(&cx).await?;
+        }
+        Ok(())
     });
     p.page_fn(PageSpec { id: "routing", title: "Routing", icon: Icon::Routing, order: 30 }, page);
     Ok(())
@@ -159,6 +323,8 @@ fn setup(p: &mut Setup) -> Result<()> {
 fn kind(pattern: &str) -> &'static str {
     match rule_pattern(pattern) {
         Ok((p, _)) if p == "*" => "Everything",
+        Ok((p, _)) if p.starts_with("geosite:") => "Geo sites",
+        Ok((p, _)) if p.starts_with("geoip:") => "Geo IPs",
         Ok((_, Some(net))) if net.prefix_len() == net.max_prefix_len() => "IP",
         Ok((_, Some(_))) => "Network",
         _ => "Domain",
@@ -166,15 +332,32 @@ fn kind(pattern: &str) -> &'static str {
 }
 
 fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
+    let geo_status = (*cx.live(&GEO)).clone();
     let n = cx.get(&RULES).len();
-    let counter = if n == 0 { String::new() } else { kit::plural(n, "rule", "rules") };
-    kit::page_header(ui, "Routing", &counter, |_| {});
-    kit::helper(ui, "Rules apply top to bottom and the first match wins. Other traffic goes via the selected server.");
+    let counter = if n == 0 {
+        String::new()
+    } else {
+        kit::plural(n, "rule", "rules")
+    };
+    let has_geo = !geo_providers(cx.snapshot()).is_empty();
+    kit::page_header(ui, "Routing", &counter, |ui| {
+        if has_geo {
+            cx.job_button(
+                ui,
+                Icon::Refresh,
+                "Update geo data",
+                140.,
+                cx.core_status().running(),
+                || UpdateGeo,
+            );
+        }
+    });
+    kit::helper(ui, "Rules apply top to bottom and the first match wins. Other traffic goes via the selected server. Geo lists: geosite:category-ru, geoip:ru; put site lists above IP lists.");
     ListEditor::new(&RULES)
         .add_form("Add routing rule", || Rule { id: Id::random(), pattern: String::new(), action: Route::Proxy }, |ui, r, width| {
             let w = (width - 120. - kit::theme::HORIZONTAL_GAP).max(60.);
             let e = kit::input(ui, "pattern", &mut r.pattern, "Domain, IP or network", w, false)
-                .on_hover_text("Examples: *.example.org, 10.0.0.0/8, 192.168.*");
+                .on_hover_text("Examples: *.example.org, 10.0.0.0/8, 192.168.*, geosite:category-ru, geoip:ru");
             kit::choice(ui, "route", &mut r.action, Route::ALL, 120., "Route");
             kit::submitted(ui, &e) && !r.pattern.trim().is_empty()
         })
@@ -183,8 +366,18 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
             kit::badge(ui, kind(&r.pattern), kit::Tone::Neutral);
         }))
         .column(Column::choice("Route", 120., |r: &mut Rule| &mut r.action, Route::ALL))
-        .subtitle(|rows, i| {
-            rows[..i].iter().any(|r| r.pattern == "*").then(|| ("Never used: the * rule above matches everything first".into(), kit::Tone::Warning))
+        .subtitle(move |rows, i| {
+            if rows[..i].iter().any(|r| r.pattern == "*") {
+                return Some(("Never used: the * rule above matches everything first".into(), kit::Tone::Warning));
+            }
+            let (kind, name) = geo(&rows[i].pattern)?;
+            let status = geo_status.get(&provider(kind, name).name).cloned();
+            let what = if kind == Geo::Site { ("domain", "domains") } else { ("network", "networks") };
+            Some(match status {
+                Some(GeoStatus { rules, updated: Some(_) }) if rules > 0 => (kit::plural(rules as usize, what.0, what.1), kit::Tone::Neutral),
+                Some(GeoStatus { updated: Some(_), .. }) => ("The list is empty. Check the name".into(), kit::Tone::Warning),
+                _ => ("Not downloaded yet. Check the name or update geo data".into(), kit::Tone::Warning),
+            })
         })
         .empty(Icon::Routing, "No routing rules", "All traffic goes via the selected server. Add a rule to send a domain or network directly or block it.")
         .show(ui, cx);
@@ -199,7 +392,32 @@ mod tests {
         assert_eq!(rule_pattern("192.168.*").unwrap().1.unwrap().to_string(), "192.168.0.0/16");
         assert_eq!(rule_pattern("**.Example.ORG").unwrap().0, "*.example.org");
         assert_eq!(rule_pattern("10.1.2.3/8").unwrap().0, "10.0.0.0/8");
-        let r = Rule { id: Id::random(), pattern: "*.example.org".into(), action: Route::Direct };
-        assert_eq!(core_rule(&r, &servers::main_target()).unwrap().wire(), "DOMAIN-REGEX,^.*\\.example\\.org$,DIRECT");
+        assert_eq!(
+            rule_pattern("GeoSite:Category-RU").unwrap().0,
+            "geosite:category-ru"
+        );
+        assert!(rule_pattern("geoip:").is_err() && rule_pattern("geosite:a b").is_err());
+        let g = Rule {
+            id: Id::random(),
+            pattern: "geoip:ru".into(),
+            action: Route::Direct,
+        };
+        assert_eq!(
+            core_rule(&g, &servers::main_target()).unwrap().wire(),
+            "RULE-SET,geoip-ru,DIRECT"
+        );
+        assert_eq!(
+            provider(Geo::Site, "category-ru").url,
+            format!("{GEO_SOURCE}/geosite/category-ru.mrs")
+        );
+        let r = Rule {
+            id: Id::random(),
+            pattern: "*.example.org".into(),
+            action: Route::Direct,
+        };
+        assert_eq!(
+            core_rule(&r, &servers::main_target()).unwrap().wire(),
+            "DOMAIN-REGEX,^.*\\.example\\.org$,DIRECT"
+        );
     }
 }

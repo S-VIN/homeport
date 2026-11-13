@@ -18,6 +18,7 @@
 #![allow(clippy::type_complexity)]
 extern crate self as rproxy_kernel;
 
+pub mod backup;
 pub mod board;
 mod changes;
 pub mod core;
@@ -34,13 +35,14 @@ mod slot;
 mod state;
 pub mod store;
 pub mod ui;
+pub mod updates;
 
 pub use board::{Phase, Run, RunId};
 pub use host::{Host, Session};
-pub use id::{now, Id};
+pub use id::{hex, now, random_bytes, Id};
 pub use kernel::{Cx, Kernel, Notice, Started};
 pub use op::{Claim, JobSpec, Next, Op, Rank};
-pub use plugin::{categories, Category, Plugin, Policy};
+pub use plugin::{categories, Category, Platform, Plugin, Policy};
 pub use rproxy_derive::Table;
 pub use rproxy_kit as kit;
 pub use rproxy_kit::egui;
@@ -110,8 +112,8 @@ pub mod prelude {
     pub use crate::list::{Add, Added, Move, Remove, Removed, Save, Saved};
     pub use crate::mihomo::{self, Fragment, Rule as CoreRule, Stage, Target};
     pub use crate::{
-        bail, categories, choices, now, Category, Changed, Claim, Cx, Error, Hook, Id, JobSpec, Next,
-        Op, Page, PageSpec, Plugin, Policy, Rank, Record, Result, Set, Setup, Slot, Snapshot, Started, Update,
+        bail, categories, choices, hex, now, random_bytes, Category, Changed, Claim, Cx, Error, Hook, Id, JobSpec, Next,
+        Op, Page, PageSpec, Platform, Plugin, Policy, Rank, Record, Result, Set, Setup, Slot, Snapshot, Started, Update,
         State, Table, UiCx, Write,
     };
     pub use crate::shell::{PANELS, SETTINGS_SECTIONS, STATUS};

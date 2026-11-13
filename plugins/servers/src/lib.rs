@@ -26,6 +26,7 @@ pub static PLUGIN: Plugin = Plugin {
     requires: &[],
     required: true,
     default_enabled: true,
+    platforms: Platform::ALL,
     setup,
 };
 

@@ -22,7 +22,7 @@ pub static PLUGIN: Plugin = Plugin {
     id: "routing", name: "Routing",
     description: "Send domains and networks via the server, directly, or block them.",
     category: categories::NETWORK, requires: &["servers"],
-    required: false, default_enabled: true, setup,
+    required: false, default_enabled: true, platforms: Platform::ALL, setup,
 };
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Table)]
@@ -49,6 +49,8 @@ fn setup(p: &mut Setup) -> Result<()> {
 ```
 
 Подключение: крейт в `plugins/`, зависимость в корневом `Cargo.toml` и строка в `src/lib.rs` (`catalog()`).
+
+**Платформы.** `platforms` перечисляет системы, которые плагин поддерживает: `Platform::ALL` или, например, `&[Platform::Linux]`. Код под каждую систему плагин пишет сам (`#[cfg(target_os = "…")]`/`#[cfg(windows)]` внутри крейта), но крейт обязан компилироваться на всех системах: там, где поддержки нет, — без вызовов системы. На неподдерживаемой системе ядро не вызывает `setup`, плагин виден в **Settings → Plugins** без переключателя с пометкой «Not available on this system · Linux only», а плагины, которые от него зависят, неактивны. Обязательный (`required`) плагин должен поддерживать все системы. Объявляйте только системы, для которых код написан и проверен.
 
 Правила для автора:
 - имя состояния начинается с `id` плагина и точки (`routing.rules`); писать в чужое состояние нельзя, только вызывать op владельца;
@@ -111,6 +113,8 @@ p.wrap(|cx, f: Fetch, next: Next<Fetch>| async move {
 
 Хуки для синхронных вопросов: `servers::ROUTE` (куда идёт трафик «через сервер»; по умолчанию группа `main`, Exit server отвечает своим выходом), `servers::EXCLUDE` (почему сервер нельзя использовать), `servers::FAILOVER` (резервы подключённого сервера: группа `main` становится `fallback` `[выбранный, резервы…]`), `servers::IDLE` (почему ничего не подключено — текст в карточке подключения), `SOURCE_LABEL`, `SOURCE_HUE` (цвет тега источника; рисует `servers::source_tag`), `SORT_KEYS`, `FREEZE`, `subscriptions::LINK` (принять прямую ссылку), `shell::TRAY` (цвет иконки трея, побеждает худший ответ).
 
+Долгие задачи — `p.service(name, spec, run)`: задача перезапускается при смене `spec(snapshot)` (`None` — остановить) и отменяется при остановке ядра; отменённая задача убирает за собой через `Drop` (так системный прокси возвращается). `p.data_dir()` — каталог данных профиля. `cx.core().routed_http()` — HTTP-клиент по обычным правилам (для загрузок, которым прямой путь закрыт); `cx.core().direct_or_routed("GitHub", |c| c.get(url).send())` — сначала напрямую с коротким таймаутом соединения, затем этим клиентом. Ошибка задачи по расписанию (`p.every`) показывается один раз, пока задача снова не пройдёт. Общие мелочи: `random_bytes::<N>()`, `hex(&bytes)`, `now()`.
+
 Чужой вклад можно заменить (`p.replace`), обернуть (`p.wrap_view`) или скрыть (`p.hide`) по его id `плагин/имя`.
 
 ## Плагины в поставке
@@ -123,11 +127,12 @@ p.wrap(|cx, f: Fetch, next: Next<Fetch>| async move {
 | health-checks — «Checks» | Servers | Задержка и тесты через delay API mihomo, скорость через полосы проверок, рейтинг (`Rate`) | колонки, детали, сортировки, трей |
 | format-uri, format-xray, format-clash | Subscription formats | Разбор документов | `subscriptions::Parse`, `LINK` |
 | auto-select — «Auto select» | Server selection (exclusive) | Автовыбор сервера, резервы для fallback, проверка текущего сервера каждые 10 с | обёртка `servers::Select`, `servers::FAILOVER`, `IDLE`, события |
-| routing — «Routing» | Network & system | Правила маршрутизации | конфиг mihomo |
-| inbounds — «Listeners» | Network & system | HTTP/SOCKS5 слушатели | конфиг mihomo, обёртка `subscriptions::Fetch` |
-| exit-server — «Exit server» | Network & system | Второй хоп после выбранного сервера | `servers::ROUTE`, CONNECTION, STATUS, PANELS |
+| routing — «Routing» | Network & system | Правила маршрутизации, гео-списки `geosite:`/`geoip:` (rule-providers ядра) | конфиг mihomo |
+| inbounds — «Listeners» | Network & system | HTTP/SOCKS5 слушатели, системный прокси (`p.service`, возврат при остановке), TUN | конфиг mihomo, обёртка `subscriptions::Fetch` |
+| exit-server — «Exit server» | Network & system | Второй хоп после выбранного сервера или напрямую; WARP как резерв или выход | `servers::ROUTE`, CONNECTION, STATUS, PANELS |
+| connections — «Connections» | Network & system | Открытые соединения и трафик, закрытие | `p.service`, STATUS, `servers::DETAILS` |
 | vless-server — «VLESS server» (выкл. по умолчанию) | Network & system | VLESS-вход с REALITY self-steal и XHTTP, сайт-приманка с Let's Encrypt, клиенты и ссылки | конфиг mihomo, `p.service`, STATUS |
-| autostart — «Start at login» | Network & system | Запуск при входе | Settings |
+| autostart — «Start at login» (только Linux) | Network & system | Запуск при входе (XDG autostart) | Settings |
 
 ## Тесты
 

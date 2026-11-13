@@ -50,6 +50,17 @@ impl PrimaryKey for Id {
     type Lookup = Self;
 }
 
+/// Bytes from the system's secure random source (keys, secrets, ids).
+pub fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut b = [0; N];
+    getrandom::fill(&mut b).expect("system randomness");
+    b
+}
+/// Lowercase hex, e.g. for short ids and digests.
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Unix seconds.
 pub fn now() -> u64 {
     std::time::SystemTime::now()

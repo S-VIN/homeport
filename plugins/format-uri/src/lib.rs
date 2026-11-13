@@ -17,6 +17,7 @@ pub static PLUGIN: Plugin = Plugin {
     requires: &["subscriptions"],
     required: false,
     default_enabled: true,
+    platforms: Platform::ALL,
     setup,
 };
 

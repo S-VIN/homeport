@@ -12,6 +12,7 @@ pub static PLUGIN: Plugin = Plugin {
     requires: &["servers"],
     required: false,
     default_enabled: true,
+    platforms: Platform::ALL,
     setup,
 };
 
