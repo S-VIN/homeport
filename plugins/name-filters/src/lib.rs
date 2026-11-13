@@ -64,7 +64,9 @@ fn setup(p: &mut Setup) -> Result<()> {
         // The page header gives the toolbar its room; drop the label in a narrow window.
         let label = if ui.ctx().content_rect().width() >= 560. { "Name filters" } else { "" };
         let r = kit::Button::secondary(label).icon(Icon::Filter).count((n > 0).then_some(n)).selected(is_open).show(ui);
-        if r.on_hover_text("Name filters: never use servers whose names match").clicked() {
+        r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Name filters"));
+        let r = if label.is_empty() { r.on_hover_text("Name filters") } else { r };
+        if r.clicked() {
             is_open = !is_open;
             ui.data_mut(|d| d.insert_temp(open(), is_open));
         }
@@ -87,12 +89,13 @@ fn setup(p: &mut Setup) -> Result<()> {
                 }
             });
         });
-        kit::helper(ui, "Servers whose whole name matches are never used. * matches any text.");
+
         ListEditor::new(&FILTERS)
             .unordered()
             .no_headers()
             .add_form("Add name filter", || Filter { id: Id::random(), pattern: String::new() }, |ui, f, width| {
-                let r = kit::input(ui, "pattern", &mut f.pattern, "Name pattern, e.g. *test*", width, false);
+                let r = kit::input(ui, "pattern", &mut f.pattern, "Name pattern, e.g. *test*", width, false)
+                    .on_hover_text("Excludes matching names. Matches the whole name; * matches any text.");
                 kit::submitted(ui, &r) && !f.pattern.trim().is_empty()
             })
             .column(Column::edit("Pattern", "Name pattern", |f: &mut Filter| &mut f.pattern))
@@ -100,7 +103,7 @@ fn setup(p: &mut Setup) -> Result<()> {
                 let n = cx.get(&servers::SERVERS).iter().filter(|s| wildcard(&f.pattern, &s.name)).count();
                 kit::hint(ui, kit::plural(n, "server", "servers"));
             }).right())
-            .empty(Icon::Filter, "No name filters", "Add a pattern above to exclude servers by name.")
+            .empty(Icon::Filter, "No name filters")
             .show(ui, cx);
     });
     Ok(())

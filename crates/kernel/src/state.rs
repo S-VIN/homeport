@@ -37,7 +37,6 @@ pub(crate) type Value = Arc<dyn Any + Send + Sync>;
 #[derive(Clone)]
 pub(crate) struct Cell {
     pub value: Value,
-    pub rev: u64,
 }
 
 /// A live state's cell: one per kernel, shared by every snapshot, replaced in place.
@@ -78,10 +77,6 @@ impl Snapshot {
     pub(crate) fn live_cell<T: Send + Sync + 'static>(&self, s: &State<T>) -> Arc<Live<T>> {
         self.get(&State::<Live<T>>::new(s.name))
     }
-    /// Revision of one cell; changes whenever the cell is written.
-    pub fn revision<T>(&self, s: &State<T>) -> u64 {
-        self.cells.get(s.name).map_or(0, |c| c.rev)
-    }
     pub fn rev(&self) -> u64 {
         self.rev
     }
@@ -89,14 +84,11 @@ impl Snapshot {
     pub fn hooks<I: ?Sized + 'static, O: 'static>(&self, hook: &crate::Hook<I, O>, input: &I) -> Vec<O> {
         self.reg.hook_fns(hook).iter().map(|f| f(self, input)).collect()
     }
-    pub fn enabled(&self, plugin: &str) -> bool {
-        self.reg.plugins.iter().any(|p| p.id == plugin)
-    }
     pub(crate) fn with(&self, changed: HashMap<&'static str, Value>) -> Snapshot {
         let rev = self.rev + 1;
         let mut cells = (*self.cells).clone();
         for (k, v) in changed {
-            cells.insert(k, Cell { value: v, rev });
+            cells.insert(k, Cell { value: v });
         }
         Snapshot { cells: Arc::new(cells), reg: self.reg.clone(), rev }
     }
@@ -162,11 +154,6 @@ impl<'a> Write<'a> {
 #[derive(Clone, Debug)]
 pub struct Changed {
     pub states: Arc<Vec<&'static str>>,
-}
-impl Changed {
-    pub fn touches<T>(&self, s: &State<T>) -> bool {
-        self.states.contains(&s.name)
-    }
 }
 
 // ---- persistence ----------------------------------------------------------
@@ -253,10 +240,11 @@ pub(crate) fn setting<T: Serialize + DeserializeOwned + Default + Send + Sync + 
     Persist {
         register: Box::new(|_| Ok(())),
         load: Box::new(move |tx| {
-            let value: T = tx
-                .get::<SettingRow>(name)?
-                .and_then(|r| serde_json::from_str(&r.json).ok())
-                .unwrap_or_default();
+            let value: T = match tx.get::<SettingRow>(name)? {
+                Some(row) => serde_json::from_str(&row.json)
+                    .map_err(|_| crate::Error::msg(format!("Invalid saved setting: {name}")))?,
+                None => T::default(),
+            };
             Ok(Arc::new(value) as Value)
         }),
         save: Box::new(move |tx, _, after| {

@@ -9,4 +9,4 @@ rproxy-kernel = { path = "../../crates/kernel" }
 plugin-servers = { path = "../servers" }
 plugin-subscriptions = { path = "../subscriptions" }
 serde_json = { workspace = true }
-serde_yaml_ng = "0.10.0"
+serde-saphyr = "2.1.1"

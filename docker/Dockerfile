@@ -21,7 +21,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && mkdir /data
 WORKDIR /app
 COPY --from=build /rproxy ./rproxy
-COPY --from=build /core/ ./assets/mihomo/
+COPY --from=build /core/mihomo ./mihomo
+COPY --from=build /core/LICENSE ./licenses/mihomo/LICENSE
 ENV HOME=/data
+# Plugins see Platform::Docker: no system proxy, TUN or login items here.
+ENV RPROXY_DOCKER=1
 ENTRYPOINT ["/app/rproxy"]
 CMD ["web", "--listen", "127.0.0.1:20800", "--data-dir", "/data"]

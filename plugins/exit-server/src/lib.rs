@@ -201,39 +201,8 @@ fn setup(p: &mut Setup) -> Result<()> {
     p.editable_setting(&SETTINGS);
     p.setting(&WARP_ACCOUNT);
     p.live(&PROBE, || None);
-    p.handle(|cx: Cx, _: SetUpWarp| async move {
-        let account = warp::register(&cx).await?;
-        cx.write(move |w| {
-            w.set(&WARP_ACCOUNT, Some(account));
-            if w.get(&SETTINGS).warp == WarpUse::Off {
-                let mut s = (*w.get(&SETTINGS)).clone();
-                s.warp = if active(w.base()).is_some() {
-                    WarpUse::Backup
-                } else {
-                    WarpUse::Only
-                };
-                w.set(&SETTINGS, s);
-            }
-            Ok(())
-        })
-        .await?;
-        cx.set_live(&PROBE, None);
-        cx.summary("WARP is ready");
-        cx.spawn(CheckExit)?;
-        Ok(())
-    });
-    p.handle(|cx: Cx, _: RemoveWarp| async move {
-        cx.write(|w| {
-            w.set(&WARP_ACCOUNT, None);
-            let mut s = (*w.get(&SETTINGS)).clone();
-            s.warp = WarpUse::Off;
-            w.set(&SETTINGS, s);
-            Ok(())
-        })
-        .await?;
-        cx.set_live(&PROBE, None);
-        Ok(())
-    });
+    p.handle(set_up_warp);
+    p.handle(remove_warp);
     // The first exit added is the one in use.
     p.on(|cx: Cx, e: Added<Exit>| async move {
         if cx.get(&ACTIVE).is_none() {
@@ -247,114 +216,136 @@ fn setup(p: &mut Setup) -> Result<()> {
         }
         Ok(())
     });
-    p.handle(|cx: Cx, Use(id): Use| async move {
-        cx.write(move |w| {
-            if id.is_some_and(|id| !w.get(&EXITS).iter().any(|e| e.id == id)) {
-                bail!("This exit server no longer exists.");
-            }
-            w.set(&ACTIVE, id);
-            Ok(())
-        })
-        .await?;
-        cx.set_live(&PROBE, None);
-        if id.is_some() {
-            cx.spawn(CheckExit)?;
-        }
-        Ok(())
-    });
-    p.handle(|cx: Cx, _: CheckExit| async move {
-        let snap = cx.snapshot();
-        let Some(plan) = plan(&snap) else {
-            bail!("No exit server is in use.");
-        };
-        if through_entry(&snap) && snap.get(&servers::SELECTED).is_none() {
-            bail!("Connect to a server first: it is the entry to the exit server.");
-        }
-        let result = cx
-            .core()
-            .delay(plan.target(), PROBE_URL, 6000)
-            .await
-            .map_err(|e| e.message);
-        cx.set_live(&PROBE, Some((result.clone(), now())));
-        result.map_err(|_| Error::msg("The exit did not answer."))
-    });
+    p.handle(use_exit);
+    p.handle(check_exit);
     p.every(
         "check",
         // Only while there is something to check: no entry is shown on the page, not as an error.
         |s| plan(s).filter(|_| !through_entry(s) || s.get(&servers::SELECTED).is_some()).map(|_| Duration::from_secs(120)),
         || CheckExit,
     );
-    // The exit keeps its transport connections (XHTTP reuse) open for a long
-    // time. A new entry or a disconnect must take effect now: rebuild the exit
-    // so new connections are dialed through the current entry, or not at all.
-    p.wrap(
-        |cx: Cx, op: servers::Select, next: Next<servers::Select>| async move {
-            let before = *cx.get(&servers::SELECTED);
-            next.run(&cx, op).await?;
-            let snap = cx.snapshot();
-            if *snap.get(&servers::SELECTED) != before
-                && plan(&snap).is_some()
-                && through_entry(&snap)
-            {
-                cx.core().reapply().await?;
-            }
-            Ok(())
-        },
-    );
-
-    p.core(|snap| {
-        let Some(plan) = plan(snap) else {
-            return Fragment::default();
-        };
-        let dial = through_entry(snap).then_some(servers::MAIN);
-        let mut f = Fragment::default();
-        if let Plan::Exit(e) | Plan::ExitThenWarp(e) = &plan {
-            let Ok(px) = proxy(&e.link) else { return f };
-            let mut options = px.options;
-            if let Some(via) = dial {
-                options.insert("dialer-proxy".into(), json!(via));
-            }
-            f.proxies.push(mihomo::Proxy {
-                name: EXIT.into(),
-                protocol: px.protocol.to_string(),
-                server: px.server,
-                port: px.port,
-                options,
-            });
-        }
-        if let (Plan::Warp | Plan::ExitThenWarp(_), Some(account)) =
-            (&plan, &*snap.get(&WARP_ACCOUNT))
-        {
-            f.proxies.push(warp::proxy(WARP, account, dial));
-        }
-        if matches!(plan, Plan::ExitThenWarp(_)) {
-            f.groups.push(mihomo::Group {
-                name: EXIT_ROUTE.into(),
-                kind: mihomo::GroupKind::Fallback {
-                    url: PROBE_URL.into(),
-                    interval_secs: 60,
-                },
-                members: vec![Target::Proxy(EXIT.into()), Target::Proxy(WARP.into())],
-                selected: None,
-            });
-        }
-        f
-    });
-    // Fail closed: an exit in use that cannot be built blocks instead of skipping it.
-    p.hook(&servers::ROUTE, |snap, _| {
-        let plan = plan(snap)?;
-        let broken =
-            matches!(&plan, Plan::Exit(e) | Plan::ExitThenWarp(e) if proxy(&e.link).is_err());
-        Some(if broken {
-            Target::Reject
-        } else if matches!(plan, Plan::ExitThenWarp(_)) {
-            Target::Group(EXIT_ROUTE.into())
-        } else {
-            Target::Proxy(plan.target().into())
-        })
-    });
+    p.wrap(redial_on_new_entry);
+    p.core(fragment);
+    p.hook(&servers::ROUTE, |snap, _| route(snap));
     ui(p);
     Ok(())
+}
+
+async fn set_up_warp(cx: Cx, _: SetUpWarp) -> Result<()> {
+    let account = warp::register(&cx).await?;
+    cx.write(move |w| {
+        w.set(&WARP_ACCOUNT, Some(account));
+        if w.get(&SETTINGS).warp == WarpUse::Off {
+            let warp = if active(w.base()).is_some() { WarpUse::Backup } else { WarpUse::Only };
+            w.update(&SETTINGS, |s| s.warp = warp);
+        }
+        Ok(())
+    })
+    .await?;
+    cx.set_live(&PROBE, None);
+    cx.summary("WARP is ready");
+    cx.spawn(CheckExit)?;
+    Ok(())
+}
+
+async fn remove_warp(cx: Cx, _: RemoveWarp) -> Result<()> {
+    cx.write(|w| {
+        w.set(&WARP_ACCOUNT, None);
+        w.update(&SETTINGS, |s| s.warp = WarpUse::Off);
+        Ok(())
+    })
+    .await?;
+    cx.set_live(&PROBE, None);
+    Ok(())
+}
+
+async fn use_exit(cx: Cx, Use(id): Use) -> Result<()> {
+    cx.write(move |w| {
+        if id.is_some_and(|id| !w.get(&EXITS).iter().any(|e| e.id == id)) {
+            bail!("This exit server no longer exists.");
+        }
+        w.set(&ACTIVE, id);
+        Ok(())
+    })
+    .await?;
+    cx.set_live(&PROBE, None);
+    if id.is_some() {
+        cx.spawn(CheckExit)?;
+    }
+    Ok(())
+}
+
+async fn check_exit(cx: Cx, _: CheckExit) -> Result<u32> {
+    let snap = cx.snapshot();
+    let Some(plan) = plan(&snap) else {
+        bail!("No exit server is in use.");
+    };
+    if through_entry(&snap) && snap.get(&servers::SELECTED).is_none() {
+        bail!("Connect to a server first: it is the entry to the exit server.");
+    }
+    let result = cx.core().delay(plan.target(), PROBE_URL, 6000).await.map_err(|e| e.message);
+    cx.set_live(&PROBE, Some((result.clone(), now())));
+    result.map_err(|_| Error::msg("The exit did not answer."))
+}
+
+/// The exit keeps its transport connections (XHTTP reuse) open for a long
+/// time. A new entry or a disconnect must take effect now: rebuild the exit
+/// so new connections are dialed through the current entry, or not at all.
+async fn redial_on_new_entry(cx: Cx, op: servers::Select, next: Next<servers::Select>) -> Result<()> {
+    let before = *cx.get(&servers::SELECTED);
+    next.run(&cx, op).await?;
+    let snap = cx.snapshot();
+    if *snap.get(&servers::SELECTED) != before && plan(&snap).is_some() && through_entry(&snap) {
+        cx.core().reapply().await?;
+    }
+    Ok(())
+}
+
+fn fragment(snap: &Snapshot) -> Fragment {
+    let Some(plan) = plan(snap) else {
+        return Fragment::default();
+    };
+    let dial = through_entry(snap).then_some(servers::MAIN);
+    let mut f = Fragment::default();
+    if let Plan::Exit(e) | Plan::ExitThenWarp(e) = &plan {
+        let Ok(px) = proxy(&e.link) else { return f };
+        let mut options = px.options;
+        if let Some(via) = dial {
+            options.insert("dialer-proxy".into(), json!(via));
+        }
+        f.proxies.push(mihomo::Proxy {
+            name: EXIT.into(),
+            protocol: px.protocol.to_string(),
+            server: px.server,
+            port: px.port,
+            options,
+        });
+    }
+    if let (Plan::Warp | Plan::ExitThenWarp(_), Some(account)) = (&plan, &*snap.get(&WARP_ACCOUNT)) {
+        f.proxies.push(warp::proxy(WARP, account, dial));
+    }
+    if matches!(plan, Plan::ExitThenWarp(_)) {
+        f.groups.push(mihomo::Group {
+            name: EXIT_ROUTE.into(),
+            kind: mihomo::GroupKind::Fallback { url: PROBE_URL.into(), interval_secs: 60 },
+            members: vec![Target::Proxy(EXIT.into()), Target::Proxy(WARP.into())],
+            selected: None,
+        });
+    }
+    f
+}
+
+/// Fail closed: an exit in use that cannot be built blocks instead of skipping it.
+fn route(snap: &Snapshot) -> Option<Target> {
+    let plan = plan(snap)?;
+    let broken = matches!(&plan, Plan::Exit(e) | Plan::ExitThenWarp(e) if proxy(&e.link).is_err());
+    Some(if broken {
+        Target::Reject
+    } else if matches!(plan, Plan::ExitThenWarp(_)) {
+        Target::Group(EXIT_ROUTE.into())
+    } else {
+        Target::Proxy(plan.target().into())
+    })
 }
 
 fn latency_text(snap: &Snapshot) -> (String, Tone) {
@@ -422,7 +413,7 @@ fn ui(p: &mut Setup) {
                 cx.job_button(ui, Icon::Checks, "Check", 80., cx.core_status().running(), || CheckExit);
             }
         });
-        kit::helper(ui, "Traffic goes through the selected server, then through the exit server to the internet. Pick a stable server you control as the exit; if it does not answer, traffic stops instead of leaving without it.");
+
         kit::page_scroll(ui, "exit-server", |ui| body(ui, cx, &snap, current.as_ref()));
     });
     status(p);
@@ -443,7 +434,7 @@ fn body(ui: &mut egui::Ui, cx: &mut UiCx, snap: &Snapshot, current: Option<&Plan
         kit::settings_row(
             ui,
             "Entry",
-            "This machine: a node that sends its clients' traffic out through the exit",
+            "Traffic goes through the entry, then the exit server. If the exit is unavailable, traffic stops.",
             |ui| {
                 if kit::segmented(
                     ui,
@@ -475,7 +466,6 @@ fn body(ui: &mut egui::Ui, cx: &mut UiCx, snap: &Snapshot, current: Option<&Plan
                     |ui| {
                         if kit::Button::ghost("Remove")
                             .show(ui)
-                            .on_hover_text("Forget this WARP device")
                             .clicked()
                         {
                             cx.submit("remove-warp", RemoveWarp);
@@ -520,7 +510,7 @@ fn body(ui: &mut egui::Ui, cx: &mut UiCx, snap: &Snapshot, current: Option<&Plan
                 })
                 .right(),
             )
-            .empty(Icon::Exit, "No exit server", "Paste the link of a server you control, for example the one an rproxy VLESS server shows.")
+            .empty(Icon::Exit, "No exit server")
             .show(ui, cx);
 }
 

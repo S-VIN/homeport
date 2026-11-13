@@ -1,7 +1,8 @@
 //! Updating the mihomo core from its GitHub releases.
 //!
 //! The bundled core stays untouched; an update is installed into the core's
-//! home folder (`<data>/core/bin/`) and wins over the bundled one. Downloads try
+//! home folder (`<data>/core/bin/`, with its version in `mihomo.version`) and
+//! wins over the bundled one while it is newer. Downloads try
 //! the direct path first and then the ordinary route (the selected server), are
 //! checked against the SHA-256 digest GitHub publishes for the asset, and the new
 //! binary must report the expected version before it replaces anything.
@@ -45,28 +46,37 @@ fn asset(version: &str) -> Option<String> {
     Some(format!("mihomo-{os}-{arch}-v{version}.{ext}"))
 }
 
-/// `1.19.34` from `v1.19.34`, `Mihomo Meta v1.19.34 linux …` and similar.
-pub fn version_of(text: &str) -> Option<Vec<u32>> {
-    let start = text.find(|c: char| c.is_ascii_digit())?;
-    let v: Vec<u32> = text[start..]
-        .split(|c: char| !c.is_ascii_digit() && c != '.')
-        .next()?
-        .split('.')
-        .filter_map(|p| p.parse().ok())
-        .collect();
-    (v.len() >= 2).then_some(v)
-}
-pub fn newer(candidate: &str, current: &str) -> bool {
-    matches!((version_of(candidate), version_of(current)), (Some(a), Some(b)) if a > b)
-}
+pub use rproxy_mihomo::{newer, version_of};
 
 impl Kernel {
     pub fn core_updates(&self) -> CoreUpdates {
-        self.updates.lock().unwrap().clone()
+        // Read from disk: an app update can bring a newer bundled core, and a
+        // broken update is removed when it fails to start.
+        CoreUpdates { installed: self.installed_core().is_some(), ..self.updates.lock().unwrap().clone() }
     }
-    /// The installed update's executable, if one replaced the bundled core.
+    /// The installed update's executable, if it is used instead of the bundled core.
     pub fn installed_core(&self) -> Option<std::path::PathBuf> {
-        Some(rproxy_mihomo::installed(&self.core.home)).filter(|p| p.is_file())
+        rproxy_mihomo::installed_update(&self.core.home)
+    }
+    /// macOS: let the core create the TUN interface. Asks for an administrator
+    /// password once (per core version), installs a setuid-root copy of the
+    /// core and restarts it.
+    pub async fn grant_core_access(&self) -> Result<()> {
+        if !cfg!(target_os = "macos") {
+            crate::bail!("Granting access is only needed on macOS.");
+        }
+        let home = self.core.home.clone();
+        let script = rproxy_mihomo::grant_tun_script(&rproxy_mihomo::unprivileged(&home), &rproxy_mihomo::privileged(&home));
+        let out = tokio::task::spawn_blocking(move || std::process::Command::new("osascript").arg("-e").arg(script).output())
+            .await
+            .map_err(|e| Error::msg(e.to_string()))?
+            .map_err(|e| Error::msg(format!("Cannot ask for administrator rights: {e}")))?;
+        if !out.status.success() {
+            // -128: the user cancelled the password dialog.
+            let text = String::from_utf8_lossy(&out.stderr);
+            crate::bail!("{}", if text.contains("-128") { "Access was not granted.".to_owned() } else { format!("Could not grant access: {}", text.trim()) });
+        }
+        self.restart_core().await
     }
 
     /// Stop the core, change its file, and start it again — also when the change failed.
@@ -175,8 +185,13 @@ impl Kernel {
                     .await
                     .map_err(|e| Error::msg(e.to_string()))??;
                 // Replaced while stopped: Windows locks running executables.
-                let target = rproxy_mihomo::installed(&k.core.home);
-                k.swap_core(|| std::fs::rename(target.with_extension("download"), &target))
+                // The version file follows the binary, so a failed rename keeps a matching pair.
+                let home = k.core.home.clone();
+                let target = rproxy_mihomo::installed(&home);
+                k.swap_core(|| {
+                    std::fs::rename(target.with_extension("download"), &target)?;
+                    std::fs::write(rproxy_mihomo::installed_version_file(&home), &r.version)
+                })
                     .await
                     .map_err(|e| Error::msg(format!("Cannot install the core: {}", e.message)))?;
                 job.summary(format!("Updated to mihomo {}", r.version));
@@ -193,8 +208,17 @@ impl Kernel {
         let task = Task::new("kernel/core-update", move |job| {
             let k = k.clone();
             async move {
-                let installed = k.installed_core();
-                k.swap_core(|| installed.map_or(Ok(()), std::fs::remove_file)).await?;
+                let home = k.core.home.clone();
+                k.swap_core(|| {
+                    // Also an older update that no longer runs.
+                    for file in [rproxy_mihomo::installed(&home), rproxy_mihomo::installed_version_file(&home)] {
+                        if file.is_file() {
+                            std::fs::remove_file(file)?;
+                        }
+                    }
+                    Ok(())
+                })
+                .await?;
                 job.summary("Using the bundled core");
                 Ok(())
             }
@@ -243,7 +267,14 @@ fn stage(home: &Path, binary: &[u8], version: &str) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).map_err(io)?;
     }
-    let out = std::process::Command::new(&path).arg("-v").output();
+    let mut command = std::process::Command::new(&path);
+    command.arg("-v");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let out = command.output();
     let reported = out
         .as_ref()
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
@@ -259,14 +290,8 @@ fn stage(home: &Path, binary: &[u8], version: &str) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn versions_compare_numerically() {
-        assert_eq!(
-            version_of("Mihomo Meta v1.19.32 linux amd64"),
-            Some(vec![1, 19, 32])
-        );
-        assert!(newer("1.19.34", "v1.19.32"));
-        assert!(newer("1.20.0", "1.19.99"));
-        assert!(!newer("1.19.32", "Mihomo Meta v1.19.32"));
+    fn every_platform_has_a_release_asset() {
         assert!(asset("1.19.34").is_some_and(|a| a.starts_with("mihomo-") && a.contains("1.19.34")));
+        assert!(newer("1.19.34", "v1.19.32"));
     }
 }

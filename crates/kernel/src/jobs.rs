@@ -70,9 +70,6 @@ impl Timing {
             every: Some(every),
         }
     }
-    pub fn at(time: SystemTime) -> Self {
-        Self::once(time.duration_since(SystemTime::now()).unwrap_or_default())
-    }
     fn deadline(self) -> Result<Instant> {
         const MAX: Duration = Duration::from_secs(10 * 366 * 24 * 3600);
         if self.after > MAX

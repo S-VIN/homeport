@@ -19,11 +19,9 @@ pub fn catalog() -> Vec<&'static Plugin> {
         &plugin_exit_server::PLUGIN,
         &plugin_vless_server::PLUGIN,
         &plugin_connections::PLUGIN,
-        // Desktop integration; the plugin itself declares the systems it supports.
+        // Desktop integration (Flatpak uses the Background portal); the plugin
+        // itself declares the systems it supports.
         #[cfg(feature = "desktop")]
         &plugin_autostart::PLUGIN,
     ]
-    .into_iter()
-    .filter(|p| p.id != "autostart" || std::env::var_os("FLATPAK_ID").is_none())
-    .collect()
 }

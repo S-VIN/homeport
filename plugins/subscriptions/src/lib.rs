@@ -55,8 +55,19 @@ impl Source {
         }
     }
 }
+/// The label of a source as shown everywhere: equal labels get `#2`, `#3`…
+/// in list order, so two subscriptions from one provider stay apart.
+pub fn label(sources: &[Source], id: Id) -> Option<String> {
+    let at = sources.iter().position(|s| s.id == id)?;
+    let base = sources[at].label();
+    let same = sources[..at].iter().filter(|s| s.label() == base).count();
+    Some(if same == 0 { base } else { format!("{base} #{}", same + 1) })
+}
+
+/// Percent-decode a link label. A `+` is literal here, not a space.
 fn percent(s: &str) -> String {
-    url::form_urlencoded::parse(format!("x={s}").as_bytes()).next().map(|(_, v)| v.into_owned()).unwrap_or_default()
+    let query = format!("x={}", s.replace('+', "%2B"));
+    url::form_urlencoded::parse(query.as_bytes()).next().map(|(_, v)| v.into_owned()).unwrap_or_default()
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -68,6 +79,8 @@ impl Default for Settings {
         Self { refresh_secs: 86_400 }
     }
 }
+
+pub static DEVICE_ID: State<String> = State::new("subscriptions.device-id");
 
 pub static SOURCES: State<Vec<Source>> = State::new("subscriptions.sources");
 pub static SETTINGS: State<Settings> = State::new("subscriptions.settings");
@@ -87,7 +100,7 @@ pub struct RefreshSource {
 impl Op for RefreshSource {
     type Reply = ();
     fn job(&self) -> Option<JobSpec> {
-        Some(JobSpec::keyed(format!("subscriptions/{}", self.id), "Load subscription").page("subscriptions"))
+        Some(JobSpec::keyed(format!("subscriptions/{}", self.id), "Load subscription").page("subscriptions").queued())
     }
 }
 /// Download the document of a source.
@@ -118,19 +131,6 @@ pub const MAX_BYTES: usize = 10 * 1024 * 1024;
 
 /// Sources being downloaded right now (rows show a spinner).
 pub static LOADING: State<Vec<Id>> = State::new("subscriptions.loading");
-/// Marks a source as loading until dropped.
-struct Loading(Cx, Id);
-impl Loading {
-    fn start(cx: &Cx, id: Id) -> Self {
-        cx.update_live(&LOADING, |l| l.push(id));
-        Self(cx.clone(), id)
-    }
-}
-impl Drop for Loading {
-    fn drop(&mut self) {
-        self.0.update_live(&LOADING, |l| l.retain(|x| *x != self.1));
-    }
-}
 
 fn validate(snap: &Snapshot, s: &mut Source, others: &[Source]) -> Result<()> {
     let raw = s.url.trim();
@@ -155,19 +155,27 @@ fn validate(snap: &Snapshot, s: &mut Source, others: &[Source]) -> Result<()> {
 
 /// Download a subscription document (size limit, gzip sniffing, UTF-8). Plugins that
 /// wrap [`Fetch`] reuse it with their own client.
-pub async fn http_get(client: &reqwest::Client, url: &str) -> Result<String> {
-    let mut res = client
-        .get(url)
+pub async fn http_get(client: &reqwest::Client, url: &str, device_id: &str) -> Result<String> {
+    let mut res = client.get(url)
+        .header("x-hwid", device_id)
+        .header("x-device-os", std::env::consts::OS)
+        .header("x-device-model", "rproxy")
         // Providers pick the document format by client; this one gets plain share links.
-        .header(reqwest::header::USER_AGENT, "v2rayN/7.0")
+        .header(reqwest::header::USER_AGENT, concat!("rproxy/", env!("CARGO_PKG_VERSION"), " (v2rayN compatible)"))
         .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
-        .and_then(|r| r.error_for_status())
         .map_err(|e| Error::msg(match e.status() {
             Some(s) => format!("Source returned HTTP {}.", s.as_u16()),
             None => "Cannot reach the subscription provider.".into(),
         }))?;
+    if ["x-hwid-max-devices-reached", "x-hwid-limit"].iter().any(|key| res.headers().get(*key).is_some_and(|v| v == "true")) {
+        return Err(Error::new("device-limit", "This subscription's device limit is reached. Remove an old device in your provider account, then refresh."));
+    }
+    if res.headers().get("x-hwid-not-supported").is_some_and(|v| v == "true") {
+        return Err(Error::new("device-id", "The provider did not accept this installation's device ID. Contact your subscription provider to allow rproxy."));
+    }
+    if !res.status().is_success() { bail!("Source returned HTTP {}.", res.status().as_u16()); }
     let mut bytes = Vec::new();
     while let Some(chunk) = res.chunk().await.map_err(|_| Error::msg("Incomplete subscription response."))? {
         if bytes.len() + chunk.len() > MAX_BYTES {
@@ -190,73 +198,120 @@ pub async fn http_get(client: &reqwest::Client, url: &str) -> Result<String> {
     String::from_utf8(bytes).map_err(|_| Error::msg("Subscription is not UTF-8."))
 }
 
+/// Use the same identity for direct requests and retries through the selected proxy.
+pub async fn fetch_http(cx: &Cx, client: &reqwest::Client, url: &str) -> Result<String> {
+    let id = cx.live(&DEVICE_ID);
+    http_get(client, url, id.as_str()).await
+}
+
+/// An installation ID, deliberately outside exported configuration so a second
+/// device never impersonates the first. Restarts and upgrades keep the same ID.
+pub fn device_id(data: &std::path::Path) -> Result<String> {
+    use std::io::Write;
+    let path = data.join("device-id");
+    let valid = |s: &str| (10..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'=');
+    if let Ok(id) = std::fs::read_to_string(&path) {
+        if valid(id.trim()) { return Ok(id.trim().to_owned()); }
+        bail!("The saved device ID is invalid.");
+    }
+    let id = Id::random().to_string();
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+    match options.open(&path) {
+        Ok(mut file) => file.write_all(id.as_bytes()).map_err(|e| Error::msg(format!("Cannot save the device ID: {e}")))?,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let saved = std::fs::read_to_string(path).map_err(|e| Error::msg(e.to_string()))?;
+            if valid(saved.trim()) { return Ok(saved.trim().to_owned()); }
+            bail!("The saved device ID is invalid.");
+        }
+        Err(e) => bail!("Cannot save the device ID: {e}"),
+    }
+    Ok(id)
+}
+
+async fn refresh_all(cx: Cx, _: RefreshAll) -> Result<()> {
+    let ids: Vec<Id> = cx.get(&SOURCES).iter().map(|s| s.id).collect();
+    let total = Some(ids.len() as u64);
+    cx.progress(0, total);
+    let mut failed = 0;
+    for (i, id) in ids.into_iter().enumerate() {
+        cx.checkpoint()?;
+        if cx.call(RefreshSource { id }).await.is_err() {
+            cx.checkpoint()?;
+            failed += 1;
+        }
+        cx.progress(i as u64 + 1, total);
+    }
+    if failed > 0 {
+        bail!("{} could not refresh. Cached servers are kept.", kit::plural(failed, "subscription", "subscriptions"));
+    }
+    Ok(())
+}
+
+async fn refresh_source(cx: Cx, op: RefreshSource) -> Result<()> {
+    let Some(source) = cx.get(&SOURCES).iter().find(|s| s.id == op.id).cloned() else { return Ok(()) };
+    let _loading = cx.mark_live(&LOADING, source.id);
+    let result: Result<usize> = async {
+        let body = cx.or_cancel(cx.call(Fetch { source: source.id, url: source.url.clone() })).await??;
+        let proxies = if body.trim().trim_start_matches('\u{feff}').trim().is_empty() {
+            Vec::new()
+        } else {
+            cx.call(Parse { source: source.id, body }).await?
+        };
+        cx.checkpoint()?;
+        let expected = source.clone();
+        let still_current: servers::SourceCheck =
+            Box::new(move |w| w.get(&SOURCES).iter().any(|s| s.id == expected.id && s.url == expected.url));
+        let total = cx.call(ReplaceFromSource { source: source.id, proxies, still_current: Some(still_current) }).await?.total;
+        // Removed while loading: drop what this load just added.
+        if !cx.get(&SOURCES).iter().any(|s| s.id == source.id) {
+            cx.call(servers::RemoveSource(source.id)).await?;
+            return Err(Error::new("cancelled", "Subscription was removed"));
+        }
+        Ok(total)
+    }
+    .await;
+    if result.as_ref().is_err_and(|e| e.cancelled()) {
+        return result.map(drop);
+    }
+    let outcome = result.as_ref().map(drop).map_err(|e| e.message.clone());
+    cx.write(move |w| {
+        w.update(&SOURCES, |list| {
+            if let Some(s) = list.iter_mut().find(|s| s.id == op.id && s.url == source.url) {
+                match outcome {
+                    Ok(()) => {
+                        s.updated = Some(now());
+                        s.error = None;
+                    }
+                    Err(e) => s.error = Some(e),
+                }
+            }
+        });
+        Ok(())
+    })
+    .await?;
+    result.map(drop)
+}
+
 fn setup(p: &mut Setup) -> Result<()> {
+    let dir = p.data_dir();
+    // Earlier versions kept the ID in the app folder; move it so providers
+    // that limit devices keep recognising this installation.
+    if let Some(app) = dir.ancestors().nth(2).filter(|_| !dir.join("device-id").exists()) {
+        let _ = std::fs::rename(app.join("device-id"), dir.join("device-id"));
+    }
+    let identity = device_id(&dir)?;
+    p.live(&DEVICE_ID, move || identity.clone());
     p.live(&LOADING, Vec::new);
     p.list(&SOURCES).validate(|snap, s, _, others| validate(snap, s, others));
     p.editable_setting(&SETTINGS);
 
-    p.handle(|cx: Cx, _: RefreshAll| async move {
-        let ids: Vec<Id> = cx.get(&SOURCES).iter().map(|s| s.id).collect();
-        let total = Some(ids.len() as u64);
-        cx.progress(0, total);
-        let mut failed = 0;
-        for (i, id) in ids.into_iter().enumerate() {
-            cx.checkpoint()?;
-            if cx.call(RefreshSource { id }).await.is_err() {
-                cx.checkpoint()?;
-                failed += 1;
-            }
-            cx.progress(i as u64 + 1, total);
-        }
-        if failed > 0 {
-            bail!("{} could not refresh. Cached servers are kept.", kit::plural(failed, "subscription", "subscriptions"));
-        }
-        Ok(())
-    });
-    p.handle(|cx: Cx, op: RefreshSource| async move {
-        let Some(source) = cx.get(&SOURCES).iter().find(|s| s.id == op.id).cloned() else { return Ok(()) };
-        let _loading = Loading::start(&cx, source.id);
-        let result: Result<usize> = async {
-            let body = cx.or_cancel(cx.call(Fetch { source: source.id, url: source.url.clone() })).await??;
-            let proxies = if body.trim().trim_start_matches('\u{feff}').trim().is_empty() {
-                Vec::new()
-            } else {
-                cx.call(Parse { source: source.id, body }).await?
-            };
-            cx.checkpoint()?;
-            let total = cx.call(ReplaceFromSource { source: source.id, proxies }).await?.total;
-            // Removed while loading: drop what this load just added.
-            if !cx.get(&SOURCES).iter().any(|s| s.id == source.id) {
-                cx.call(servers::RemoveSource(source.id)).await?;
-                return Err(Error::new("cancelled", "Subscription was removed"));
-            }
-            Ok(total)
-        }
-        .await;
-        if result.as_ref().is_err_and(|e| e.cancelled()) {
-            return result.map(drop);
-        }
-        let outcome = result.as_ref().map(drop).map_err(|e| e.message.clone());
-        cx.write(move |w| {
-            w.update(&SOURCES, |list| {
-                if let Some(s) = list.iter_mut().find(|s| s.id == op.id) {
-                    match outcome {
-                        Ok(()) => {
-                            s.updated = Some(now());
-                            s.error = None;
-                        }
-                        Err(e) => s.error = Some(e),
-                    }
-                }
-            });
-            Ok(())
-        })
-        .await?;
-        result.map(drop)
-    });
+    p.handle(refresh_all);
+    p.handle(refresh_source);
     p.handle(|cx: Cx, f: Fetch| async move {
         if f.url.starts_with("http://") || f.url.starts_with("https://") {
-            http_get(cx.http(), &f.url).await
+            fetch_http(&cx, cx.http(), &f.url).await
         } else {
             // A direct link is its own document.
             Ok(f.url)
@@ -286,13 +341,13 @@ fn setup(p: &mut Setup) -> Result<()> {
         Ok(())
     });
     p.every("refresh", |s| Some(std::time::Duration::from_secs(s.get(&SETTINGS).refresh_secs.into())), || RefreshAll);
-    p.hook(&servers::SOURCE_LABEL, |snap, id| snap.get(&SOURCES).iter().find(|s| s.id == *id).map(Source::label));
+    p.hook(&servers::SOURCE_LABEL, |snap, id| label(&snap.get(&SOURCES), *id));
     p.hook(&servers::SOURCE_HUE, |snap, id| hue(&snap.get(&SOURCES), *id));
 
     p.page_fn(PageSpec { id: "subscriptions", title: "Subscriptions", icon: Icon::Subscriptions, order: 20 }, page);
     p.fill(&SETTINGS_SECTIONS, "refresh", 0, |ui, cx, _| {
         let mut secs = cx.get(&SETTINGS).refresh_secs;
-        kit::settings_row(ui, "Refresh subscriptions", "Reload every subscription on this schedule", |ui| {
+        kit::settings_row(ui, "Refresh subscriptions", "", |ui| {
             if kit::interval(ui, "refresh", &mut secs) {
                 cx.update("refresh-interval", &SETTINGS, move |s| s.refresh_secs = secs);
             }
@@ -343,17 +398,20 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
     kit::page_header(ui, "Subscriptions", &counter, |ui| {
         cx.job_button(ui, Icon::Refresh, "Refresh all", 104., !sources.is_empty(), || RefreshAll);
     });
-    kit::helper(ui, "Higher subscriptions win ties when Auto select picks a server. Each color tags that subscription's servers.");
+
     let loading = cx.live(&LOADING);
     ListEditor::new(&SOURCES)
         .add_form("Add subscription", || Source::new(""), |ui, s, width| {
-            let r = kit::input(ui, "url", &mut s.url, "Subscription URL or link (vless://…)", width, false);
+            let r = kit::input(ui, "url", &mut s.url, "Subscription URL or server link", width, false);
             kit::submitted(ui, &r) && !s.url.trim().is_empty()
         })
         .leading(8., |ui, cx, s: &Source| {
             kit::tag_dot(ui, servers::source_hue(cx.snapshot(), s.id));
         })
-        .column(Column::edit("Subscription", "Subscription URL", |s: &mut Source| &mut s.url).display(Source::label))
+        .column(
+            Column::edit("Subscription", "Subscription URL", |s: &mut Source| &mut s.url)
+                .display(move |s: &Source| label(&sources, s.id).unwrap_or_else(|| s.label())),
+        )
         .column(
             Column::custom("Servers", 56., |ui, cx, s: &Source| {
                 if loading.contains(&s.id) {
@@ -366,7 +424,7 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
             .right(),
         )
         .subtitle(|rows, i| Some(status(&rows[i], loading.contains(&rows[i].id))))
-        .empty(Icon::Subscriptions, "No subscriptions", "Paste a subscription URL or a vless:// link above to load servers.")
+        .empty(Icon::Subscriptions, "No subscriptions")
         .show(ui, cx);
     cx.slot(ui, &SECTIONS, &());
 }

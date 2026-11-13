@@ -1,5 +1,5 @@
 //! # format-uri
-//! Direct `vless://` links (one per line) and Base64-wrapped documents.
+//! VLESS and Hysteria 2 links (including mixed lists) and Base64-wrapped documents.
 use plugin_servers::Proxy;
 use plugin_subscriptions::{Parse, LINK};
 use base64::{engine::general_purpose::{STANDARD, URL_SAFE}, Engine};
@@ -12,7 +12,7 @@ use url::Url;
 pub static PLUGIN: Plugin = Plugin {
     id: "format-uri",
     name: "Links and Base64",
-    description: "vless:// links, one per line, and Base64-encoded subscription bodies.",
+    description: "VLESS and Hysteria 2 links, mixed lists, and Base64 subscription bodies.",
     category: categories::FORMATS,
     requires: &["subscriptions"],
     required: false,
@@ -27,6 +27,9 @@ fn invalid(m: impl Into<String>) -> Error {
 
 fn plain(body: &str) -> &str {
     body.trim().trim_start_matches('\u{feff}').trim()
+}
+fn supported_link(raw: &str) -> bool {
+    ["vless://", "hysteria2://", "hy2://"].iter().any(|prefix| raw.starts_with(prefix))
 }
 fn looks_base64(body: &str) -> bool {
     let b = plain(body);
@@ -43,7 +46,7 @@ pub fn decode_base64(body: &str) -> Result<String> {
     String::from_utf8(bytes).map_err(|_| invalid("Subscription is not UTF-8."))
 }
 
-/// Parse `vless://` lines into proxies.
+/// Parse supported share links without dropping any entries from mixed lists.
 pub fn parse_links(body: &str) -> Result<Vec<Proxy>> {
     plain(body)
         .lines()
@@ -65,12 +68,13 @@ fn setup(p: &mut Setup) -> Result<()> {
     })
     .claim(|_, op| looks_base64(&op.body).then_some(Claim::content(90)));
     p.handle(|_: Cx, op: Parse| async move { parse_links(&op.body) })
-        .claim(|_, op| plain(&op.body).starts_with("vless://").then_some(Claim::content(80)));
-    p.hook(&LINK, |_, raw| raw.starts_with("vless://").then(|| link(raw).map(drop).map_err(|e| e.message)));
+        .claim(|_, op| supported_link(plain(&op.body)).then_some(Claim::content(80)));
+    p.hook(&LINK, |_, raw| supported_link(raw).then(|| link(raw).map(drop).map_err(|e| e.message)));
     Ok(())
 }
 
 fn link(raw: &str) -> Result<Value> {
+    if raw.starts_with("hysteria2://") || raw.starts_with("hy2://") { return hysteria2(raw); }
     let u = Url::parse(raw).map_err(|_| invalid("Invalid VLESS link."))?;
     if u.scheme() != "vless" || u.password().is_some() {
         return Err(invalid("Expected a VLESS link."));
@@ -151,6 +155,55 @@ fn link(raw: &str) -> Result<Value> {
         _ => return Err(invalid("Unsupported VLESS transport.")),
     }
     Ok(p)
+}
+
+fn hysteria2(raw: &str) -> Result<Value> {
+    let u = Url::parse(raw).map_err(|_| invalid("Invalid Hysteria 2 link."))?;
+    let host = u.host_str().filter(|s| !s.is_empty()).ok_or_else(|| invalid("Missing Hysteria 2 host."))?.trim_matches(['[', ']']);
+    let port = u.port().unwrap_or(443);
+    if port == 0 { return Err(invalid("Invalid Hysteria 2 port.")); }
+    let decode = |value: &str| percent_decode_str(value).decode_utf8().map(|s| s.into_owned()).map_err(|_| invalid("Invalid UTF-8 in Hysteria 2 link."));
+    let mut password = decode(u.username())?;
+    if let Some(p) = u.password() { password.push(':'); password.push_str(&decode(p)?); }
+    let name = decode(u.fragment().filter(|s| !s.is_empty()).unwrap_or(host))?;
+    let mut proxy = json!({"name":name,"type":"hysteria2","server":host,"port":port,"password":password});
+    let mut mask = None;
+    let mut seen = HashSet::new();
+    for (key, value) in u.query_pairs() {
+        if !seen.insert(key.to_string()) { return Err(invalid("Duplicate Hysteria 2 parameter.")); }
+        match key.as_ref() {
+            "fm" => mask = Some(serde_json::from_str::<Value>(&value).map_err(|_| invalid("Invalid Hysteria 2 final mask."))?),
+            "sni" | "obfs-password" => proxy[&*key] = json!(value),
+            "obfs" => {
+                if !matches!(value.as_ref(), "salamander" | "gecko") { return Err(invalid("Unsupported Hysteria 2 obfuscation.")); }
+                proxy["obfs"] = json!(value);
+            }
+            "insecure" | "allowInsecure" => proxy["skip-cert-verify"] = json!(boolean(&json!(value))?),
+            "pinSHA256" => proxy["fingerprint"] = json!(value),
+            "alpn" => proxy["alpn"] = json!(value.split(',').collect::<Vec<_>>()),
+            "ech" => proxy["ech-opts"] = json!({"enable":true,"config":value}),
+            _ => return Err(invalid(format!("Unsupported Hysteria 2 parameter: {key}"))),
+        }
+    }
+    if let Some(mask) = mask {
+        let object = mask.as_object().ok_or_else(|| invalid("Invalid Hysteria 2 final mask."))?;
+        if object.keys().any(|k| k != "udp") { return Err(invalid("Unsupported Hysteria 2 final mask options.")); }
+        let udp = mask["udp"].as_array().ok_or_else(|| invalid("Invalid Hysteria 2 UDP mask."))?;
+        if udp.len() != 1 || udp[0]["type"] != "salamander" {
+            return Err(invalid("This Hysteria 2 final mask is not supported by the core."));
+        }
+        let settings = udp[0]["settings"].as_object().ok_or_else(|| invalid("Invalid Salamander settings."))?;
+        if settings.keys().any(|k| k != "password") { return Err(invalid("Unsupported Salamander settings.")); }
+        let secret = settings.get("password").and_then(Value::as_str).ok_or_else(|| invalid("Missing Salamander password."))?;
+        if proxy.get("obfs").is_some_and(|v| v != "salamander") || proxy.get("obfs-password").is_some_and(|v| v != secret) {
+            return Err(invalid("Conflicting Hysteria 2 obfuscation settings."));
+        }
+        proxy["obfs"] = json!("salamander"); proxy["obfs-password"] = json!(secret);
+    }
+    if proxy.get("obfs").is_some() && proxy["obfs-password"].as_str().is_none_or(str::is_empty) {
+        return Err(invalid("Hysteria 2 obfuscation needs a password."));
+    }
+    Ok(proxy)
 }
 /// XHTTP client options. Connection reuse (XMUX) is always explicit and ranged:
 /// core defaults change between versions and a burst of parallel handshakes to

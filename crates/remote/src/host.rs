@@ -25,6 +25,8 @@ pub trait Frontend: Send + Sync + 'static {
 }
 pub trait FrontendSession: Send {
     fn ui(&mut self, ui: &mut egui::Ui);
+    fn file_dialog(&mut self) -> Option<crate::FileDialog> { None }
+    fn file_reply(&mut self, _: crate::FileReply) {}
 }
 
 pub struct Asset {
@@ -44,7 +46,7 @@ pub fn router(frontend: Arc<dyn Frontend>, assets: &'static [Asset]) -> Router {
 }
 
 async fn upgrade(State(frontend): State<Arc<dyn Frontend>>, ws: WebSocketUpgrade) -> Response {
-    ws.max_message_size(4 << 20).on_upgrade(move |socket| session(socket, frontend)).into_response()
+    ws.max_message_size(40 << 20).max_frame_size(40 << 20).on_upgrade(move |socket| session(socket, frontend)).into_response()
 }
 
 /// Remote frames never run faster than this.
@@ -84,8 +86,11 @@ async fn session(mut socket: WebSocket, frontend: Arc<dyn Frontend>) {
         tokio::select! {
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Binary(bytes))) => {
-                    let Ok(ToHost::Input(raw)) = unpack::<ToHost>(&bytes) else { continue };
-                    merge(&mut input, raw);
+                    match unpack::<ToHost>(&bytes) {
+                        Ok(ToHost::Input(raw)) => merge(&mut input, raw),
+                        Ok(ToHost::File(reply)) => ui.file_reply(reply),
+                        Err(_) => continue,
+                    }
                     ready = true;
                     frame = true;
                 }
@@ -116,7 +121,7 @@ async fn session(mut socket: WebSocket, frontend: Arc<dyn Frontend>) {
                 }
             }
         }
-        let bytes = encoder.encode(out);
+        let bytes = encoder.encode_with_file(out, ui.file_dialog());
         if socket.send(Message::Binary(bytes.into())).await.is_err() {
             break;
         }
@@ -161,7 +166,10 @@ fn hash_of<T: serde::Serialize>(v: &T) -> u64 {
     h.finish()
 }
 impl Encoder {
-    pub fn encode(&mut self, mut out: egui::FullOutput) -> Vec<u8> {
+    pub fn encode(&mut self, out: egui::FullOutput) -> Vec<u8> {
+        self.encode_with_file(out, None)
+    }
+    pub fn encode_with_file(&mut self, mut out: egui::FullOutput, file_dialog: Option<crate::FileDialog>) -> Vec<u8> {
         self.frame += 1;
         let frame_no = self.frame;
         let mut fresh: Vec<(u64, Arc<Galley>)> = Vec::new();
@@ -229,6 +237,6 @@ impl Encoder {
         let free = out.textures_delta.free.drain().map(TexId::from).collect();
         let mut platform = out.platform_output;
         platform.events.clear();
-        pack(&Frame { ppp: out.pixels_per_point, textures, free, galleys: fresh, forget, shapes: ops, platform })
+        pack(&Frame { file_dialog, ppp: out.pixels_per_point, textures, free, galleys: fresh, forget, shapes: ops, platform })
     }
 }

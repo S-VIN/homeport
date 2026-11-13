@@ -58,6 +58,13 @@ pub(crate) struct PanelAnchor {
 /// Per window / browser tab state owned by the shell.
 pub(crate) struct SessionState {
     pub ctx: egui::Context,
+    pub file_action: Option<crate::configuration::FileAction>,
+    pub can_exit: bool,
+    pub exit_requested: bool,
+    pub file_busy: bool,
+    pub incoming: Option<Arc<crate::configuration::Import>>,
+    /// An imported file being validated off the UI thread.
+    pub checking: Option<tokio::sync::oneshot::Receiver<crate::Result<Arc<crate::configuration::Import>>>>,
     pub page: &'static str,
     pub pages: HashMap<&'static str, Box<dyn Page>>,
     pub tickets: Arc<Mutex<HashMap<egui::Id, (Ticket, f64)>>>,
@@ -79,6 +86,12 @@ impl SessionState {
     pub fn new(ctx: egui::Context, k: &Kernel) -> Self {
         Self {
             ctx,
+            file_action: None,
+            can_exit: false,
+            exit_requested: false,
+            file_busy: false,
+            incoming: None,
+            checking: None,
             page: k.reg.pages.first().map_or("settings", |p| p.spec.id),
             pages: HashMap::new(),
             tickets: Arc::default(),
@@ -185,8 +198,8 @@ impl<'a> UiCx<'a> {
         });
     }
     /// Change some fields of a setting registered with `Setup::editable_setting`.
-    pub fn update<T: Send + Sync + 'static>(&mut self, key: impl Hash + std::fmt::Debug, _state: &'static State<T>, f: impl FnOnce(&mut T) + Send + 'static) {
-        self.submit(key, crate::Update::<T>(Box::new(f)));
+    pub fn update<T: Send + Sync + 'static>(&mut self, key: impl Hash + std::fmt::Debug, state: &'static State<T>, f: impl FnOnce(&mut T) + Send + 'static) {
+        self.submit(key, crate::Update { state, change: Box::new(f) });
     }
     /// True while a submitted op runs.
     pub fn pending(&self, key: impl Hash + std::fmt::Debug) -> bool {
@@ -242,6 +255,8 @@ impl<'a> UiCx<'a> {
     /// Switch the session to another page.
     pub fn navigate(&mut self, page: &'static str) {
         self.s.page = page;
+        self.s.panels_open = false;
+        self.s.activity_open = false;
     }
     /// The page currently shown.
     pub fn page(&self) -> &'static str {

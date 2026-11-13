@@ -288,7 +288,12 @@ fn setup(p: &mut Setup) -> Result<()> {
             ..Default::default()
         }
     });
-    let data = p.data_dir().join("vless-server").join("acme");
+    let data = p.data_dir().join("acme");
+    // Earlier versions kept certificates in the app folder; reuse them
+    // instead of asking Let's Encrypt again (it limits reissues).
+    if let Some(app) = data.ancestors().nth(3).filter(|_| !data.exists()) {
+        let _ = std::fs::rename(app.join("vless-server").join("acme"), &data);
+    }
     p.service(
         "site",
         move |snap| {
@@ -419,11 +424,11 @@ fn ui(p: &mut Setup) {
         let counter = if c.enabled { format!("On · {}", kit::plural(clients.len(), "client", "clients")) } else { "Off".into() };
         kit::page_header(ui, "VLESS server", &counter, |ui| {
             let mut on = c.enabled;
-            if kit::toggle(ui, &mut on, "").on_hover_text(if on { "Stop accepting clients" } else { "Start accepting clients" }).changed() {
+            if kit::toggle_named(ui, &mut on, "", "VLESS server").changed() {
                 cx.submit("enabled", SetEnabled(on));
             }
         });
-        kit::helper(ui, "Other devices connect to this machine with VLESS over REALITY and XHTTP. Anyone without a client link sees an ordinary website on your domain. Open this app's web interface only through an SSH tunnel, never on the public address.");
+
         if let Some(why) = problem(&snap).filter(|_| c.enabled) {
             kit::banner(ui, kit::Tone::Warning, why, None);
         }
@@ -445,7 +450,7 @@ fn body(ui: &mut egui::Ui, cx: &mut UiCx, c: &Settings) {
                 }
             },
         );
-        kit::settings_row(ui, "Port", "443 looks like any other website", |ui| {
+        kit::settings_row(ui, "Port", "", |ui| {
             if let Some(port) = kit::field(ui, "port", &c.port.to_string(), "443", 70.) {
                 match port.trim().parse::<u16>() {
                     Ok(p) if p > 0 => cx.update("port", &CONFIG, move |s| s.port = p),
@@ -563,9 +568,7 @@ fn body(ui: &mut egui::Ui, cx: &mut UiCx, c: &Settings) {
         )
         .empty(
             Icon::Users,
-            "No clients",
-            "Add a client to get a link for a phone, a laptop or another rproxy.",
-        )
+            "No clients")
         .show(ui, cx);
     // The QR code of one client, large enough for a phone camera.
     let snap = cx.snapshot().clone();
@@ -578,7 +581,6 @@ fn body(ui: &mut egui::Ui, cx: &mut UiCx, c: &Settings) {
                 kit::qr_code(ui, &link(&snap, &client), 220.);
                 ui.vertical(|ui| {
                     ui.label(kit::bold(client.name.clone(), theme::BODY));
-                    kit::tone_text(ui, "Scan with the client app (rproxy, Hiddify, v2rayNG, Happ…) or copy the link.", kit::Tone::Neutral);
                     ui.add_space(theme::SPACE_M);
                     if kit::Button::secondary("Copy link").icon(Icon::Copy).show(ui).clicked() {
                         ui.ctx().copy_text(link(&snap, &client));

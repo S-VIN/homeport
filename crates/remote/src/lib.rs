@@ -25,6 +25,22 @@ pub mod host;
 #[derive(Serialize, Deserialize)]
 pub enum ToHost {
     Input(egui::RawInput),
+    File(FileReply),
+}
+
+pub const MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Serialize, Deserialize)]
+pub enum FileDialog {
+    Save { name: String, bytes: Vec<u8> },
+    Open,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum FileReply {
+    Finished,
+    Opened { name: String, bytes: Vec<u8> },
+    Failed(String),
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -95,6 +111,7 @@ pub enum ShapeOp {
 
 #[derive(Serialize, Deserialize)]
 pub struct Frame {
+    pub file_dialog: Option<FileDialog>,
     pub ppp: f32,
     pub textures: Vec<Texture>,
     pub free: Vec<TexId>,

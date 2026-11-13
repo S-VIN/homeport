@@ -122,20 +122,6 @@ pub static CHECKING: State<bool> = State::new("health-checks.checking");
 
 /// Servers being measured right now (rows show a spinner).
 pub static IN_FLIGHT: State<Vec<Id>> = State::new("health-checks.in-flight");
-/// Marks a server as being measured until dropped.
-struct Flight(Cx, Id);
-impl Flight {
-    fn start(cx: &Cx, id: Id) -> Self {
-        cx.update_live(&IN_FLIGHT, |l| l.push(id));
-        Self(cx.clone(), id)
-    }
-}
-impl Drop for Flight {
-    fn drop(&mut self) {
-        self.0.update_live(&IN_FLIGHT, |l| l.retain(|x| *x != self.1));
-    }
-}
-
 pub fn health(snap: &Snapshot, server: Id) -> Option<Health> {
     snap.get(&HEALTH).iter().find(|h| h.id == server).cloned()
 }
@@ -366,7 +352,7 @@ fn setup(p: &mut Setup) -> Result<()> {
     p.collection(&HEALTH);
     p.collection(&RESULTS);
     p.editable_setting(&CONFIG);
-    p.memory(&CHECKING, || false);
+    p.live(&CHECKING, || false);
     p.cascade(&servers::SERVERS, &HEALTH, |h| h.id);
     p.cascade(&servers::SERVERS, &RESULTS, |m| m.server);
     p.cascade(&TESTS, &RESULTS, |m| m.test);
@@ -381,73 +367,9 @@ fn setup(p: &mut Setup) -> Result<()> {
 
     p.handle(|_: Cx, r: Rate| async move { Ok(default_rating(r.ping_ms, r.bytes_per_sec, &r.results)) });
 
-    p.handle(|cx: Cx, _: CheckAll| async move {
-        let set = |on: bool| {
-            let cx = cx.clone();
-            async move {
-                cx.write(move |w| {
-                    w.set(&CHECKING, on);
-                    Ok(())
-                })
-                .await
-            }
-        };
-        set(true).await?;
-        // A panic becomes an error, so the flag is always reset.
-        use futures_util::FutureExt;
-        let result = std::panic::AssertUnwindSafe(check_all(&cx)).catch_unwind().await.unwrap_or_else(|_| Err(Error::msg("Server check crashed.")));
-        set(false).await?;
-        result
-    });
-    p.handle(|cx: Cx, op: CheckServer| async move {
-        let snap = cx.snapshot();
-        let Some(s) = server(&snap, op.id).filter(|s| !skipped(&snap, s)) else { return Ok(None) };
-        let _flight = Flight::start(&cx, s.id);
-        let (ping, results) = cx.or_cancel(measure(&cx, s.id, &probes(&snap))).await?;
-        // Only configured tests are stored; the default probe only measures latency.
-        let results: Vec<Measurement> = results.into_iter().filter(|m| m.test != Id::NIL).collect();
-        let mut speed = None;
-        if ping.is_some() {
-            let lease = cx.core().lease(Target::Proxy(s.id.to_string())).await?;
-            let measured = cx.or_cancel(download_speed(lease.http())).await;
-            lease.release().await;
-            speed = measured?;
-        }
-        let rating = match ping {
-            None => 0,
-            Some(_) => cx.call(Rate { server: s.id, ping_ms: ping, bytes_per_sec: speed, results: results.clone() }).await?,
-        };
-        let h = Health { id: s.id, ping_ms: ping, bytes_per_sec: speed, rating: Some(rating), checked: Some(now()) };
-        let stored = h.clone();
-        cx.write(move |w| {
-            if !w.get(&servers::SERVERS).iter().any(|x| x.id == stored.id) {
-                return Ok(());
-            }
-            let tests: Vec<Id> = w.get(&TESTS).iter().map(|t| t.id).collect();
-            w.update(&HEALTH, |l| {
-                l.retain(|x| x.id != stored.id);
-                l.push(stored.clone());
-            });
-            w.update(&RESULTS, |l| {
-                l.retain(|m| m.server != stored.id);
-                l.extend(results.into_iter().filter(|m| tests.contains(&m.test)));
-            });
-            Ok(())
-        })
-        .await?;
-        Ok(Some(h))
-    });
-    p.handle(|cx: Cx, op: QuickCheck| async move {
-        let snap = cx.snapshot();
-        let Some(s) = server(&snap, op.id).filter(|s| !skipped(&snap, s)) else { return Ok(None) };
-        let (ping, results) = cx.or_cancel(measure(&cx, s.id, &probes(&snap))).await?;
-        let prior = health(&snap, s.id);
-        let mut h = Health { id: s.id, ping_ms: ping, bytes_per_sec: prior.and_then(|p| p.bytes_per_sec), rating: Some(0), checked: Some(now()) };
-        if ping.is_some() {
-            h.rating = Some(cx.call(Rate { server: s.id, ping_ms: ping, bytes_per_sec: h.bytes_per_sec, results: results.clone() }).await?);
-        }
-        Ok(Some(Quick { health: h, results }))
-    });
+    p.handle(check_all_servers);
+    p.handle(check_server);
+    p.handle(quick_check);
     p.every("check", |s| Some(Duration::from_secs(s.get(&CONFIG).check_secs.into())), || CheckAll);
 
     p.hook(&servers::EXCLUDE, |snap, s| {
@@ -461,7 +383,7 @@ fn setup(p: &mut Setup) -> Result<()> {
             ("Download speed", |snap: &Snapshot, s: &Server| -(health(snap, s.id).and_then(|h| h.bytes_per_sec).map_or(-1, |b| b as i64))),
         ]
     });
-    p.hook(&servers::FREEZE, |snap, _| *snap.get(&CHECKING));
+    p.hook(&servers::FREEZE, |snap, _| *snap.live(&CHECKING));
     // The tray turns red when the connected server failed its last check.
     p.hook(&rproxy_kernel::shell::TRAY, |snap, _| {
         let id = (*snap.get(&servers::SELECTED))?;
@@ -472,6 +394,70 @@ fn setup(p: &mut Setup) -> Result<()> {
 }
 
 /// No test answered through the server on its last check.
+async fn check_all_servers(cx: Cx, _: CheckAll) -> Result<()> {
+    cx.set_live(&CHECKING, true);
+    // A panic becomes an error, so the flag is always reset.
+    use futures_util::FutureExt;
+    let result = std::panic::AssertUnwindSafe(check_all(&cx))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| Err(Error::msg("Server check crashed.")));
+    cx.set_live(&CHECKING, false);
+    result
+}
+
+async fn check_server(cx: Cx, op: CheckServer) -> Result<Option<Health>> {
+    let snap = cx.snapshot();
+    let Some(s) = server(&snap, op.id).filter(|s| !skipped(&snap, s)) else { return Ok(None) };
+    let _measuring = cx.mark_live(&IN_FLIGHT, s.id);
+    let (ping, results) = cx.or_cancel(measure(&cx, s.id, &probes(&snap))).await?;
+    // Only configured tests are stored; the default probe only measures latency.
+    let results: Vec<Measurement> = results.into_iter().filter(|m| m.test != Id::NIL).collect();
+    let mut speed = None;
+    if ping.is_some() {
+        let lease = cx.core().lease(Target::Proxy(s.id.to_string())).await?;
+        let measured = cx.or_cancel(download_speed(lease.http())).await;
+        lease.release().await;
+        speed = measured?;
+    }
+    let rating = match ping {
+        None => 0,
+        Some(_) => cx.call(Rate { server: s.id, ping_ms: ping, bytes_per_sec: speed, results: results.clone() }).await?,
+    };
+    let h = Health { id: s.id, ping_ms: ping, bytes_per_sec: speed, rating: Some(rating), checked: Some(now()) };
+    let stored = h.clone();
+    cx.write(move |w| {
+        if !w.get(&servers::SERVERS).iter().any(|x| x.id == stored.id) {
+            return Ok(());
+        }
+        let tests: Vec<Id> = w.get(&TESTS).iter().map(|t| t.id).collect();
+        w.update(&HEALTH, |l| {
+            l.retain(|x| x.id != stored.id);
+            l.push(stored.clone());
+        });
+        w.update(&RESULTS, |l| {
+            l.retain(|m| m.server != stored.id);
+            l.extend(results.into_iter().filter(|m| tests.contains(&m.test)));
+        });
+        Ok(())
+    })
+    .await?;
+    Ok(Some(h))
+}
+
+async fn quick_check(cx: Cx, op: QuickCheck) -> Result<Option<Quick>> {
+    let snap = cx.snapshot();
+    let Some(s) = server(&snap, op.id).filter(|s| !skipped(&snap, s)) else { return Ok(None) };
+    let (ping, results) = cx.or_cancel(measure(&cx, s.id, &probes(&snap))).await?;
+    let prior = health(&snap, s.id);
+    let bytes_per_sec = prior.and_then(|p| p.bytes_per_sec);
+    let mut h = Health { id: s.id, ping_ms: ping, bytes_per_sec, rating: Some(0), checked: Some(now()) };
+    if ping.is_some() {
+        h.rating = Some(cx.call(Rate { server: s.id, ping_ms: ping, bytes_per_sec, results: results.clone() }).await?);
+    }
+    Ok(Some(Quick { health: h, results }))
+}
+
 pub fn unreachable(h: &Health) -> bool {
     h.checked.is_some() && h.ping_ms.is_none() && h.rating == Some(0)
 }
@@ -495,15 +481,6 @@ fn result_text(r: &Measurement) -> String {
         (None, None, Some(code)) => format!("HTTP {code}"),
     };
     format!("{} · {detail}", if r.passed { "Passed" } else { "Failed" })
-}
-
-fn speed(bytes: u64) -> String {
-    let kib = bytes as f64 / 1024.;
-    if kib >= 1024. {
-        format!("{:.1} MiB/s", kib / 1024.)
-    } else {
-        format!("{kib:.0} KiB/s")
-    }
 }
 
 fn host(url: &str) -> String {
@@ -557,7 +534,7 @@ fn ui(p: &mut Setup) {
         }
         let ping = h.as_ref().and_then(|h| h.ping_ms);
         kit::property(ui, "Latency", &ping.map_or_else(|| "—".into(), |ms| format!("{ms} ms")));
-        kit::property(ui, "Download", &h.as_ref().and_then(|h| h.bytes_per_sec).map_or_else(|| "—".into(), speed));
+        kit::property(ui, "Download", &h.as_ref().and_then(|h| h.bytes_per_sec).map_or_else(|| "—".into(), kit::rate));
         kit::property(ui, "Last check", &h.as_ref().and_then(|h| h.checked).map_or_else(|| "Never".into(), kit::age));
         for t in snap.get(&TESTS).iter() {
             let r = snap.get(&RESULTS).iter().find(|r| r.server == s.id && r.test == t.id).cloned();
@@ -596,23 +573,23 @@ fn ui(p: &mut Setup) {
         let n = cx.get(&TESTS).len();
         let counter = if n == 0 { String::new() } else { kit::plural(n, "test URL", "test URLs") };
         kit::page_header(ui, "Checks", &counter, |_| {});
-        kit::helper(ui, "Each check requests these URLs through the server (HEAD, redirects not followed). A test passes when the response status matches. The first URL also tells whether the connected server is alive.");
+
         ListEditor::new(&TESTS)
             .unordered()
             .add_form("Add test URL", || Test { id: Id::random(), url: String::new(), expected: Expected::NoContent }, |ui, t, width| {
                 let w = (width - 120. - theme::HORIZONTAL_GAP).max(60.);
                 let r = kit::input(ui, "url", &mut t.url, "https://example.org/", w, false);
-                kit::choice(ui, "expected", &mut t.expected, Expected::ALL, 120., "Expected HTTP status");
+                kit::choice(ui, "expected", &mut t.expected, Expected::ALL, 120., "HEAD requests; redirects are not followed. Only a matching status passes.");
                 kit::submitted(ui, &r) && !t.url.trim().is_empty()
             })
             .column(Column::edit("URL", "https://example.org/", |t: &mut Test| &mut t.url))
             .column(Column::choice("Expected status", 120., |t: &mut Test| &mut t.expected, Expected::ALL))
-            .empty(Icon::Checks, "No test URLs", "Without tests a check measures only latency and speed. Add URLs your traffic depends on.")
+            .empty(Icon::Checks, "No test URLs")
             .show(ui, cx);
     });
     p.fill(&SETTINGS_SECTIONS, "interval", 0, |ui, cx, _| {
         let mut secs = cx.get(&CONFIG).check_secs;
-        kit::settings_row(ui, "Check servers", "Measure every server on this schedule", |ui| {
+        kit::settings_row(ui, "Check servers", "", |ui| {
             if kit::interval(ui, "check", &mut secs) {
                 cx.update("check-interval", &CONFIG, move |s| s.check_secs = secs);
             }

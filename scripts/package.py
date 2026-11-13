@@ -50,6 +50,35 @@ Section
   SetErrorLevel $1
 SectionEnd
 !else
+# Windows locks running executables: ask the user to quit rproxy first.
+!macro CHECK_RUNNING UN
+Function ${UN}CheckRunning
+  retry:
+  StrCpy $1 "rproxy.exe"
+  Call ${UN}Locked
+  StrCmp $0 "locked" running
+  StrCpy $1 "mihomo.exe"
+  Call ${UN}Locked
+  StrCmp $0 "locked" running done
+  running:
+  MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "rproxy is running. Quit it from its tray icon (Quit rproxy), then click Retry." /SD IDCANCEL IDRETRY retry
+  Abort
+  done:
+FunctionEnd
+Function ${UN}Locked
+  StrCpy $0 ""
+  IfFileExists "$INSTDIR\$1" 0 free
+  ClearErrors
+  FileOpen $2 "$INSTDIR\$1" a
+  IfErrors 0 +3
+  StrCpy $0 "locked"
+  Goto free
+  FileClose $2
+  free:
+FunctionEnd
+!macroend
+!insertmacro CHECK_RUNNING ""
+!insertmacro CHECK_RUNNING "un."
 InstallDir "$LOCALAPPDATA\Programs\rproxy"
 InstallDirRegKey HKCU "Software\rproxy" "InstallDir"
 !insertmacro MUI_PAGE_DIRECTORY
@@ -59,6 +88,7 @@ InstallDirRegKey HKCU "Software\rproxy" "InstallDir"
 !insertmacro MUI_LANGUAGE "English"
 Section
   SetOutPath "$INSTDIR"
+  Call CheckRunning
   File /r "${STAGE}\*"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   WriteRegStr HKCU "Software\rproxy" "InstallDir" "$INSTDIR"
@@ -68,15 +98,29 @@ Section
   CreateShortcut "$SMPROGRAMS\rproxy.lnk" "$INSTDIR\rproxy.exe"
 SectionEnd
 Section "Uninstall"
+  Call un.CheckRunning
   Delete "$SMPROGRAMS\rproxy.lnk"
   Delete "$INSTDIR\rproxy.exe"
+  Delete "$INSTDIR\mihomo.exe"
   Delete "$INSTDIR\Uninstall.exe"
+  RMDir /r "$INSTDIR\licenses"
+  # Remove the payload of older installations too.
   RMDir /r "$INSTDIR\assets"
   RMDir "$INSTDIR"
   DeleteRegKey HKCU "Software\rproxy"
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\rproxy"
 SectionEnd
 !endif
+'''
+
+# pacman runs this scriptlet as root: let the packaged core create the TUN interface.
+PACMAN_INSTALL = '''post_install() {
+  setcap cap_net_admin,cap_net_bind_service+ep /opt/rproxy/mihomo
+}
+
+post_upgrade() {
+  post_install
+}
 '''
 
 LINUX_DESKTOP = '''[Desktop Entry]
@@ -87,7 +131,7 @@ Exec=rproxy
 Icon=io.github.rproxy.Rproxy
 Terminal=false
 Categories=Network;
-StartupWMClass=rproxy
+StartupWMClass=io.github.rproxy.Rproxy
 '''
 
 def run(*args, **kwargs):
@@ -99,16 +143,17 @@ def copy(source, target):
     shutil.copy2(source, target)
 
 
-def bundle(path, system, arch):
+def bundle(path, system, arch, *, resources=None):
     suffix = '.exe' if system == 'win32' else ''
     target = Path(os.environ.get('CARGO_TARGET_DIR', ROOT / 'target'))
     if os.environ.get('CARGO_BUILD_TARGET'):
         target /= os.environ['CARGO_BUILD_TARGET']
     copy(target / f'release/rproxy{suffix}', path / f'rproxy{suffix}')
     core = verify_mihomo(system, arch)
-    copy(core, path / 'assets/mihomo' / core.name)
-    (path / 'assets/mihomo' / core.name).chmod(0o755)
-    copy(ROOT / 'assets/mihomo/LICENSE', path / 'assets/mihomo/LICENSE')
+    # Every package puts the core beside rproxy; only the package's resource root varies.
+    copy(core, path / core.name)
+    (path / core.name).chmod(0o755)
+    copy(ROOT / 'assets/mihomo/LICENSE', (resources or path) / 'licenses/mihomo/LICENSE')
 
 
 def windows(arch, name):
@@ -133,14 +178,14 @@ def macos(arch, name):
     if image.exists():
         shutil.rmtree(image)
     app = image / 'rproxy.app'
-    bundle(app / 'Contents/MacOS', 'darwin', arch)
+    bundle(app / 'Contents/MacOS', 'darwin', arch, resources=app / 'Contents/Resources')
     info = dict(CFBundleExecutable='rproxy', CFBundleName='rproxy', CFBundleIdentifier=APP_ID,
                 CFBundleVersion=VERSION, CFBundleShortVersionString=VERSION,
                 CFBundlePackageType='APPL', NSHighResolutionCapable=True,
                 LSMinimumSystemVersion='11.0', LSApplicationCategoryType='public.app-category.utilities')
     (app / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
-    run('codesign', '--force', '--sign', '-', app / 'Contents/MacOS/assets/mihomo/mihomo')
-    run('codesign', '--force', '--sign', '-', app / 'Contents/MacOS/rproxy')
+    # Sign nested code first. Signing the app also signs its main executable.
+    run('codesign', '--force', '--sign', '-', app / 'Contents/MacOS/mihomo')
     run('codesign', '--force', '--sign', '-', app)
     run('codesign', '--verify', '--deep', '--strict', app)
     (image / 'Applications').symlink_to('/Applications', target_is_directory=True)
@@ -160,20 +205,22 @@ def linux(arch, name):
     appdir = DIST / f'AppDir-{arch}'
     if appdir.exists():
         shutil.rmtree(appdir)
-    bundle(appdir / 'usr/bin', 'linux', arch)
+    bundle(appdir / 'usr/bin', 'linux', arch, resources=appdir / 'usr/share')
     desktop = DIST / f'{APP_ID}.desktop'
     desktop.write_text(LINUX_DESKTOP, encoding='utf-8')
-    icon = appdir / f'usr/share/icons/hicolor/256x256/apps/{APP_ID}.png'
+    icon = appdir / f'usr/share/icons/hicolor/512x512/apps/{APP_ID}.png'
+    scalable = appdir / f'usr/share/icons/hicolor/scalable/apps/{APP_ID}.svg'
+    copy(ROOT / 'assets/logos/rproxy-blue.svg', scalable)
     # The repository logo is resized by ImageMagick, available in Linux CI.
     icon.parent.mkdir(parents=True, exist_ok=True)
-    run('convert', ROOT / 'assets/logos/blue.png', '-resize', '256x256', icon)
+    run('convert', '-background', 'none', '-density', '384', ROOT / 'assets/logos/rproxy-blue.svg', '-resize', '512x512', icon)
     copy(desktop, appdir / f'usr/share/applications/{APP_ID}.desktop')
 
     # Flatpak packages the clean binary tree; platform libraries come from its runtime.
     manifest = {
         'app-id': APP_ID, 'runtime': 'org.freedesktop.Platform', 'runtime-version': '25.08',
         'sdk': 'org.freedesktop.Sdk', 'command': 'rproxy',
-        'finish-args': ['--share=network', '--share=ipc', '--socket=wayland', '--socket=fallback-x11',
+        'finish-args': ['--filesystem=xdg-run/rproxy:create', '--share=network', '--share=ipc', '--socket=wayland', '--socket=fallback-x11',
                         '--device=dri', '--talk-name=org.kde.StatusNotifierWatcher'],
         # Cargo already stripped debuginfo; this also avoids a host eu-strip (elfutils).
         'modules': [{'name': 'rproxy', 'buildsystem': 'simple', 'build-options': {'no-debuginfo': True},
@@ -193,15 +240,24 @@ def linux(arch, name):
         shutil.rmtree(pkg)
     bundle(pkg / 'opt/rproxy', 'linux', arch)
     copy(desktop, pkg / f'usr/share/applications/{APP_ID}.desktop')
-    copy(icon, pkg / f'usr/share/icons/hicolor/256x256/apps/{APP_ID}.png')
+    copy(icon, pkg / f'usr/share/icons/hicolor/512x512/apps/{APP_ID}.png')
+    copy(scalable, pkg / f'usr/share/icons/hicolor/scalable/apps/{APP_ID}.svg')
     (pkg / 'usr/bin').mkdir(parents=True)
     (pkg / 'usr/bin/rproxy').symlink_to('/opt/rproxy/rproxy')
     size = sum(p.stat().st_size for p in pkg.rglob('*') if p.is_file())
     (pkg / '.PKGINFO').write_text(f'pkgname = rproxy\npkgver = {VERSION}-1\npkgdesc = Proxy manager\n'
         f'arch = {native_arch}\nbuilddate = {int(time.time())}\nsize = {size}\n'
-        'depend = glibc\ndepend = gcc-libs\ndepend = libxkbcommon\ndepend = libx11\n'
-        'depend = libxcursor\ndepend = libxi\ndepend = libxrandr\ndepend = wayland\ndepend = libglvnd\n')
-    run('tar', '--zstd', '-cf', DIST / (name + '.pkg.tar.zst'), '-C', pkg, '.')
+        'depend = glibc\ndepend = gcc-libs\ndepend = libxkbcommon\ndepend = libxkbcommon-x11\ndepend = libx11\n'
+        'depend = libxcursor\ndepend = libxi\ndepend = libxrandr\ndepend = wayland\ndepend = libglvnd\n'
+        'depend = dbus\ndepend = xdg-desktop-portal\ndepend = libcap\n'
+        'optdepend = xdg-desktop-portal-gtk: file dialogs on GTK desktops\n'
+        'optdepend = xdg-desktop-portal-gnome: GNOME desktop integration\n'
+        'optdepend = xdg-desktop-portal-kde: KDE desktop integration\n')
+    (pkg / '.INSTALL').write_text(PACMAN_INSTALL)
+    # pacman reads .PKGINFO as the first entry; names without "./", files owned by root.
+    payload = sorted(p.name for p in pkg.iterdir() if p.name not in ('.PKGINFO', '.INSTALL'))
+    run('tar', '--zstd', '--owner=0', '--group=0', '--numeric-owner', '-cf', DIST / (name + '.pkg.tar.zst'),
+        '-C', pkg, '.PKGINFO', '.INSTALL', *payload)
 
     tool = DIST / f'linuxdeploy-{native_arch}.AppImage'
     with urlopen(LINUXDEPLOY.format(native_arch), timeout=120) as response:
@@ -243,6 +299,14 @@ def check_packages(system, arch):
             # flatpak run needs a session bus; headless CI runners have none.
             bus = [] if os.environ.get('DBUS_SESSION_BUS_ADDRESS') else ['dbus-run-session', '--']
             check_run(*bus, 'flatpak', 'run', APP_ID, '--smoke-test', '--data-dir', '/tmp/rproxy-smoke')
+            listing = subprocess.run(['tar', '--zstd', '--numeric-owner', '-tvf', artifact('.pkg.tar.zst')], capture_output=True, text=True,
+                                     check=True, timeout=120).stdout.splitlines()
+            if not listing or listing[0].split()[-1] != '.PKGINFO':
+                raise RuntimeError(f'.PKGINFO must be the first pacman package entry, not {listing[:1]}')
+            if any(line.split()[1] != '0/0' for line in listing):
+                raise RuntimeError('pacman package files must be owned by 0/0')
+            if '.INSTALL' not in {line.split()[-1] for line in listing}:
+                raise RuntimeError('The pacman package has no .INSTALL')
             check_run('tar', '--zstd', '-xf', artifact('.pkg.tar.zst'), '-C', temp)
             smoke(temp / 'opt/rproxy/rproxy', temp / 'pacman')
         elif system == 'darwin':

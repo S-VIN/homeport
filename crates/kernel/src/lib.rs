@@ -18,7 +18,7 @@
 #![allow(clippy::type_complexity)]
 extern crate self as rproxy_kernel;
 
-pub mod backup;
+pub mod configuration;
 pub mod board;
 mod changes;
 pub mod core;
@@ -40,7 +40,7 @@ pub mod updates;
 pub use board::{Phase, Run, RunId};
 pub use host::{Host, Session};
 pub use id::{hex, now, random_bytes, Id};
-pub use kernel::{Cx, Kernel, Notice, Started};
+pub use kernel::{Cx, Kernel, LiveMark, Notice, Started};
 pub use op::{Claim, JobSpec, Next, Op, Rank};
 pub use plugin::{categories, Category, Platform, Plugin, Policy};
 pub use rproxy_derive::Table;
@@ -55,14 +55,20 @@ pub use ui::{Page, PageSpec, UiCx};
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Replace the value of a setting registered with [`Setup::editable_setting`].
-pub struct Set<T>(pub T);
-impl<T: Send + 'static> Op for Set<T> {
+pub struct Set<T: 'static> {
+    pub state: &'static State<T>,
+    pub value: T,
+}
+impl<T: Send + Sync + 'static> Op for Set<T> {
     type Reply = ();
 }
 /// Change some fields of a setting registered with [`Setup::editable_setting`]
 /// (other fields keep their current values). See [`UiCx::update`].
-pub struct Update<T>(pub Box<dyn FnOnce(&mut T) + Send>);
-impl<T: Send + 'static> Op for Update<T> {
+pub struct Update<T: 'static> {
+    pub state: &'static State<T>,
+    pub change: Box<dyn FnOnce(&mut T) + Send>,
+}
+impl<T: Send + Sync + 'static> Op for Update<T> {
     type Reply = ();
 }
 

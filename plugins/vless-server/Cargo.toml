@@ -15,7 +15,7 @@ url = { workspace = true }
 futures-util = { workspace = true }
 rustls-acme = { version = "0.15.4", default-features = false, features = ["ring", "tls12", "webpki-roots"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
-rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem", "crypto"] }
+rcgen = { version = "0.13.2", default-features = false, features = ["ring", "pem", "crypto"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 base64 = "0.23"
 hyper = { version = "1.12", features = ["server", "http1", "http2"] }

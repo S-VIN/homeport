@@ -9,5 +9,4 @@ description = "rproxy design system for egui: tokens, palette, fonts, icons, wid
 egui = { workspace = true }
 image = { workspace = true }
 unicode-segmentation = "1.13"
-web-time = "1.1"
 qrcode = { version = "0.14.1", default-features = false }

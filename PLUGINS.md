@@ -6,7 +6,7 @@
 
 | Понятие | Зачем | API |
 |---|---|---|
-| **State** | Данные плагина: сохраняемый список, коллекция, настройка или состояние в памяти | `State<T>`, `p.list`, `p.collection`, `p.setting`, `p.editable_setting`, `p.memory`, `p.persist` |
+| **State** | Данные плагина: сохраняемый список, коллекция, настройка или живое состояние в памяти | `State<T>`, `p.list`, `p.collection`, `p.setting`, `p.editable_setting`, `p.live`, `p.persist` |
 | **Op** | Действие. Владелец реализует, другие плагины оборачивают, заменяют или заявляют часть входов | `impl Op`, `p.handle`, `p.wrap`, `.claim`, `.rank`, `cx.call`, `cx.spawn` |
 | **Event** | Факт после коммита: «подписка добавлена», «серверы изменились» | `w.emit`, `cx.emit`, `p.on`, `p.on_change` |
 | **Slot / Hook** | Зона UI, куда плагины вносят интерфейс; синхронный вопрос, на который отвечают несколько плагинов | `Slot<P>`, `p.fill`, `p.replace`, `p.wrap_view`, `p.hide`; `Hook<I, O>`, `p.hook`, `snap.hooks` |
@@ -34,7 +34,7 @@ fn setup(p: &mut Setup) -> Result<()> {
     // Таблица, порядок, Add/Save/Move/Remove и события Added/Saved/Removed — от ядра.
     p.list(&RULES).validate(|_, rule, _previous, others| { /* нормализация, уникальность */ Ok(()) });
     // Вклад в конфиг mihomo пересчитывается и применяется после каждого коммита.
-    p.core(|snap| Fragment::rules(Stage::User, snap.get(&RULES).iter().filter_map(|r| core_rule(r).ok())));
+    p.core(|snap| Fragment::rules(Stage::User, snap.get(&RULES).iter().filter_map(|r| core_rule(r, &servers::route(snap)).ok())));
     p.page_fn(PageSpec { id: "routing", title: "Routing", icon: Icon::Routing, order: 30 }, |ui, cx| {
         kit::page_header(ui, "Routing", &kit::plural(cx.get(&RULES).len(), "rule", "rules"), |_| {});
         kit::helper(ui, "Rules apply top to bottom and the first match wins.");
@@ -50,7 +50,7 @@ fn setup(p: &mut Setup) -> Result<()> {
 
 Подключение: крейт в `plugins/`, зависимость в корневом `Cargo.toml` и строка в `src/lib.rs` (`catalog()`).
 
-**Платформы.** `platforms` перечисляет системы, которые плагин поддерживает: `Platform::ALL` или, например, `&[Platform::Linux]`. Код под каждую систему плагин пишет сам (`#[cfg(target_os = "…")]`/`#[cfg(windows)]` внутри крейта), но крейт обязан компилироваться на всех системах: там, где поддержки нет, — без вызовов системы. На неподдерживаемой системе ядро не вызывает `setup`, плагин виден в **Settings → Plugins** без переключателя с пометкой «Not available on this system · Linux only», а плагины, которые от него зависят, неактивны. Обязательный (`required`) плагин должен поддерживать все системы. Объявляйте только системы, для которых код написан и проверен.
+**Платформы.** `platforms` перечисляет системы, которые плагин поддерживает: `Platform::ALL` (Linux, Windows, macOS и Docker), `Platform::DESKTOP` (только три настольные ОС) или, например, `&[Platform::Linux]`. `Platform::Docker` — образ из `docker/`: Linux без рабочего стола, системного прокси, TUN и автозапуска; его распознаёт `Platform::current()` по `RPROXY_DOCKER=1` (задан в Dockerfile) или файлам `/.dockerenv`, `/run/.containerenv`. Код под каждую систему плагин пишет сам (`#[cfg(target_os = "…")]`/`#[cfg(windows)]` внутри крейта), но крейт обязан компилироваться на всех системах: там, где поддержки нет, — без вызовов системы. Различия внутри одной сборки проверяются во время работы: `Platform::current()` (определяется один раз), `Platform::is_docker()`, `Platform::is_flatpak()`, `Platform::appimage()` (путь AppImage, только если процесс запущен из неё, а не унаследовал `APPIMAGE`). Например, inbounds в Docker и Flatpak прячет System proxy и TUN и показывает одну нейтральную строку. На неподдерживаемой системе ядро не вызывает `setup`, плагин виден в **Settings → Plugins** без переключателя с пометкой «Not available on this system · Desktop only» (или «· Linux only»), а плагины, которые от него зависят, неактивны. Обязательный (`required`) плагин должен поддерживать все системы. Объявляйте только системы, для которых код написан и проверен.
 
 Правила для автора:
 - имя состояния начинается с `id` плагина и точки (`routing.rules`); писать в чужое состояние нельзя, только вызывать op владельца;
@@ -113,7 +113,11 @@ p.wrap(|cx, f: Fetch, next: Next<Fetch>| async move {
 
 Хуки для синхронных вопросов: `servers::ROUTE` (куда идёт трафик «через сервер»; по умолчанию группа `main`, Exit server отвечает своим выходом), `servers::EXCLUDE` (почему сервер нельзя использовать), `servers::FAILOVER` (резервы подключённого сервера: группа `main` становится `fallback` `[выбранный, резервы…]`), `servers::IDLE` (почему ничего не подключено — текст в карточке подключения), `SOURCE_LABEL`, `SOURCE_HUE` (цвет тега источника; рисует `servers::source_tag`), `SORT_KEYS`, `FREEZE`, `subscriptions::LINK` (принять прямую ссылку), `shell::TRAY` (цвет иконки трея, побеждает худший ответ).
 
-Долгие задачи — `p.service(name, spec, run)`: задача перезапускается при смене `spec(snapshot)` (`None` — остановить) и отменяется при остановке ядра; отменённая задача убирает за собой через `Drop` (так системный прокси возвращается). `p.data_dir()` — каталог данных профиля. `cx.core().routed_http()` — HTTP-клиент по обычным правилам (для загрузок, которым прямой путь закрыт); `cx.core().direct_or_routed("GitHub", |c| c.get(url).send())` — сначала напрямую с коротким таймаутом соединения, затем этим клиентом. Ошибка задачи по расписанию (`p.every`) показывается один раз, пока задача снова не пройдёт. Общие мелочи: `random_bytes::<N>()`, `hex(&bytes)`, `now()`.
+**Живое состояние** — `p.live(&S, init)`: значения в памяти, которые часто меняются и не сохраняются (трафик, что проверяется сейчас, статус сертификата). Без транзакции: `cx.set_live(&S, v)` / `cx.update_live(&S, |v| …)` заменяют значение и перерисовывают UI, если оно изменилось; читают `cx.live(&S)` и `snap.live(&S)`. Для списка «что сейчас занято» есть `let _busy = cx.mark_live(&BUSY, id);` — элемент уходит из списка, когда guard удаляется (в том числе при ошибке или отмене). В `p.core` живое состояние недоступно: конфиг ядра строится только из сохранённых данных.
+
+**Настройки из UI** — `p.editable_setting(&S)` и в UI `cx.update(key, &S, |s| s.field = v)` (или ops `Set { state, value }` / `Update { state, change }`). Op несёт само состояние, поэтому несколько настроек одного типа не путаются.
+
+Долгие задачи — `p.service(name, spec, run)`: задача перезапускается при смене `spec(snapshot)` (`None` — остановить) и отменяется при остановке ядра. Что задача изменила в системе, возвращает `.on_stop(|cx, spec| async { … })`: ядро вызывает его после остановки (смена spec, выключение, выход), и следующий запуск ждёт его окончания (так системный прокси возвращается). `p.data_dir()` — собственная папка плагина `<data>/plugins/<id>` для файлов вне SQLite (сертификаты, кеш, журналы). `cx.core().routed_http()` — HTTP-клиент по обычным правилам (для загрузок, которым прямой путь закрыт); `cx.core().direct_or_routed("GitHub", |c| c.get(url).send())` — сначала напрямую с коротким таймаутом соединения, затем этим клиентом. Ошибка задачи по расписанию (`p.every`) показывается один раз, пока задача снова не пройдёт. Общие мелочи: `random_bytes::<N>()`, `hex(&bytes)`, `now()`.
 
 Чужой вклад можно заменить (`p.replace`), обернуть (`p.wrap_view`) или скрыть (`p.hide`) по его id `плагин/имя`.
 
@@ -132,7 +136,7 @@ p.wrap(|cx, f: Fetch, next: Next<Fetch>| async move {
 | exit-server — «Exit server» | Network & system | Второй хоп после выбранного сервера или напрямую; WARP как резерв или выход | `servers::ROUTE`, CONNECTION, STATUS, PANELS |
 | connections — «Connections» | Network & system | Открытые соединения и трафик, закрытие | `p.service`, STATUS, `servers::DETAILS` |
 | vless-server — «VLESS server» (выкл. по умолчанию) | Network & system | VLESS-вход с REALITY self-steal и XHTTP, сайт-приманка с Let's Encrypt, клиенты и ссылки | конфиг mihomo, `p.service`, STATUS |
-| autostart — «Start at login» (только Linux) | Network & system | Запуск при входе (XDG autostart) | Settings |
+| autostart — «Start at login» (`Platform::DESKTOP`) | Network & system | Запуск при входе: XDG autostart, Background portal во Flatpak, `HKCU\…\Run` в Windows, LaunchAgent в macOS; устаревший путь в записи переписывается при запуске | Settings |
 
 ## Тесты
 

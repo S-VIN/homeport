@@ -37,6 +37,8 @@ pub const NAVIGATION: f32 = 48.0;
 pub const UTILITY_WIDTH: f32 = 300.0;
 /// From this window width the side panel is docked on the right.
 pub const UTILITY_BREAKPOINT: f32 = 960.0;
+/// Phone-sized window: list rows trade labels for icons (see `kit::compact_row`).
+pub const PHONE: f32 = 480.0;
 /// Width of the label column in property lists (server details, About).
 pub const LABEL_WIDTH: f32 = 96.0;
 /// Corner radius of cards, popovers and toasts.
@@ -98,6 +100,7 @@ pub fn style(dark: bool, reduced_motion: bool) -> Style {
     s.spacing.button_padding = Vec2::new(10.0, 4.0);
     s.spacing.interact_size = Vec2::new(CONTROL, CONTROL);
     s.spacing.combo_height = 300.0;
+    s.spacing.tooltip_width = 320.0;
     s.spacing.menu_margin = egui::Margin::same(4);
     s.spacing.window_margin = egui::Margin::same(PADDING as i8);
     s.spacing.icon_width = 14.0;

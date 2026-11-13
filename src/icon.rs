@@ -1,10 +1,17 @@
 use eframe::egui;
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // Connection colors are used by the Linux tray.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Link {
     Idle,
     Selected,
     Failed,
+}
+pub fn status(host: &rproxy_kernel::Host) -> Link {
+    use rproxy_kernel::shell::TrayLink;
+    let Some(k) = host.try_kernel() else { return Link::Idle };
+    let answers = k.snapshot().hooks(&rproxy_kernel::shell::TRAY, &());
+    if !k.core_status().running() || answers.contains(&Some(TrayLink::Failed)) { Link::Failed }
+    else if answers.contains(&Some(TrayLink::Connected)) { Link::Selected }
+    else { Link::Idle }
 }
 pub fn icon(link: Link) -> egui::IconData {
     let bytes = match link {

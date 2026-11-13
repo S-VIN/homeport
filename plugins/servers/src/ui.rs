@@ -24,12 +24,12 @@ pub(crate) fn register(p: &mut Setup) {
             Some(s) => (
                 pal.success,
                 short(&s.name, 28),
-                format!("Connected via {}", s.name),
+                s.name.clone(),
             ),
             None => (
                 pal.faint,
                 "Not connected".to_owned(),
-                "No server selected".to_owned(),
+                String::new(),
             ),
         };
         if kit::chip(ui, Some(Lead::Dot(color)), &text, &tip).clicked() {
@@ -47,16 +47,6 @@ fn short(s: &str, n: usize) -> String {
     }
 }
 
-fn connected_label(ui: &mut egui::Ui) {
-    let pal = theme::palette(ui);
-    kit::icon(ui, Icon::Connected, 15., pal.success);
-    ui.label(
-        egui::RichText::new("Connected")
-            .size(theme::SMALL)
-            .color(pal.success),
-    );
-}
-
 fn connection_card(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
     let pal = theme::palette(ui);
     let snap = cx.snapshot().clone();
@@ -64,20 +54,9 @@ fn connection_card(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
         panel_title(ui, "Connection", |ui| {
             kit::badge(ui, "Not connected", Tone::Neutral);
         });
-        let hint = snap
-            .hooks(&crate::IDLE, &())
-            .into_iter()
-            .flatten()
-            .next()
-            .unwrap_or_else(|| "Choose a server on the Servers page or turn on Auto select.".into());
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(hint)
-                    .size(theme::SMALL)
-                    .color(pal.muted),
-            )
-            .wrap(),
-        );
+        if let Some(status) = snap.hooks(&crate::IDLE, &()).into_iter().flatten().next() {
+            kit::tone_text(ui, status, Tone::Neutral);
+        }
         if cx.page() != "servers" {
             ui.add_space(6.);
             if Button::secondary("Open Servers")
@@ -101,7 +80,7 @@ fn connection_card(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
     });
     ui.scope(|ui| {
         ui.set_max_width(ui.available_width());
-        emoji::label(ui, &s.name, theme::bold(theme::TITLE), true).on_hover_text(&s.name);
+        emoji::label(ui, &s.name, theme::bold(theme::TITLE), true);
     });
     ui.add_space(4.);
     ui.horizontal_wrapped(|ui| {
@@ -115,15 +94,11 @@ fn connection_card(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
     if Button::secondary("Disconnect")
         .icon(Icon::Disconnect)
         .show(ui)
-        .on_hover_text("Stop using this server")
         .clicked()
     {
         cx.submit(
             "disconnect",
-            Select {
-                id: None,
-                auto: false,
-            },
+            Select::manual(None),
         );
     }
 }
@@ -161,7 +136,6 @@ impl Page for ServersPage {
                     ui,
                     Icon::Servers,
                     "No servers yet",
-                    "Servers appear here after a subscription loads.",
                 );
                 ui.vertical_centered(|ui| {
                     if Button::primary("Add subscription")
@@ -214,7 +188,6 @@ impl Page for ServersPage {
                     ui,
                     Icon::Filter,
                     "No matching servers",
-                    "No server matches the source and protocol filters.",
                 );
                 ui.vertical_centered(|ui| {
                     if Button::secondary("Reset filters").show(ui).clicked() {
@@ -232,7 +205,7 @@ impl Page for ServersPage {
         kit::list_card(ui, |ui| {
             kit::list_header(ui, |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    kit::cell(ui, ACTION, |_| {});
+                    kit::action_cell(ui, ACTION, |_| {});
                     cx.slot_rev(ui, &COLUMNS, &Cell { server: None, wide });
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.add_space(CHEVRON + theme::HORIZONTAL_GAP);
@@ -296,7 +269,7 @@ impl ServersPage {
                     }
                 },
             )
-            .on_hover_text("Show servers of one subscription");
+            ;
             kit::select(
                 ui,
                 "protocol",
@@ -315,14 +288,11 @@ impl ServersPage {
                     }
                 },
             )
-            .on_hover_text("Show servers of one protocol");
+            ;
             kit::select(
                 ui,
                 "sort",
-                &format!(
-                    "Sort by {}",
-                    sorts.get(self.sort).map_or("Name", |s| s.0).to_lowercase()
-                ),
+                &format!("Sort: {}", sorts.get(self.sort).map_or("Name", |s| s.0)),
                 w,
                 |ui| {
                     for (i, (label, _)) in sorts.iter().enumerate() {
@@ -330,7 +300,7 @@ impl ServersPage {
                     }
                 },
             )
-            .on_hover_text("Order of the list");
+            ;
         });
         ui.add_space(theme::SPACE_M);
     }
@@ -354,38 +324,17 @@ impl ServersPage {
             let two_lines = excluded.is_some() && !expanded;
             kit::row_line(ui, if two_lines { 44. } else { theme::ROW }, |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    kit::cell_right(ui, ACTION, |ui| {
-                        ui.spacing_mut().item_spacing.x = 4.;
-                        let usable = excluded.is_none() && core_ok;
-                        if selected && row.hovered {
-                            if Button::ghost("Disconnect")
-                                .tone(Tone::Danger)
-                                .width(ACTION)
-                                .show(ui)
-                                .on_hover_text("Stop using this server")
-                                .clicked()
-                            {
+                    kit::action_cell(ui, ACTION, |ui| {
+                        if selected {
+                            if Button::ghost("Disconnect").icon(Icon::Disconnect).tone(Tone::Danger).width(ACTION).show(ui).clicked() {
                                 connect = Some(None);
                             }
-                        } else if selected {
-                            ui.with_layout(
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.add_space(8.);
-                                    connected_label(ui);
-                                },
-                            );
-                        } else if row.hovered && usable {
-                            if Button::secondary("Connect")
-                                .width(ACTION)
-                                .show(ui)
-                                .on_hover_text("Send traffic through this server")
-                                .clicked()
-                            {
+                        } else if excluded.is_none() && core_ok {
+                            if Button::secondary("Connect").icon(Icon::Link).width(ACTION).show(ui).clicked() {
                                 connect = Some(Some(s.id));
                             }
-                        } else if row.hovered && excluded.is_none() {
-                            kit::hint(ui, "Core offline");
+                        } else if excluded.is_none() {
+                            kit::icon(ui, Icon::Warning, 14., pal.warning).on_hover_text("Core offline");
                         }
                     });
                     cx.slot_rev(
@@ -400,17 +349,7 @@ impl ServersPage {
                         // Chevron, name and source tag share one click target that expands the row.
                         let avail = ui.available_width();
                         let label = source_label(snap, s.source);
-                        let tag_w = (ui
-                            .painter()
-                            .layout_no_wrap(
-                                label,
-                                egui::FontId::proportional(theme::CAPTION),
-                                pal.muted,
-                            )
-                            .size()
-                            .x
-                            + 12.)
-                            .min(if wide { 130. } else { 84. });
+                        let tag_w = kit::tag_width(ui, &label, if wide { 130. } else { 84. });
                         let name_w =
                             (avail - CHEVRON - tag_w - 2. * theme::HORIZONTAL_GAP - 4.).max(40.);
                         let (rect, click) = ui.allocate_exact_size(
@@ -478,14 +417,6 @@ impl ServersPage {
                         } else {
                             name_line(ui)
                         };
-                        let tip = match &excluded {
-                            Some(e) => format!("{}\n{}", s.name, e.reason),
-                            None if selected => format!("{}\nClick for details", s.name),
-                            None => {
-                                format!("{}\nClick for details · double-click to connect", s.name)
-                            }
-                        };
-                        let name = name.on_hover_text(tip);
                         if name.double_clicked() && !selected && excluded.is_none() && core_ok {
                             connect = Some(Some(s.id));
                         } else if click.clicked() || name.clicked() {
@@ -519,7 +450,7 @@ impl ServersPage {
             }
         });
         if let Some(id) = connect {
-            cx.submit(("select", s.id), Select { id, auto: false });
+            cx.submit(("select", s.id), Select::manual(id));
         }
         if expanded {
             self.expanded.insert(s.id);
@@ -543,6 +474,8 @@ fn details_body(
             ui.add(egui::Label::new(egui::RichText::new(&e.reason).color(pal.warning)).truncate());
         });
     }
+    // A long name is cut in the row.
+    kit::property(ui, "Name", &s.name);
     kit::property_with(ui, "Source", |ui| {
         source_tag(ui, snap, s.source, 200.);
     });

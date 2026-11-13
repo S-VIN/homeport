@@ -58,6 +58,7 @@ fn insert_sql<T: Table>() -> String {
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path).map_err(db)?;
+        conn.pragma_update(None, "trusted_schema", false).map_err(db)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -77,14 +78,8 @@ impl Store {
     /// Replace the whole database with the copy at `path`. The copy must be an
     /// rproxy database; nothing changes when it is not.
     pub fn restore_from(&self, path: &Path) -> Result<()> {
-        let src = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(db)?;
-        let ours: bool = src
-            .query_row("SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'kernel_plugins'", [], |r| r.get(0))
-            .map_err(db)?;
-        if !ours {
-            return Err(Error::msg("This file is not an rproxy backup."));
-        }
+        Self::check_configuration(path)?;
+        let src = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(db)?;
         let mut conn = self
             .conn
             .lock()
@@ -92,6 +87,17 @@ impl Store {
         rusqlite::backup::Backup::new(&src, &mut conn)
             .and_then(|b| b.run_to_completion(256, std::time::Duration::ZERO, None))
             .map_err(db)
+    }
+    pub(crate) fn check_configuration(path: &Path) -> Result<()> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(db)?;
+        conn.pragma_update(None, "trusted_schema", false).map_err(db)?;
+        let ours: bool = conn.query_row("SELECT count(*) = 1 FROM sqlite_schema WHERE type = 'table' AND name = 'kernel_plugins'", [], |r| r.get(0)).map_err(db)?;
+        let safe: bool = conn.query_row("SELECT count(*) = 0 FROM sqlite_schema WHERE type NOT IN ('table', 'index') OR upper(sql) LIKE '%VIRTUAL TABLE%'", [], |r| r.get(0)).map_err(db)?;
+        let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0)).map_err(db)?;
+        if !ours || !safe || integrity != "ok" {
+            return Err(Error::msg("This file is not a valid rproxy configuration. Your settings have not changed."));
+        }
+        Ok(())
     }
     /// Register at startup before serving requests. A failed upgrade leaves the old data intact.
     pub fn register<T: Table + DeserializeOwned>(&self) -> Result<()> {

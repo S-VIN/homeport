@@ -57,7 +57,6 @@ pub trait Op: Send + 'static {
 /// Handler priority; earlier ranks run first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Rank {
-    Override,
     Specific,
     Default,
     Fallback,
@@ -147,8 +146,4 @@ pub(crate) fn run<O: Op>(cx: &Cx, handlers: Option<&(dyn Any + Send + Sync)>, op
         .unwrap_or_default();
     let cx = cx.clone();
     Box::pin(async move { Next { chain: Arc::new(list), at: 0 }.run(&cx, op).await })
-}
-
-pub(crate) fn run_single<O: Op>(cx: &Cx, h: &Handler<O>, op: O) -> BoxFut<O::Reply> {
-    (h.f)(cx.clone(), op, Next { chain: Arc::new(Vec::new()), at: 0 })
 }

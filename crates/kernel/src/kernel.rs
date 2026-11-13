@@ -2,7 +2,7 @@ use crate::{
     changes::Changes,
     core::{Core, CoreApi},
     jobs::{JobContext, Jobs, Task, Timing},
-    op::{self, short_name, Handlers},
+    op::{self, short_name},
     setup::Registry,
     state::{Cell, OrderRow, PluginRow, SettingRow, Snapshot, Value, Write},
     store::Store,
@@ -59,14 +59,15 @@ pub struct Kernel {
     next_notice: AtomicU64,
     schedules: Mutex<HashMap<String, Option<Duration>>>,
     pub(crate) updates: Mutex<crate::updates::CoreUpdates>,
-    pub(crate) backup_list: Mutex<Vec<crate::backup::Backup>>,
     services: Mutex<HashMap<String, RunningService>>,
     pub(crate) catalog: Vec<&'static Plugin>,
     pub(crate) saved_toggles: Mutex<HashMap<String, bool>>,
     pub(crate) disabled_reasons: Vec<(String, String)>,
     pub(crate) restart: Arc<dyn Fn() + Send + Sync>,
-    /// Replace the database with a backup and restart (provided by the host).
-    pub(crate) restore: Arc<dyn Fn(PathBuf) + Send + Sync>,
+    /// Apply a validated imported configuration (provided by the host).
+    pub(crate) restore: Arc<dyn Fn(Arc<crate::configuration::Import>) + Send + Sync>,
+    /// True while a window or browser tab shows the UI.
+    ui_open: Arc<dyn Fn() -> bool + Send + Sync>,
     /// Set by shutdown: no more writes, events or jobs from this kernel.
     closed: std::sync::atomic::AtomicBool,
     /// Job keys with a queued follow-up run.
@@ -146,19 +147,16 @@ pub(crate) fn resolve(catalog: &[&'static Plugin], saved: &HashMap<String, bool>
 }
 
 impl Kernel {
-    pub(crate) async fn start(
-        catalog: Vec<&'static Plugin>,
-        store: Store,
-        data_dir: PathBuf,
-        restart: Arc<dyn Fn() + Send + Sync>,
-        restore: Arc<dyn Fn(PathBuf) + Send + Sync>,
-    ) -> Result<Arc<Kernel>> {
+    pub(crate) fn load_configuration(catalog: &[&'static Plugin], store: &Store, data_dir: &std::path::Path, all_plugins: bool) -> Result<Snapshot> {
         store.register::<PluginRow>()?;
         store.register::<OrderRow>()?;
         store.register::<SettingRow>()?;
         let saved: HashMap<String, bool> = store.transaction(|tx| tx.all::<PluginRow>())?.into_iter().map(|r| (r.id, r.enabled)).collect();
-        let (plugins, disabled_reasons) = resolve(&catalog, &saved);
-        let mut reg = Registry { plugins, data_dir: data_dir.clone(), ..Default::default() };
+        // Import validation also reads data of disabled plugins (not of plugins
+        // for other systems: those never run here). It
+        // only registers/deserializes; no services or core process are started.
+        let plugins = if all_plugins { catalog.iter().copied().filter(|p| p.supported()).collect() } else { resolve(catalog, &saved).0 };
+        let mut reg = Registry { plugins, data_dir: data_dir.to_owned(), ..Default::default() };
         Setup { reg: &mut reg, plugin: None }.setting(&THEME);
         for i in 0..reg.plugins.len() {
             let p = reg.plugins[i];
@@ -170,19 +168,33 @@ impl Kernel {
             store.transaction(|tx| m(tx.sql())).map_err(|e| Error::msg(format!("{}: migration failed: {e}", reg.plugins[*p].name)))?;
         }
         for (_, _, p) in &reg.persist {
-            (p.register)(&store)?;
+            (p.register)(store)?;
         }
         let mut cells: HashMap<&'static str, Cell> = store.transaction(|tx| {
             reg.persist
                 .iter()
-                .map(|(name, _, p)| Ok((*name, Cell { value: (p.load)(tx)?, rev: 1 })))
+                .map(|(name, _, p)| Ok((*name, Cell { value: (p.load)(tx)? })))
                 .collect::<Result<_>>()
         })?;
-        for (name, init) in &reg.memory {
-            cells.insert(name, Cell { value: init(), rev: 1 });
+        for (name, init) in &reg.live {
+            cells.insert(name, Cell { value: init() });
         }
         let reg = Arc::new(reg);
-        let snapshot = Snapshot { cells: Arc::new(cells), reg: reg.clone(), rev: 1 };
+        Ok(Snapshot { cells: Arc::new(cells), reg, rev: 1 })
+    }
+
+    pub(crate) async fn start(
+        catalog: Vec<&'static Plugin>,
+        store: Store,
+        data_dir: PathBuf,
+        restart: Arc<dyn Fn() + Send + Sync>,
+        restore: Arc<dyn Fn(Arc<crate::configuration::Import>) + Send + Sync>,
+        ui_open: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<Arc<Kernel>> {
+        let snapshot = Self::load_configuration(&catalog, &store, &data_dir, false)?;
+        let reg = snapshot.reg.clone();
+        let saved: HashMap<String, bool> = store.transaction(|tx| tx.all::<PluginRow>())?.into_iter().map(|r| (r.id, r.enabled)).collect();
+        let (_, disabled_reasons) = resolve(&catalog, &saved);
         let changes = Changes::default();
         let k = Arc::new_cyclic(|me| Kernel {
             reg,
@@ -203,12 +215,12 @@ impl Kernel {
             schedules: Mutex::default(),
             services: Mutex::default(),
             updates: Mutex::new(crate::updates::CoreUpdates { installed: rproxy_mihomo::installed(&data_dir.join("core")).is_file(), ..Default::default() }),
-            backup_list: Mutex::new(crate::backup::list(&data_dir)),
             catalog,
             saved_toggles: Mutex::new(saved),
             disabled_reasons,
             restart,
             restore,
+            ui_open,
             closed: Default::default(),
             queued: Mutex::default(),
             data_dir,
@@ -218,28 +230,6 @@ impl Kernel {
             k.notify_error("Core did not start", &e.message);
         }
         k.reschedule();
-        // The daily automatic backup (checked at start and every six hours).
-        let task = crate::jobs::Task::new("kernel/backup", {
-            let weak = Arc::downgrade(&k);
-            move |_| {
-                let weak = weak.clone();
-                async move {
-                    if let Some(k) = weak.upgrade() {
-                        tokio::task::spawn_blocking(move || k.daily_backup())
-                            .await
-                            .map_err(|e| Error::msg(e.to_string()))?;
-                    }
-                    Ok(())
-                }
-            }
-        })
-        .label("Back up settings")
-        .quiet(true);
-        let _ = k.jobs.schedule(
-            "kernel/backup",
-            task,
-            crate::jobs::Timing::repeating(Duration::from_secs(5), Duration::from_secs(6 * 3600)),
-        );
         let weak = Arc::downgrade(&k);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(2));
@@ -257,18 +247,32 @@ impl Kernel {
     }
 
     pub async fn shutdown(&self) {
-        self.closed.store(true, Ordering::SeqCst);
+        {
+            // Synchronous plugin choices must finish before the closed flag,
+            // and later choices see it under the same lock.
+            let _toggles = self.saved_toggles.lock().unwrap();
+            self.closed.store(true, Ordering::SeqCst);
+        }
         // Stop every service and wait for its cleanup (e.g. restoring the system proxy).
         let services: Vec<_> = self.services.lock().unwrap().drain().map(|(_, s)| s.done).collect();
         for done in services {
             let _ = done.await;
         }
         self.jobs.shutdown().await;
+        // UI operations without a job can still hold the writer across core I/O.
+        // Drain them before the host snapshots or replaces the shared database.
+        let _writer = self.writer.lock().await;
         self.core.stop().await;
     }
 
     pub fn closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+    fn ensure_open(&self) -> Result<()> {
+        if self.closed() {
+            return Err(Error::new("closed", "rproxy is restarting."));
+        }
+        Ok(())
     }
     pub fn snapshot(&self) -> Snapshot {
         self.snap.read().unwrap().clone()
@@ -307,21 +311,21 @@ impl Kernel {
     /// Restart mihomo and apply the saved configuration.
     pub async fn restart_core(&self) -> Result<()> {
         let _w = self.writer.lock().await;
+        self.ensure_open()?;
         self.core.start(&self.reg, &self.snapshot()).await
     }
 
     /// Re-run the core apply for the current snapshot under the writer lock.
     pub(crate) async fn resync(&self) -> Result<()> {
         let _w = self.writer.lock().await;
+        self.ensure_open()?;
         self.core.sync(&self.reg, &self.snapshot()).await
     }
 
     // ---- transactions ---------------------------------------------------
     pub(crate) async fn write<R>(&self, plugin: Option<usize>, f: impl FnOnce(&mut Write<'_>) -> Result<R>) -> Result<R> {
         let _w = self.writer.lock().await;
-        if self.closed() {
-            return Err(Error::new("closed", "rproxy is restarting."));
-        }
+        self.ensure_open()?;
         let base = self.snapshot();
         let mut w = Write::new(&base, plugin);
         let out = std::panic::catch_unwind(AssertUnwindSafe(|| f(&mut w)))
@@ -500,6 +504,7 @@ impl Kernel {
     /// Save a plugin on/off choice. It applies after the next kernel restart.
     pub fn set_plugin(&self, id: &str, enabled: bool) -> Result<()> {
         let mut t = self.saved_toggles.lock().unwrap();
+        self.ensure_open()?;
         let mut changes = vec![(id.to_owned(), enabled)];
         if enabled {
             if let Some(p) = self.catalog.iter().find(|p| p.id == id) {
@@ -568,6 +573,11 @@ impl Cx {
     pub fn get<T: Send + Sync + 'static>(&self, s: &State<T>) -> Arc<T> {
         self.k.snapshot().get(s)
     }
+    /// True while a window or browser tab shows the UI: work that only feeds
+    /// the screen (live readings) can slow down otherwise.
+    pub fn ui_open(&self) -> bool {
+        (self.k.ui_open)()
+    }
     /// The latest value of a live state (see [`Setup::live`]).
     pub fn live<T: Send + Sync + 'static>(&self, s: &State<T>) -> Arc<T> {
         self.k.snapshot().live(s)
@@ -595,6 +605,13 @@ impl Cx {
         }
         r
     }
+    /// Put `item` into a live list while the returned guard lives, e.g. the
+    /// servers being checked right now: `let _busy = cx.mark_live(&BUSY, id);`
+    pub fn mark_live<T: Clone + PartialEq + Send + Sync + 'static>(&self, s: &'static State<Vec<T>>, item: T) -> LiveMark {
+        self.update_live(s, |list| list.push(item.clone()));
+        let cx = self.clone();
+        LiveMark(Some(Box::new(move || cx.update_live(s, |list| list.retain(|x| *x != item)))))
+    }
     fn live_cell<T: Send + Sync + 'static>(&self, s: &State<T>) -> Arc<crate::state::Live<T>> {
         let snap = self.k.snapshot();
         if let Some(me) = self.plugin {
@@ -613,25 +630,6 @@ impl Cx {
     pub fn call<O: Op>(&self, op: O) -> impl std::future::Future<Output = Result<O::Reply>> + Send + 'static {
         let h = self.k.reg.ops.get(&TypeId::of::<O>()).map(|b| &**b);
         op::run(self, h, op)
-    }
-    /// Run every handler that accepts `op` (fan-out), each without `next`.
-    pub async fn call_all<O: Op + Clone>(&self, op: O) -> Vec<(&'static str, Result<O::Reply>)> {
-        let snap = self.snapshot();
-        let list = self
-            .k
-            .reg
-            .ops
-            .get(&TypeId::of::<O>())
-            .and_then(|b| b.downcast_ref::<Handlers<O>>())
-            .map(|h| op::chain(&h.0, &snap, &op))
-            .unwrap_or_default();
-        let mut out = Vec::new();
-        for h in list {
-            let cx = self.as_plugin(Some(h.plugin));
-            let r = op::run_single(&cx, &h, op.clone()).await;
-            out.push((self.k.reg.plugins[h.plugin].id, r));
-        }
-        out
     }
     /// The job that runs ops made by `make` with this context. With `last_error`
     /// (scheduled jobs), the same error is shown once until a run succeeds.
@@ -742,6 +740,17 @@ impl Cx {
     }
     pub fn notify(&self, text: &str) {
         self.k.notify(self.plugin_name(), text)
+    }
+}
+
+/// Returned by [`Cx::mark_live`]; dropping it takes the item out again.
+#[must_use = "the item leaves the list when this guard drops"]
+pub struct LiveMark(Option<Box<dyn FnOnce() + Send>>);
+impl Drop for LiveMark {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
     }
 }
 

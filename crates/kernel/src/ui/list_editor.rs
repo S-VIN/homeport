@@ -1,6 +1,6 @@
 //! One editor for every ordered list a plugin registers with `Setup::list`:
 //! add bar, a list card with column captions, inline edit (Enter/blur saves,
-//! Esc discards), reorder, two-step delete, drafts that survive errors and
+//! Esc discards), reorder, delete, drafts that survive errors and
 //! "Saving…/Saved" feedback. Row actions stay faint until the row is hovered.
 use super::UiCx;
 use crate::{
@@ -51,7 +51,7 @@ impl<'s, T: 's> Column<'s, T> {
     }
     /// A combo box over a closed set; saves on change.
     pub fn choice<C: Copy + PartialEq + std::fmt::Display + 'static>(title: &'s str, width: f32, lens: fn(&mut T) -> &mut C, options: &'static [C]) -> Self {
-        Self::widget(title, width, move |ui, item| kit::choice(ui, "choice", lens(item), options, width, title))
+        Self::widget(title, width, move |ui, item| kit::choice(ui, "choice", lens(item), options, ui.available_width().min(width), ""))
     }
     /// Anything else (read-only).
     pub fn custom(title: &'s str, width: f32, f: impl Fn(&mut Ui, &mut UiCx, &T) + 's) -> Self {
@@ -105,7 +105,7 @@ pub struct ListEditor<'s, T: Record> {
     columns: Vec<Column<'s, T>>,
     add: Option<(&'s str, Box<dyn Fn() -> T + 's>, Fields<'s, T>)>,
     ordered: bool,
-    empty: Option<(Icon, &'s str, &'s str)>,
+    empty: Option<(Icon, &'s str)>,
     subtitle: Option<Subtitle<'s, T>>,
     leading: Option<Leading<'s, T>>,
     below: Option<Box<dyn Fn(&mut Ui, &mut UiCx, &T) + 's>>,
@@ -135,9 +135,9 @@ impl<'s, T: Record> ListEditor<'s, T> {
         self.headers = false;
         self
     }
-    /// Empty state: icon, title and the next step.
-    pub fn empty(mut self, icon: Icon, title: &'s str, hint: &'s str) -> Self {
-        self.empty = Some((icon, title, hint));
+    /// Compact empty state: icon and title.
+    pub fn empty(mut self, icon: Icon, title: &'s str) -> Self {
+        self.empty = Some((icon, title));
         self
     }
     /// A second line under the first column: status, errors, warnings.
@@ -191,19 +191,32 @@ impl<'s, T: Record> ListEditor<'s, T> {
         // Row actions sit edge to edge (no gaps between them).
         let actions = if self.ordered { 2. * theme::CONTROL } else { 0. } + if editable { theme::CONTROL } else { 0. } + theme::CONTROL;
         let leading = self.leading.as_ref().map_or(0., |(w, _)| w + gap);
-        let fixed: f32 = self.columns.iter().filter_map(|c| c.width).map(|w| w + gap).sum();
         let fills = self.columns.iter().filter(|c| c.width.is_none()).count().max(1) as f32;
-        let fill = |ui: &Ui| ((ui.available_width() - leading - actions - fixed - gap) / fills).max(40.);
+        // Narrow rows put the fixed-width columns on a second line, so the main
+        // column keeps at least `MIN_FILL`; plugins don't plan for screen sizes.
+        const MIN_FILL: f32 = 96.;
+        let fixed: f32 = self.columns.iter().filter_map(|c| c.width).map(|w| w + gap).sum();
+        let layout = move |ui: &Ui| -> Layout {
+            let avail = ui.available_width() - leading - actions - gap;
+            let stacked = fixed > 0. && avail - fixed < MIN_FILL * fills;
+            if stacked {
+                // The second line starts under the main column and has no actions.
+                let below = ui.available_width() - leading;
+                Layout { stacked, scale: (below / fixed).min(1.), fill: (avail / fills).max(40.) }
+            } else {
+                Layout { stacked, scale: 1., fill: ((avail - fixed) / fills).max(40.) }
+            }
+        };
         kit::list_card(ui, |ui| {
             if self.headers && !rows.is_empty() && self.columns.iter().any(|c| !c.title.is_empty()) {
                 kit::list_header(ui, |ui| {
                     // The header has no row inset: match the row's content start.
-                    let w = fill(ui) - 0.;
+                    let l = layout(ui);
                     if leading > 0. {
                         ui.add_space(leading - gap);
                     }
-                    for c in &self.columns {
-                        let width = c.width.unwrap_or(w);
+                    for c in self.columns.iter().filter(|c| l.on(c, Line::Main)) {
+                        let width = l.width(c);
                         if c.right {
                             kit::cell_right(ui, width, |ui| kit::caption(ui, c.title));
                         } else {
@@ -213,8 +226,8 @@ impl<'s, T: Record> ListEditor<'s, T> {
                 });
             }
             if rows.is_empty() {
-                if let Some((icon, title, hint)) = self.empty {
-                    kit::empty(ui, icon, title, hint);
+                if let Some((icon, title)) = self.empty {
+                    kit::empty(ui, icon, title);
                 }
                 return;
             }
@@ -256,12 +269,79 @@ impl<'s, T: Record> ListEditor<'s, T> {
                                     ui.spacing_mut().item_spacing.y = 2.;
                                     ui.add_space(3.);
                                     first(ui);
-                                    ui.add(egui::Label::new(egui::RichText::new(text).size(theme::SMALL).color(p.tone(*tone))).truncate()).on_hover_text(text);
+                                    kit::truncated(ui, egui::RichText::new(text).size(theme::SMALL).color(p.tone(*tone)), None);
                                 });
+                            };
+                            // One row's cells; `line` picks the main line or, on narrow rows, the line
+                            // below it with the fixed-width columns.
+                            let cells = |ui: &mut Ui, cx: &mut UiCx, draft: &mut T, save: &mut bool, l: &Layout, line: Line| {
+                                for (ci, c) in self.columns.iter().enumerate().filter(|(_, c)| l.on(c, line)) {
+                                let width = l.width(c);
+                                let first_line = ci == 0 && two_lines;
+                                match &c.kind {
+                                    Kind::Text { text, color, tooltip } => {
+                                        let draw = |ui: &mut Ui| {
+                                            let mut t = egui::RichText::new(text(item));
+                                            if let Some(color) = color {
+                                                t = t.color(color(ui, item));
+                                            }
+                                            let tip = tooltip.as_ref().map(|tip| tip(item));
+                                            kit::truncated(ui, t, tip.as_deref());
+                                        };
+                                        if first_line {
+                                            second(ui, width, &draw)
+                                        } else if c.right {
+                                            kit::cell_right(ui, width, draw)
+                                        } else {
+                                            kit::cell(ui, width, draw)
+                                        }
+                                    }
+                                    Kind::Edit { lens, placeholder, secret, display, color } => {
+                                        if is_editing {
+                                            let r = kit::input(ui, c.title, lens(draft), placeholder, width, *secret)
+                                                .on_hover_text("Enter or leave the field to save · Esc discards unsaved text");
+                                            let focus = list.with(("focus", id));
+                                            if ui.data(|d| d.get_temp::<bool>(focus).unwrap_or(false)) {
+                                                r.request_focus();
+                                                ui.data_mut(|d| d.remove::<bool>(focus));
+                                            }
+                                            *save |= kit::committed(ui, &r);
+                                        } else {
+                                            let draw = |ui: &mut Ui| {
+                                                let shown = display.as_ref().map_or_else(|| lens(&mut item.clone()).clone(), |f| f(item));
+                                                let mut t = egui::RichText::new(&shown).color(p.foreground);
+                                                if let Some(color) = color {
+                                                    t = t.color(color(ui, item));
+                                                }
+                                                kit::truncated(ui, t, None);
+                                            };
+                                            if first_line {
+                                                second(ui, width, &draw)
+                                            } else {
+                                                kit::cell(ui, width, draw)
+                                            }
+                                        }
+                                    }
+                                    Kind::Widget(f) => {
+                                        // Applied to the stored item at once, independent of the text draft.
+                                        let mut fresh = item.clone();
+                                        if kit::cell(ui, width, |ui| f(ui, &mut fresh)) && fresh != *item {
+                                            cx.submit(key, Save(fresh));
+                                        }
+                                    }
+                                    Kind::Custom(f) => {
+                                        if c.right {
+                                            kit::cell_right(ui, width, |ui| f(ui, cx, item))
+                                        } else {
+                                            kit::cell(ui, width, |ui| f(ui, cx, item))
+                                        }
+                                    }
+                                }
+                                }
                             };
                             ui.add_enabled_ui(!busy, |ui| {
                                 kit::row_line(ui, if two_lines { 44. } else { theme::ROW }, |ui| {
-                                    let w = fill(ui);
+                                    let l = layout(ui);
                                     if let Some((width, f)) = &self.leading {
                                         if two_lines {
                                             // Align the marker with the first line.
@@ -273,71 +353,7 @@ impl<'s, T: Record> ListEditor<'s, T> {
                                             kit::cell(ui, *width, |ui| f(ui, cx, item));
                                         }
                                     }
-                                    for (ci, c) in self.columns.iter().enumerate() {
-                                        let width = c.width.unwrap_or(w);
-                                        let first_line = ci == 0 && two_lines;
-                                        match &c.kind {
-                                            Kind::Text { text, color, tooltip } => {
-                                                let draw = |ui: &mut Ui| {
-                                                    let mut t = egui::RichText::new(text(item));
-                                                    if let Some(color) = color {
-                                                        t = t.color(color(ui, item));
-                                                    }
-                                                    let r = ui.add(egui::Label::new(t).truncate());
-                                                    if let Some(tip) = tooltip {
-                                                        r.on_hover_text(tip(item));
-                                                    }
-                                                };
-                                                if first_line {
-                                                    second(ui, width, &draw)
-                                                } else if c.right {
-                                                    kit::cell_right(ui, width, draw)
-                                                } else {
-                                                    kit::cell(ui, width, draw)
-                                                }
-                                            }
-                                            Kind::Edit { lens, placeholder, secret, display, color } => {
-                                                if is_editing {
-                                                    let r = kit::input(ui, c.title, lens(&mut draft), placeholder, width, *secret)
-                                                        .on_hover_text("Enter or leave the field to save · Esc discards unsaved text");
-                                                    let focus = list.with(("focus", id));
-                                                    if ui.data(|d| d.get_temp::<bool>(focus).unwrap_or(false)) {
-                                                        r.request_focus();
-                                                        ui.data_mut(|d| d.remove::<bool>(focus));
-                                                    }
-                                                    save |= kit::committed(ui, &r);
-                                                } else {
-                                                    let draw = |ui: &mut Ui| {
-                                                        let shown = display.as_ref().map_or_else(|| lens(&mut item.clone()).clone(), |f| f(item));
-                                                        let mut t = egui::RichText::new(&shown).color(p.foreground);
-                                                        if let Some(color) = color {
-                                                            t = t.color(color(ui, item));
-                                                        }
-                                                        ui.add(egui::Label::new(t).truncate()).on_hover_text(shown);
-                                                    };
-                                                    if first_line {
-                                                        second(ui, width, &draw)
-                                                    } else {
-                                                        kit::cell(ui, width, draw)
-                                                    }
-                                                }
-                                            }
-                                            Kind::Widget(f) => {
-                                                // Applied to the stored item at once, independent of the text draft.
-                                                let mut fresh = item.clone();
-                                                if kit::cell(ui, width, |ui| f(ui, &mut fresh)) && fresh != *item {
-                                                    cx.submit(key, Save(fresh));
-                                                }
-                                            }
-                                            Kind::Custom(f) => {
-                                                if c.right {
-                                                    kit::cell_right(ui, width, |ui| f(ui, cx, item))
-                                                } else {
-                                                    kit::cell(ui, width, |ui| f(ui, cx, item))
-                                                }
-                                            }
-                                        }
-                                    }
+                                    cells(ui, cx, &mut draft, &mut save, &l, Line::Main);
                                     if self.ordered {
                                         if let Some(up) = kit::order(ui, index, rows.len(), emphasis) {
                                             cx.submit(key, Move::<T>::new(id, up));
@@ -365,6 +381,16 @@ impl<'s, T: Record> ListEditor<'s, T> {
                                         cx.submit(key, Remove::<T>::new(id));
                                     }
                                 });
+                                let l = layout(ui);
+                                if l.stacked {
+                                    // Tucked under the first line; the gap below separates rows.
+                                    ui.add_space(-4.);
+                                    kit::row_line(ui, theme::CONTROL, |ui| {
+                                        ui.add_space(leading);
+                                        cells(ui, cx, &mut draft, &mut save, &l, Line::Below);
+                                    });
+                                    ui.add_space(8.);
+                                }
                             });
                             if let Some(e) = ui.data(|d| d.get_temp::<String>(error_id)) {
                                 ui.horizontal(|ui| {
@@ -403,5 +429,27 @@ impl<'s, T: Record> ListEditor<'s, T> {
             });
         });
         ui.data_mut(|d| d.insert_temp(editing_id, editing));
+    }
+}
+
+/// Column widths of one row.
+struct Layout {
+    /// Too narrow for one line: fixed-width columns move below.
+    stacked: bool,
+    scale: f32,
+    fill: f32,
+}
+#[derive(Clone, Copy, PartialEq)]
+enum Line {
+    Main,
+    Below,
+}
+impl Layout {
+    fn on<T>(&self, c: &Column<'_, T>, line: Line) -> bool {
+        let below = self.stacked && c.width.is_some();
+        below == (line == Line::Below)
+    }
+    fn width<T>(&self, c: &Column<'_, T>) -> f32 {
+        c.width.map_or(self.fill, |w| w * self.scale)
     }
 }

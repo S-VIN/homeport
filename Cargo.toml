@@ -7,16 +7,18 @@ description = "Proxy manager: kernel + plugins, one egui UI for the desktop wind
 
 [features]
 default = ["desktop"]
-desktop = ["dep:eframe", "dep:ksni"]
+desktop = ["dep:eframe", "dep:ksni", "dep:rfd", "dep:winit", "dep:zbus", "dep:futures-util", "dep:tray-icon", "dep:objc2", "dep:objc2-app-kit"]
 
 [dependencies]
 rproxy-kernel = { path = "crates/kernel" }
 rproxy-remote = { path = "crates/remote" }
 egui = { workspace = true, features = ["default_fonts"] }
 eframe = { workspace = true, optional = true }
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal", "wayland"], optional = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 url = { workspace = true }
+uuid = { workspace = true }
 image = { workspace = true }
 plugin-servers = { path = "plugins/servers" }
 plugin-subscriptions = { path = "plugins/subscriptions" }
@@ -35,6 +37,21 @@ plugin-connections = { path = "plugins/connections" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3.7", optional = true }
+# Standard window controls when the Wayland compositor delegates decorations.
+winit = { version = "0.30.13", default-features = false, features = ["wayland-csd-adwaita"], optional = true }
+zbus = { version = "5.19", default-features = false, features = ["tokio"], optional = true }
+futures-util = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# AttachConsole for `rproxy web` started from a terminal.
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+tray-icon = { version = "0.26.1", default-features = false, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.5", optional = true }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSResponder"], optional = true }
 
 [dev-dependencies]
 tempfile = "3.27"
@@ -49,7 +66,7 @@ resolver = "2"
 
 [workspace.dependencies]
 egui = { version = "0.37.0", default-features = false, features = ["serde"] }
-eframe = { version = "0.37.0", default-features = false, features = ["glow", "wayland", "x11"] }
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "wayland", "x11", "clipboard", "accesskit"] }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.154"
 tokio = { version = "1.54", features = ["full"] }

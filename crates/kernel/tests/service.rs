@@ -57,9 +57,9 @@ async fn a_service_restarts_only_after_the_old_run_stopped() {
     let dir = tempfile::tempdir().unwrap();
     let host = Host::start(vec![&SVC], dir.path()).await.unwrap();
     let cx = host.kernel().cx_for("svc");
-    cx.call(Set(1u16)).await.unwrap();
+    cx.call(Set { state: &PORT, value: 1 }).await.unwrap();
     until("first run", |l| l.contains(&"start 1".into())).await;
-    cx.call(Set(2u16)).await.unwrap();
+    cx.call(Set { state: &PORT, value: 2 }).await.unwrap();
     until("second run", |l| l.contains(&"start 2".into())).await;
     host.shutdown().await;
     assert_eq!(*LOG.lock().unwrap(), ["start 1", "stop 1", "clean 1", "start 2", "stop 2", "clean 2"], "stops run before the next start and before shutdown returns");

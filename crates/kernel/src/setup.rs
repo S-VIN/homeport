@@ -73,7 +73,8 @@ pub(crate) struct Registry {
     pub plugins: Vec<&'static Plugin>,
     pub owners: HashMap<&'static str, Option<usize>>,
     pub persist: Vec<(&'static str, Option<usize>, Persist)>,
-    pub memory: Vec<(&'static str, Box<dyn Fn() -> Value + Send + Sync>)>,
+    /// Initial values of live states (see [`Setup::live`]).
+    pub live: Vec<(&'static str, Box<dyn Fn() -> Value + Send + Sync>)>,
     pub ops: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
     pub observers: HashMap<TypeId, Vec<Observer>>,
     pub hooks: HashMap<&'static str, Box<dyn Any + Send + Sync>>,
@@ -149,14 +150,12 @@ impl<'a> Setup<'a> {
     pub fn plugin_id(&self) -> &'static str {
         self.plugin.map_or("kernel", |p| self.reg.plugins[p].id)
     }
-    /// The app's data folder, for files a plugin must keep outside SQLite
-    /// (certificates, caches). Use a subfolder named after the plugin id.
+    /// This plugin's own folder (`<data>/plugins/<id>`, created on first use)
+    /// for files it must keep outside SQLite: certificates, caches, journals.
     pub fn data_dir(&self) -> std::path::PathBuf {
-        self.reg.data_dir.clone()
-    }
-    /// True if another plugin is enabled (for optional integrations).
-    pub fn enabled(&self, plugin: &str) -> bool {
-        self.reg.plugin_index(plugin).is_some()
+        let dir = self.reg.data_dir.join("plugins").join(self.plugin_id());
+        let _ = std::fs::create_dir_all(&dir);
+        dir
     }
 
     // ---- state ----------------------------------------------------------
@@ -176,29 +175,26 @@ impl<'a> Setup<'a> {
         self.reg.declare(s.name, self.plugin);
         self.reg.persist.push((s.name, self.plugin, state::setting::<T>(s.name)));
     }
-    /// A persisted setting the UI may change directly with [`Set`](crate::Set)`(value)`.
-    /// Use one distinct type per editable setting.
+    /// A persisted setting the UI may change directly with
+    /// [`UiCx::update`] (or the [`Set`](crate::Set) / [`Update`](crate::Update) ops).
     pub fn editable_setting<T: Serialize + DeserializeOwned + Clone + Default + Send + Sync + 'static>(&mut self, s: &'static State<T>) {
         self.setting(s);
-        self.handle(move |cx: Cx, crate::Set(value): crate::Set<T>| async move {
+        self.handle(|cx: Cx, op: crate::Set<T>| async move {
             cx.write(|w| {
-                w.set(s, value);
+                w.set(op.state, op.value);
                 Ok(())
             })
             .await
-        });
-        self.handle(move |cx: Cx, crate::Update(f): crate::Update<T>| async move {
+        })
+        .claim(move |_, op| (op.state.name == s.name).then_some(Claim::OWNED));
+        self.handle(|cx: Cx, op: crate::Update<T>| async move {
             cx.write(|w| {
-                w.update(s, f);
+                w.update(op.state, op.change);
                 Ok(())
             })
             .await
-        });
-    }
-    /// Memory-only state (errors, live readings), reset on restart.
-    pub fn memory<T: Clone + Send + Sync + 'static>(&mut self, s: &'static State<T>, init: impl Fn() -> T + Send + Sync + 'static) {
-        self.reg.declare(s.name, self.plugin);
-        self.reg.memory.push((s.name, Box::new(move || Arc::new(init()) as Value)));
+        })
+        .claim(move |_, op| (op.state.name == s.name).then_some(Claim::OWNED));
     }
     /// Live state: readings that change often and are never saved (traffic,
     /// what is being checked right now). No transaction and no core config:
@@ -206,7 +202,7 @@ impl<'a> Setup<'a> {
     /// with `cx.live(&S)` (or `snap.live`). Not available to `p.core`.
     pub fn live<T: Send + Sync + 'static>(&mut self, s: &'static State<T>, init: impl Fn() -> T + Send + Sync + 'static) {
         self.reg.declare(s.name, self.plugin);
-        self.reg.memory.push((s.name, Box::new(move || Arc::new(crate::state::Live::new(init())) as Value)));
+        self.reg.live.push((s.name, Box::new(move || Arc::new(crate::state::Live::new(init())) as Value)));
     }
     /// Custom persistence for data that does not fit one table.
     pub fn persist<T: Send + Sync + 'static>(

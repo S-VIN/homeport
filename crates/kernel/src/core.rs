@@ -182,7 +182,10 @@ impl Drop for Lease {
         // Cancelled before `release`: reset the route before the lane is reused.
         if let Some(permit) = self.permit.take() {
             let (core, lane) = (self.core.clone(), self.lane);
-            tokio::spawn(async move { core.reset_lane(lane, permit).await });
+            // No runtime left (the app is exiting): mihomo is going away too.
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move { core.reset_lane(lane, permit).await });
+            }
         }
     }
 }
@@ -213,7 +216,8 @@ impl CoreApi {
     pub async fn lease(&self, target: Target) -> Result<Lease> {
         let permit = self.core.lanes.clone().acquire_owned().await.map_err(|_| Error::msg("Mihomo is stopping."))?;
         let lane = self.core.free.lock().unwrap().pop().expect("a free lane for every permit");
-        // From here on the lease owns the lane: dropping it on error resets and returns it.
+        // From here on the lease owns the lane: dropping it (an error, or the
+        // caller giving up while routing) resets and returns the lane.
         let mut lease = Lease { core: self.core.clone(), http: reqwest::Client::new(), lane, permit: Some(permit) };
         lease.http = self
             .core

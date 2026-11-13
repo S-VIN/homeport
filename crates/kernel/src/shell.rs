@@ -10,8 +10,7 @@
 //! ```
 //! A status chip opens its plugin's panel in a popover anchored to the chip; in
 //! a wide window the panels are docked and the chips are not needed.
-//! Settings shows one General card (theme + SETTINGS_SECTIONS rows), the plugin
-//! manager grouped by category, and About.
+//! Settings contains General and About; plugin management has its own page.
 use crate::{
     kernel::{Theme, THEME},
     kit::{self, theme, Icon, Lead, Tone},
@@ -31,6 +30,7 @@ pub static PANELS: Slot<()> = Slot::new("shell.panels", "Side panel cards with d
 pub static SETTINGS_SECTIONS: Slot<()> = Slot::new("shell.settings", "Settings → General: one settings row per setting");
 
 const SETTINGS_PAGE: &str = "settings";
+const PLUGINS_PAGE: &str = "plugins";
 /// Width of the navigation sidebar in a wide window.
 const SIDEBAR: f32 = 184.;
 
@@ -94,7 +94,13 @@ pub(crate) fn frame(root: &mut egui::Ui, k: &Arc<Kernel>, s: &mut SessionState) 
     });
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE.fill(p.background).inner_margin(egui::Margin { left: theme::PADDING as i8, right: theme::PADDING as i8, top: 8, bottom: 4 }))
-        .show(root, |ui| page(ui, &mut cx));
+        .show(root, |ui| {
+            // Very wide windows: keep rows scannable instead of stretching them.
+            const MAX_WIDTH: f32 = 1040.;
+            let extra = ((ui.available_width() - MAX_WIDTH) / 2.).max(0.);
+            let rect = ui.max_rect().shrink2(vec2(extra, 0.));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| page(ui, &mut cx));
+        });
     if let Some(rect) = panels_rect {
         let mut ui = root.new_child(egui::UiBuilder::new().max_rect(rect).layout(Layout::top_down(Align::Min)));
         egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: theme::PADDING as i8, top: 10, bottom: 6 }).show(&mut ui, |ui| {
@@ -132,7 +138,14 @@ fn apply_theme(ctx: &egui::Context, k: &Kernel, s: &mut SessionState) {
 }
 
 /// "Saving…" / "Saved ✓" after a change.
-fn save_state(ui: &mut egui::Ui, cx: &UiCx, p: &kit::Palette) {
+fn save_state(ui: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette) {
+    if cx.k.restart_pending() {
+        if kit::chip(ui, Some(Lead::Icon(Icon::Plugin, p.warning)), "Restart", "Plugin changes are waiting. Open Plugins to apply them.").clicked() {
+            cx.s.page = PLUGINS_PAGE;
+            cx.s.panels_open = false;
+        }
+        return;
+    }
     let saving = cx.s.pending_since().is_some_and(|t| cx.s.now - t > 0.2);
     let saved = !saving && cx.s.saved_at.is_some_and(|t| cx.s.now - t < 2.);
     if saving || saved {
@@ -149,7 +162,7 @@ fn activity_button(ui: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette) -> egui::
     let active: Vec<_> = board.runs.iter().filter(|r| r.phase.active() && !r.quiet).collect();
     let failed = board.runs.iter().any(|r| r.phase == Phase::Failed && !r.key.starts_with("schedule:"));
     let text = if active.is_empty() { "Activity".to_owned() } else { format!("{} running", active.len()) };
-    let tip = if active.is_empty() { "Background tasks".to_owned() } else { active.iter().map(|r| r.label.as_str()).collect::<Vec<_>>().join("\n") };
+    let tip = if active.is_empty() { String::new() } else { active.iter().map(|r| r.label.as_str()).collect::<Vec<_>>().join("\n") };
     let ink = if !active.is_empty() { p.accent } else if failed { p.muted } else { p.faint };
     let r = kit::chip(ui, Some(Lead::Icon(Icon::Activity, ink)), &text, &tip);
     if r.clicked() {
@@ -216,7 +229,7 @@ fn panels(ui: &mut egui::Ui, cx: &mut UiCx, cards: bool, only: Option<usize>) {
     let mut first = true;
     let mut block = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
         if cards {
-            kit::card(ui, |ui| add(ui));
+            if !kit::optional_card(ui, |ui| add(ui)) { return; }
         } else {
             if !first {
                 ui.add_space(theme::SPACE_M);
@@ -267,15 +280,19 @@ fn panels_popover(ctx: &egui::Context, cx: &mut UiCx, p: &kit::Palette, status: 
     let chip = anchor.map(|a| a.rect).filter(|r| r.is_positive()).unwrap_or(Rect::from_min_size(pos2(screen.left() + 8., status.top()), vec2(0., status.height())));
     let left = chip.left().clamp(screen.left() + 8., (screen.right() - 8. - width).max(screen.left() + 8.));
     let only = anchor.and_then(|a| a.plugin);
+    let bounds = Rect::from_min_max(pos2(screen.left() + 8., status.bottom() + 4.), pos2(screen.right() - 8., screen.bottom() - theme::NAVIGATION - 4.));
     let area = egui::Area::new(egui::Id::unique("panels-popover"))
+        .constrain_to(bounds)
         .order(egui::Order::Foreground)
         .fixed_pos(pos2(left, status.bottom() + 4.))
         .show(ctx, |ui| {
             popover_frame(p).show(ui, |ui| {
-                ui.set_width(width - 24.);
+                ui.set_width(width - 26.);
+                // An area starts at last frame's size: let the content grow.
+                ui.set_max_height((bounds.height() - 26.).max(0.));
                 egui::ScrollArea::vertical()
                     .id_salt("panels-popover-scroll")
-                    .max_height((screen.height() - status.bottom() - theme::NAVIGATION - 40.).max(120.))
+                    .max_height((bounds.height() - 26.).max(0.))
                     .show(ui, |ui| panels(ui, cx, false, only));
             });
         });
@@ -292,7 +309,9 @@ struct Tab {
 }
 
 fn tabs(cx: &UiCx) -> Vec<Tab> {
-    cx.k.reg.pages.iter().map(|e| Tab { id: e.spec.id, title: e.spec.title, icon: e.spec.icon }).collect()
+    cx.k.reg.pages.iter().map(|e| Tab { id: e.spec.id, title: e.spec.title, icon: e.spec.icon })
+        .chain(std::iter::once(Tab { id: PLUGINS_PAGE, title: "Plugins", icon: Icon::Plugin }))
+        .collect()
 }
 
 /// Narrow window: the bottom bar. Returns the rect of the Activity anchor (none here).
@@ -307,13 +326,8 @@ fn navigation(root: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette, rect: Rect) 
     let fits = ((full + gap) / (min + gap)).floor().max(2.) as usize;
     let mut overflow = Vec::new();
     if tabs.len() + 1 > fits {
-        let keep = fits.saturating_sub(2);
-        // Keep the current page visible.
-        if let Some(i) = tabs.iter().position(|t| t.id == cx.s.page).filter(|i| *i >= keep) {
-            let t = tabs.remove(i);
-            tabs.insert(keep.saturating_sub(1), t);
-        }
-        overflow = tabs.split_off(keep);
+        // Fixed slots: a page opened from More shows on the More tab instead.
+        overflow = tabs.split_off(fits.saturating_sub(2));
     }
     let count = tabs.len() + 1 + usize::from(!overflow.is_empty());
     let width = ((full - gap * (count as f32 - 1.)) / count as f32).min(120.);
@@ -328,8 +342,9 @@ fn navigation(root: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette, rect: Rect) 
         }
     }
     if !overflow.is_empty() {
-        let more = Tab { id: "more", title: "More", icon: Icon::More };
-        let active = overflow.iter().any(|t| t.id == cx.s.page);
+        let current = overflow.iter().find(|t| t.id == cx.s.page);
+        let active = current.is_some();
+        let more = Tab { id: "more", title: current.map_or("More", |t| t.title), icon: current.map_or(Icon::More, |t| t.icon) };
         let r = tab(ui, p, &more, active, width, icons_only);
         let popup = ui.make_persistent_id("more-pages");
         egui::Popup::from_toggle_button_response(&r)
@@ -349,7 +364,8 @@ fn navigation(root: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette, rect: Rect) 
 }
 
 fn tab(ui: &mut egui::Ui, p: &kit::Palette, t: &Tab, active: bool, width: f32, icons_only: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 40.), egui::Sense::click());
+    let (_, rect) = ui.allocate_space(vec2(width, 40.));
+    let response = ui.interact(rect, ui.scope_id().with(("navigation", t.id)), egui::Sense::click());
     response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, active, t.title));
     let hovered = response.hovered();
     if active || hovered {
@@ -375,7 +391,8 @@ fn tab(ui: &mut egui::Ui, p: &kit::Palette, t: &Tab, active: bool, width: f32, i
 
 /// A page in the sidebar (wide window) or the More menu: icon and title in a row.
 fn side_tab(ui: &mut egui::Ui, p: &kit::Palette, t: &Tab, active: bool, width: f32) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 32.), egui::Sense::click());
+    let (_, rect) = ui.allocate_space(vec2(width, 32.));
+    let response = ui.interact(rect, ui.scope_id().with(("navigation", t.id)), egui::Sense::click());
     response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, active, t.title));
     let hovered = response.hovered();
     if active || hovered {
@@ -409,9 +426,9 @@ fn sidebar(root: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette, rect: Rect) -> 
         }
     }
     // Bottom block: save state, Activity, Settings.
-    let bottom = 32. + 2. + 26. + 2. + 20.;
+    let bottom = 32. + 2. + 26. + 2. + 24.;
     ui.add_space((ui.available_height() - bottom).max(theme::SPACE_L));
-    ui.allocate_ui_with_layout(vec2(width, 20.), Layout::left_to_right(Align::Center), |ui| {
+    ui.allocate_ui_with_layout(vec2(width, 24.), Layout::left_to_right(Align::Center), |ui| {
         ui.add_space(10.);
         save_state(ui, cx, p);
     });
@@ -427,12 +444,19 @@ fn sidebar(root: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette, rect: Rect) -> 
 }
 
 fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
-    if cx.s.page == SETTINGS_PAGE {
-        kit::page_header(ui, "Settings", "", |_| {});
+    if cx.s.page == PLUGINS_PAGE {
+        let enabled = cx.k.reg.plugins.iter().filter(|p| !p.required).count();
+        kit::page_header(ui, "Plugins", &format!("{enabled} active"), |_| {});
+
         // Pinned under the header: it never scrolls away or pushes the content.
         if cx.k.restart_pending() && kit::banner(ui, Tone::Warning, "Restart to apply plugin changes. Traffic pauses for a moment.", Some("Restart now")) {
             cx.k.request_restart();
         }
+        kit::page_scroll(ui, "plugins", |ui| plugin_manager(ui, cx));
+        return;
+    }
+    if cx.s.page == SETTINGS_PAGE {
+        configuration(ui, cx);
         kit::page_scroll(ui, "settings", |ui| settings(ui, cx));
         return;
     }
@@ -451,7 +475,7 @@ fn settings(ui: &mut egui::Ui, cx: &mut UiCx) {
     let mut theme_choice = *cx.get(&THEME);
     let list: Vec<_> = cx.k.reg.contributions(&SETTINGS_SECTIONS).to_vec();
     kit::settings_card(ui, |ui| {
-        kit::settings_row(ui, "Theme", "System follows your desktop's light or dark mode", |ui| {
+        kit::settings_row(ui, "Theme", "", |ui| {
             if kit::segmented(ui, &mut theme_choice, &[(Theme::System, "System"), (Theme::Light, "Light"), (Theme::Dark, "Dark")]) {
                 let k = cx.k.clone();
                 tokio::spawn(async move {
@@ -467,9 +491,12 @@ fn settings(ui: &mut egui::Ui, cx: &mut UiCx) {
         for c in list {
             ui.push_id(&c.id, |ui| cx.scoped(Some(c.plugin), |cx| (c.view)(ui, cx, &())));
         }
+        if cx.s.can_exit {
+            kit::settings_row(ui, "Application", "Closing the window keeps rproxy running in the background", |ui| {
+                if kit::Button::secondary("Quit rproxy").show(ui).clicked() { cx.s.exit_requested = true; }
+            });
+        }
     });
-    plugin_manager(ui, cx);
-    backups(ui, cx);
     kit::section(ui, "About", None);
     let status = cx.core_status();
     let p = theme::palette(ui);
@@ -495,61 +522,39 @@ fn settings(ui: &mut egui::Ui, cx: &mut UiCx) {
     });
 }
 
-/// Backups of every setting and list: make one, restore or delete.
-fn backups(ui: &mut egui::Ui, cx: &mut UiCx) {
-    let k = cx.k.clone();
-    let list = k.backups();
-    kit::section(ui, "Backups", Some("Every setting and list. A copy is made daily (the last 7 are kept) and before each restore."));
-    let armed_id = egui::Id::unique("backup-armed");
-    let mut armed: Option<std::path::PathBuf> = ui.data(|d| d.get_temp(armed_id)).flatten();
-    kit::settings_card(ui, |ui| {
-        kit::settings_row(
-            ui,
-            "Back up now",
-            &format!("Saved in {}", crate::backup::folder(&k.data_dir).display()),
-            |ui| {
-                if kit::Button::secondary("Back up")
-                    .icon(Icon::Add)
-                    .show(ui)
-                    .clicked()
-                {
-                    if let Err(e) = k.start_backup() {
-                        cx.notify_error(&e.message);
-                    }
+/// Explicit portable configuration import and export; no hidden backup schedule.
+fn configuration(ui: &mut egui::Ui, cx: &mut UiCx) {
+    use crate::configuration::FileAction;
+    kit::page_header(ui, "Settings", "", |ui| {
+        if kit::Button::secondary("Import…").icon(Icon::Up).enabled(!cx.s.file_busy).show(ui).clicked() {
+            cx.s.file_action = Some(FileAction::Import);
+            cx.s.file_busy = true;
+        }
+        if kit::Button::secondary("Export…").icon(Icon::Down).enabled(!cx.s.file_busy).show(ui).on_hover_text("Includes subscription links and credentials.").clicked() {
+            cx.s.file_action = Some(FileAction::Export);
+            cx.s.file_busy = true;
+        }
+    });
+
+    if cx.s.checking.is_some() {
+        kit::hint(ui, "Checking the configuration…");
+    } else if cx.s.file_busy {
+        kit::hint(ui, "File dialog open");
+    }
+        if let Some(config) = cx.s.incoming.clone() {
+            kit::separator(ui);
+            kit::tone_text(ui, "Replace current settings? Traffic will pause while the configuration is applied.", Tone::Warning);
+            kit::truncated(ui, format!("{} · {}", config.name, kit::bytes(config.size as u64)), None);
+            ui.horizontal_wrapped(|ui| {
+                if kit::Button::ghost("Cancel").show(ui).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cx.s.incoming = None;
                 }
-            },
-        );
-        for b in list.iter().take(10) {
-            let label = format!(
-                "{}{}",
-                crate::backup::stamp(b.created),
-                if b.auto { " · automatic" } else { "" }
-            );
-            kit::settings_row(ui, &label, &format!("{} · UTC", kit::bytes(b.size)), |ui| {
-                if armed.as_ref() == Some(&b.path) {
-                    if kit::Button::ghost("Cancel").show(ui).clicked() {
-                        armed = None;
-                    }
-                    if kit::Button::secondary("Restore and restart").tone(Tone::Danger).show(ui).on_hover_text("Replace every setting with this copy; the current ones are backed up first").clicked() {
-                        armed = None;
-                        if let Err(e) = k.restore_backup(&b.path) {
-                            cx.notify_error(&e.message);
-                        }
-                    }
-                } else {
-                    if kit::icon_button(ui, Icon::Delete, "Delete this backup", true).clicked() {
-                        if let Err(e) = k.delete_backup(&b.path) {
-                            cx.notify_error(&e.message);
-                        }
-                    }
-                    if kit::Button::ghost("Restore").show(ui).clicked() {
-                        armed = Some(b.path.clone());
-                    }
+                if kit::Button::danger("Replace settings").show(ui).clicked() {
+                    cx.s.incoming = None;
+                    (cx.k.restore)(config);
                 }
             });
         }
-    });
-    ui.data_mut(|d| d.insert_temp(armed_id, armed));
 }
 
 /// The core version with update actions: check, update, or go back to the bundled core.
@@ -576,9 +581,10 @@ fn core_row(ui: &mut egui::Ui, cx: &mut UiCx, status: &crate::core::CoreStatus) 
         .as_ref()
         .filter(|r| crate::updates::newer(&r.version, &current))
         .cloned();
-    kit::property_with(ui, "Core", |ui| {
-        ui.label(RichText::new(label).color(theme::palette(ui).foreground));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+    kit::property(ui, "Core", &label);
+    // Actions on their own line: they never squeeze the version.
+    kit::property_with(ui, "", |ui| {
+        ui.horizontal(|ui| {
             let result = if let Some(run) = &running {
                 let text = match run.total {
                     Some(total) if total > 0 => format!("{}%", run.done * 100 / total),
@@ -590,9 +596,6 @@ fn core_row(ui: &mut egui::Ui, cx: &mut UiCx, status: &crate::core::CoreStatus) 
             } else if let Some(r) = &available {
                 if kit::Button::secondary(&format!("Update to {}", r.version))
                     .show(ui)
-                    .on_hover_text(
-                        "Download from the mihomo releases on GitHub, verify and restart the core",
-                    )
                     .clicked()
                 {
                     k.install_core_update()
@@ -601,7 +604,7 @@ fn core_row(ui: &mut egui::Ui, cx: &mut UiCx, status: &crate::core::CoreStatus) 
                 }
             } else {
                 let mut result = Ok(());
-                if kit::Button::ghost("Check for update").show(ui).clicked() {
+                if kit::Button::secondary("Check for update").show(ui).clicked() {
                     result = k.check_core_update();
                 }
                 if installed
@@ -637,7 +640,7 @@ fn plugin_link(cx: &UiCx, plugin: usize) -> Option<(&'static str, String)> {
             return Some((page.spec.id, format!("Open {}", page.spec.title)));
         }
     }
-    reg.fills.iter().any(|(slot, p)| *p == plugin && *slot == SETTINGS_SECTIONS.id).then(|| (SETTINGS_PAGE, "Set in General above".to_owned()))
+    reg.fills.iter().any(|(slot, p)| *p == plugin && *slot == SETTINGS_SECTIONS.id).then(|| (SETTINGS_PAGE, "Open Settings".to_owned()))
 }
 
 fn plugin_manager(ui: &mut egui::Ui, cx: &mut UiCx) {
@@ -659,9 +662,9 @@ fn plugin_manager(ui: &mut egui::Ui, cx: &mut UiCx) {
         let exclusive = cat.policy == Policy::Exclusive;
         kit::section_note(
             ui,
-            &format!("Plugins · {}", cat.name),
+            cat.name,
             if exclusive { "One at a time" } else { "" },
-            Some("Turning a plugin on or off applies after a restart. Traffic pauses for a moment."),
+            None,
         );
         kit::settings_card(ui, |ui| {
             for pl in members {
@@ -678,16 +681,16 @@ fn plugin_manager(ui: &mut egui::Ui, cx: &mut UiCx) {
                     ui,
                     pl.id,
                     |ui| {
-                        ui.label(RichText::new(pl.name).color(p.foreground));
-                        ui.add(egui::Label::new(RichText::new(pl.description).size(theme::SMALL).color(p.muted)).wrap());
+                        let label = ui.label(RichText::new(pl.name).color(p.foreground));
+                        if !matches!(pl.id, "subscriptions" | "connections" | "autostart") {
+                            label.on_hover_text(pl.description);
+                        }
                         if let Some(only) = &unsupported {
                             ui.label(RichText::new(format!("Not available on this system · {only}")).size(theme::SMALL).color(p.muted));
                         } else if let Some(why) = &reason {
                             kit::tone_text(ui, format!("Inactive · {why}"), Tone::Warning);
                         } else if let Some((page, text)) = &link {
-                            if *page == SETTINGS_PAGE {
-                                ui.label(RichText::new(text).size(theme::SMALL).color(p.muted));
-                            } else if ui.link(text).clicked() {
+                            if ui.link(text).clicked() {
                                 navigate = Some(*page);
                             }
                         }
@@ -699,7 +702,7 @@ fn plugin_manager(ui: &mut egui::Ui, cx: &mut UiCx) {
                         if unsupported.is_some() {
                             return;
                         }
-                        changed = kit::toggle(ui, &mut on, "").on_hover_text(if on { format!("Turn off the {} plugin", pl.name) } else { format!("Turn on the {} plugin", pl.name) }).changed();
+                        changed = kit::toggle_named(ui, &mut on, "", pl.name).changed();
                     },
                 );
                 if changed {
@@ -738,7 +741,7 @@ fn toasts(root: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette, reserved: Option
         Rect::from_min_max(pos2(screen.left(), navigation.top() - 70.), pos2(screen.right(), navigation.top()))
     };
     let rect = reserved.unwrap_or(fallback);
-    let ids: Vec<u64> = cx.s.toasts.iter().rev().take(2).map(|t| t.notice.id).collect::<Vec<_>>().into_iter().rev().collect();
+    let ids: Vec<u64> = cx.s.toasts.iter().rev().take(if screen.height() < 480. { 1 } else { 2 }).map(|t| t.notice.id).collect::<Vec<_>>().into_iter().rev().collect();
     let mut dismiss = None;
     let mut open = None;
     let mut act = None;
@@ -768,33 +771,28 @@ fn toasts(root: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette, reserved: Option
                     .inner_margin(egui::Margin { left: 10, right: 4, top: 6, bottom: 6 })
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
-                        ui.horizontal(|ui| {
+                        let link = n.page.and_then(|id| titles.iter().find(|(pid, _)| *pid == id).copied());
+                        kit::row_line(ui, theme::CONTROL, |ui| {
                             kit::icon(ui, icon, 16., tone);
-                            let link = n.page.and_then(|id| titles.iter().find(|(pid, _)| *pid == id).copied());
-                            let right = theme::CONTROL + if link.is_some() { 120. } else if undo.is_some() { 64. } else { 0. };
-                            ui.allocate_ui_with_layout(vec2(ui.available_width() - right, 0.), Layout::top_down(Align::Min), |ui| {
-                                ui.spacing_mut().item_spacing.y = 1.;
-                                kit::truncated(ui, kit::bold(&n.title, theme::BODY).color(p.foreground), None);
-                                if !n.text.is_empty() {
-                                    ui.add(egui::Label::new(RichText::new(&n.text).size(theme::SMALL).color(p.muted)).wrap());
-                                }
-                            });
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if kit::icon_button(ui, Icon::Close, "Dismiss", true).clicked() {
-                                    dismiss = Some(n.id);
-                                }
-                                if let Some(label) = &undo {
-                                    if kit::Button::ghost(label).tone(Tone::Accent).show(ui).clicked() {
-                                        act = Some(n.id);
-                                    }
-                                } else if let Some((id, title)) = link {
-                                    if kit::Button::ghost(&format!("Open {title}")).tone(Tone::Accent).show(ui).clicked() {
-                                        open = Some(id);
-                                        dismiss = Some(n.id);
-                                    }
-                                }
-                            });
+                            let width = (ui.available_width() - theme::CONTROL - theme::HORIZONTAL_GAP).max(0.);
+                            kit::cell(ui, width, |ui| { kit::truncated(ui, kit::bold(&n.title, theme::BODY).color(p.foreground), None); });
+                            if kit::icon_button(ui, Icon::Close, "Dismiss", true).clicked() { dismiss = Some(n.id); }
                         });
+                        if !n.text.is_empty() {
+                            let mut text = (*egui::WidgetText::from(RichText::new(&n.text).size(theme::SMALL).color(p.muted))
+                                .into_layout_job(ui.style(), egui::FontSelection::Default, Align::Min)).clone();
+                            text.wrap.max_rows = 3;
+                            let (response, elided) = kit::emoji::text_label_with_elision(ui, text, true, false);
+                            if elided { response.on_hover_ui(|ui| { kit::emoji::text_label(ui, &n.text, true, false); }); }
+                        }
+                        if let Some(label) = &undo {
+                            if kit::Button::ghost(label).tone(Tone::Accent).show(ui).clicked() { act = Some(n.id); }
+                        } else if let Some((id, title)) = link {
+                            if kit::Button::ghost(&format!("Open {title}")).tone(Tone::Accent).show(ui).clicked() {
+                                open = Some(id);
+                                dismiss = Some(n.id);
+                            }
+                        }
                     });
                 hold |= r.response.contains_pointer();
             }
@@ -844,45 +842,54 @@ fn activity(ctx: &egui::Context, cx: &mut UiCx, p: &kit::Palette, anchor: Rect, 
         let left = (anchor.right() - width).clamp(screen.left() + 8., (screen.right() - width - 8.).max(screen.left() + 8.));
         area.fixed_pos(pos2(left, anchor.bottom() + 8.))
     };
-    let area = area.show(ctx, |ui| {
+    let bounds = if wide {
+        Rect::from_min_max(pos2(anchor.right() + 8., screen.top() + 8.), pos2(screen.right() - 8., anchor.bottom().min(screen.bottom() - 8.)))
+    } else {
+        Rect::from_min_max(pos2(screen.left() + 8., anchor.bottom() + 8.), pos2(screen.right() - 8., screen.bottom() - theme::NAVIGATION - 4.))
+    };
+    let area = area.constrain_to(bounds).show(ctx, |ui| {
         popover_frame(p).show(ui, |ui| {
-            ui.set_width(width - 24.);
+            ui.set_width(width - 26.);
+            // An area starts at last frame's size: let the content grow.
+            ui.set_max_height((bounds.height() - 26.).max(0.));
             panel_title(ui, "Activity", |_| {});
-            let runs: Vec<_> = board.runs.iter().filter(|r| !r.key.starts_with("schedule:") && (!r.quiet || r.phase == Phase::Failed)).collect();
-            let mut entries: Vec<Entry> = Vec::new();
-            for r in runs {
-                let same = |e: &Entry| {
-                    let a = e.run;
-                    !a.phase.active() && !r.phase.active() && a.label == r.label && a.phase == r.phase && a.summary == r.summary && a.error.as_ref().map(|e| &e.message) == r.error.as_ref().map(|e| &e.message)
-                };
-                match entries.last_mut() {
-                    Some(e) if same(e) => e.count += 1,
-                    _ => entries.push(Entry { run: r, count: 1 }),
+            egui::ScrollArea::vertical().id_salt("activity-scroll").max_height((bounds.height() - 54.).max(0.)).show(ui, |ui| {
+                let runs: Vec<_> = board.runs.iter().filter(|r| !r.key.starts_with("schedule:") && (!r.quiet || r.phase == Phase::Failed)).collect();
+                let mut entries: Vec<Entry> = Vec::new();
+                for r in runs {
+                    let same = |e: &Entry| {
+                        let a = e.run;
+                        !a.phase.active() && !r.phase.active() && a.label == r.label && a.phase == r.phase && a.summary == r.summary && a.error.as_ref().map(|e| &e.message) == r.error.as_ref().map(|e| &e.message)
+                    };
+                    match entries.last_mut() {
+                        Some(e) if same(e) => e.count += 1,
+                        _ => entries.push(Entry { run: r, count: 1 }),
+                    }
                 }
-            }
-            if entries.is_empty() {
-                kit::hint(ui, "No background tasks yet.");
-            }
-            for e in entries.iter().take(8) {
-                activity_entry(ui, cx, p, e);
-            }
-            let schedules: Vec<_> = board.schedules.iter().filter(|s| !s.name.starts_with('@') && !s.quiet).collect();
-            if !schedules.is_empty() {
-                ui.add_space(6.);
-                kit::separator(ui);
-                ui.add_space(4.);
-                kit::caption(ui, "Scheduled");
-                for s in schedules {
-                    let secs = s.next_unix_ms / 1000;
-                    let left = secs.saturating_sub(crate::now());
-                    kit::row_line(ui, 22., |ui| {
-                        ui.label(RichText::new(schedule_name(&s.label, &s.name)).size(theme::SMALL));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(RichText::new(format!("in {}", human(left))).size(theme::SMALL).color(p.muted));
+                if entries.is_empty() {
+                    kit::hint(ui, "No background tasks yet.");
+                }
+                for e in entries.iter().take(8) {
+                    activity_entry(ui, cx, p, e);
+                }
+                let schedules: Vec<_> = board.schedules.iter().filter(|s| !s.name.starts_with('@') && !s.quiet).collect();
+                if !schedules.is_empty() {
+                    ui.add_space(6.);
+                    kit::separator(ui);
+                    ui.add_space(4.);
+                    kit::caption(ui, "Scheduled");
+                    for s in schedules {
+                        let secs = s.next_unix_ms / 1000;
+                        let left = secs.saturating_sub(crate::now());
+                        kit::row_line(ui, 22., |ui| {
+                            ui.label(RichText::new(schedule_name(&s.label, &s.name)).size(theme::SMALL));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(RichText::new(format!("in {}", human(left))).size(theme::SMALL).color(p.muted));
+                            });
                         });
-                    });
+                    }
                 }
-            }
+            });
         });
     });
     let chip = if wide { anchor } else { cx.s.activity_chip.unwrap_or(anchor) };

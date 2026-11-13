@@ -31,8 +31,11 @@ python3 scripts/mihomo.py --os linux --arch arm64 --output /tmp/rproxy-core
 
 Обычная сборка использует файлы из этой папки. При запуске через Cargo платформа
 выбирается по ОС и архитектуре скомпилированной программы. В готовом пакете остаётся
-только соответствующий бинарник по пути `assets/mihomo/mihomo` (или `mihomo.exe`)
-рядом с приложением. Docker выбирает Linux-бинарник по `TARGETARCH`.
+только соответствующий бинарник `mihomo` (или `mihomo.exe`), лежащий непосредственно
+рядом с `rproxy` на всех ОС и в Docker. Лицензия находится в `licenses/mihomo/LICENSE`
+в каталоге ресурсов пакета: рядом с программой в Windows/pacman/Docker,
+в `usr/share` для AppImage, в `/app/share` для Flatpak и в `Contents/Resources` для macOS.
+Docker выбирает Linux-бинарник по `TARGETARCH`.
 
 ## Обновление комплекта
 

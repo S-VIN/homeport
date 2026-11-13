@@ -173,8 +173,9 @@ impl Controller {
 
 pub struct Mihomo {
     child: Child,
+    supervised: bool,
     #[cfg(windows)]
-    _job: crate::windows_job::Job,
+    _job: Option<crate::windows_job::Job>,
     _dir: TempDir,
     endpoint: Value,
     ctl: Controller,
@@ -198,12 +199,83 @@ pub const BINARY: &str = if cfg!(windows) {
 pub fn installed(home: &Path) -> PathBuf {
     home.join("bin").join(BINARY)
 }
+/// The version of the installed update, written next to it (`<home>/bin/mihomo.version`).
+pub fn installed_version_file(home: &Path) -> PathBuf {
+    installed(home).with_extension("version")
+}
+/// The version of the bundled core, e.g. `1.19.32` (from `assets/mihomo/manifest.json`).
+pub fn bundled_version() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        let manifest: Value = serde_json::from_str(include_str!("../../../assets/mihomo/manifest.json")).unwrap_or_default();
+        manifest["version"].as_str().unwrap_or_default().to_owned()
+    })
+}
+/// The installed update, used only while it is newer than the bundled core
+/// (an app update can bring a newer core than an old download).
+pub fn installed_update(home: &Path) -> Option<PathBuf> {
+    let version = fs::read_to_string(installed_version_file(home)).ok()?;
+    let path = installed(home);
+    (path.is_file() && newer(version.trim(), bundled_version())).then_some(path)
+}
+/// `1.19.34` from `v1.19.34`, `Mihomo Meta v1.19.34 linux …` and similar.
+pub fn version_of(text: &str) -> Option<Vec<u32>> {
+    let start = text.find(|c: char| c.is_ascii_digit())?;
+    let v: Vec<u32> = text[start..]
+        .split(|c: char| !c.is_ascii_digit() && c != '.')
+        .next()?
+        .split('.')
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    (v.len() >= 2).then_some(v)
+}
+pub fn newer(candidate: &str, current: &str) -> bool {
+    matches!((version_of(candidate), version_of(current)), (Some(a), Some(b)) if a > b)
+}
 
-/// The core to run: an installed update if present, otherwise the bundled one.
+/// macOS: a root-owned setuid copy of the core that may create a utun
+/// interface (`<home>/bin/mihomo-tun`). See [`grant_tun_script`].
+pub fn privileged(home: &Path) -> PathBuf {
+    home.join("bin").join("mihomo-tun")
+}
+/// The setuid copy is used only while it is a copy of the current core:
+/// `cp -p` keeps size and modification time, so a core update shows the
+/// Grant access button again.
+#[cfg(target_os = "macos")]
+fn privileged_copy_of(copy: &Path, core: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(c), Ok(o)) = (fs::metadata(copy), fs::metadata(core)) else { return false };
+    c.uid() == 0 && c.mode() & 0o4000 != 0 && c.len() == o.len() && c.mtime() == o.mtime()
+}
+/// The shell commands that make [`privileged`] a setuid-root copy of `core`;
+/// macOS runs them with `osascript … with administrator privileges`.
+pub fn grant_tun_script(core: &Path, target: &Path) -> String {
+    let q = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
+    let tmp = target.with_extension("tmp");
+    let commands = format!(
+        "mkdir -p {dir} && rm -f {tmp} && cp -p {core} {tmp} && chown root:wheel {tmp} && chmod 4755 {tmp} && mv -f {tmp} {target}",
+        dir = q(target.parent().unwrap_or(Path::new("."))),
+        core = q(core),
+        tmp = q(&tmp),
+        target = q(target),
+    );
+    // AppleScript string literal: escape backslashes and quotes.
+    format!("do shell script \"{}\" with administrator privileges", commands.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// The core without the macOS setuid copy: an installed update newer than the
+/// bundled core, otherwise the bundled one.
+pub fn unprivileged(home: &Path) -> PathBuf {
+    installed_update(home).unwrap_or_else(bundled)
+}
+/// The core to run: [`unprivileged`], or on macOS its setuid copy once the user granted it.
 pub fn executable(home: &Path) -> PathBuf {
-    Some(installed(home))
-        .filter(|p| p.is_file())
-        .unwrap_or_else(bundled)
+    let core = unprivileged(home);
+    #[cfg(target_os = "macos")]
+    if privileged_copy_of(&privileged(home), &core) {
+        return privileged(home);
+    }
+    core
 }
 
 /// The core shipped with this build.
@@ -225,7 +297,7 @@ pub fn bundled() -> PathBuf {
         .join("../../assets/mihomo").join(platform).join(arch).join(binary);
     std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("assets/mihomo").join(binary)))
+        .and_then(|p| p.parent().map(|d| d.join(binary)))
         .filter(|p| p.is_file())
         .unwrap_or(bundled)
 }
@@ -242,7 +314,31 @@ pub fn local_address(listen: IpAddr, port: u16) -> SocketAddr {
 impl Mihomo {
     /// Start the core. `home` keeps files between runs (rule sets, an updated core);
     /// the control socket and generated config live in a private temporary folder.
+    /// A core that cannot start is skipped: the macOS setuid copy, then an
+    /// installed update, then the bundled core. A broken update is removed so
+    /// Settings and the next start agree on which core runs.
     pub async fn start(reserved_ports: &[u16], home: &Path) -> Result<Self> {
+        let mut cores = vec![executable(home), unprivileged(home), bundled()];
+        cores.dedup();
+        let mut error = String::new();
+        for core in cores {
+            match Self::launch(reserved_ports, home, &core).await {
+                Ok(m) => return Ok(m),
+                Err(e) => error = e,
+            }
+            // Only a core that could not run at all is removed, not a slow start.
+            let broken = error.starts_with("Cannot start mihomo") || error == "Mihomo exited during startup.";
+            if broken && core == installed(home) {
+                let _ = fs::remove_file(installed_version_file(home));
+                let _ = fs::remove_file(&core);
+            }
+            if core != bundled() {
+                eprintln!("rproxy: {} failed ({error}); trying the next core.", core.display());
+            }
+        }
+        Err(error)
+    }
+    async fn launch(reserved_ports: &[u16], home: &Path, core: &Path) -> Result<Self> {
         fs::create_dir_all(home).map_err(|e| format!("Cannot create {}: {e}", home.display()))?;
         let mut builder = tempfile::Builder::new();
         builder.prefix("rproxy-");
@@ -288,13 +384,18 @@ impl Mihomo {
             "dns": {"enable": false}, "log-level": "silent"});
         initial.as_object_mut().unwrap().extend(endpoint.as_object().unwrap().clone());
         fs::write(&path, initial.to_string()).map_err(|e| e.to_string())?;
-        let mut cmd = Command::new(executable(home));
+        let supervised = crate::supervisor::executable().is_some();
+        let mut cmd = if let Some(guard) = crate::supervisor::executable() {
+            let mut cmd = Command::new(guard);
+            cmd.arg(crate::supervisor::ARG).arg(core);
+            cmd
+        } else { Command::new(core) };
         cmd.arg("-d")
             .arg(home)
             .arg("-f")
             .arg(path)
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
+            .stdin(if supervised { Stdio::piped() } else { Stdio::null() })
+            .kill_on_drop(!supervised);
         // RPROXY_MIHOMO_LOG=debug|info|warning shows the core's log on stderr.
         if config::log_level() == "silent" {
             cmd.stdout(Stdio::null()).stderr(Stdio::null());
@@ -305,7 +406,7 @@ impl Mihomo {
         #[cfg(target_os = "linux")]
         let parent = std::process::id();
         #[cfg(target_os = "linux")]
-        unsafe {
+        if !supervised { unsafe {
             cmd.pre_exec(move || {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                     return Err(std::io::Error::last_os_error());
@@ -315,14 +416,17 @@ impl Mihomo {
                 }
                 Ok(())
             });
-        }
+        } }
         #[cfg(windows)]
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        let child = cmd.spawn().map_err(|e| format!("Cannot start bundled mihomo: {e}"))?;
+        let child = cmd.spawn().map_err(|e| format!("Cannot start mihomo: {e}"))?;
         #[cfg(windows)]
-        let job = crate::windows_job::Job::attach(child.id().ok_or("Mihomo exited before job assignment")?).map_err(|e| e.to_string())?;
+        let job = if supervised { None } else {
+            Some(crate::windows_job::Job::attach(child.id().ok_or("Mihomo exited before job assignment")?).map_err(|e| e.to_string())?)
+        };
         let mut core = Self {
             child,
+            supervised,
             #[cfg(windows)]
             _job: job,
             _dir: dir,
@@ -351,7 +455,10 @@ impl Mihomo {
         matches!(self.child.try_wait(), Ok(None))
     }
     pub async fn stop(&mut self) {
-        let _ = self.child.kill().await;
+        if self.supervised {
+            // Never kill the guard first: closing the pipe asks it to kill+reap.
+            drop(self.child.stdin.take());
+        } else { let _ = self.child.start_kill(); }
         let _ = self.child.wait().await;
     }
     pub fn check_ports(&self) -> &[u16] {
@@ -551,4 +658,42 @@ fn rand() -> u64 {
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
     h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
     h.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn an_installed_core_is_used_only_while_newer_than_the_bundled_one() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        assert!(version_of(bundled_version()).is_some(), "manifest version {:?}", bundled_version());
+        assert_eq!(executable(home), bundled());
+        fs::create_dir_all(home.join("bin")).unwrap();
+        fs::write(installed(home), b"core").unwrap();
+        // An update from before version files, or an older one, is ignored.
+        assert_eq!(installed_update(home), None);
+        fs::write(installed_version_file(home), "1.0.0").unwrap();
+        assert_eq!(executable(home), bundled());
+        fs::write(installed_version_file(home), "999.0.0\n").unwrap();
+        assert_eq!(installed_update(home), Some(installed(home)));
+        assert_eq!(executable(home), installed(home));
+        assert_eq!(unprivileged(home), installed(home));
+    }
+    #[test]
+    fn versions_compare_numerically() {
+        assert_eq!(version_of("Mihomo Meta v1.19.32 linux amd64"), Some(vec![1, 19, 32]));
+        assert!(newer("1.19.34", "v1.19.32"));
+        assert!(newer("1.20.0", "1.19.99"));
+        assert!(!newer("1.19.32", "Mihomo Meta v1.19.32"));
+        assert!(!newer("garbage", "1.19.32"));
+    }
+    #[test]
+    fn the_grant_script_quotes_paths_for_the_shell_and_applescript() {
+        let script = grant_tun_script(Path::new("/Applications/r proxy.app/Contents/MacOS/mihomo"), Path::new("/Users/o'neil/core/bin/mihomo-tun"));
+        assert!(script.starts_with("do shell script \"mkdir -p '/Users/o'\\\\''neil/core/bin'"), "{script}");
+        assert!(script.contains("cp -p '/Applications/r proxy.app/Contents/MacOS/mihomo' "));
+        assert!(script.contains("chown root:wheel") && script.contains("chmod 4755"));
+        assert!(script.ends_with("'/Users/o'\\\\''neil/core/bin/mihomo-tun'\" with administrator privileges"), "{script}");
+    }
 }

@@ -10,6 +10,37 @@ use wasm_bindgen::{prelude::*, JsCast};
 use web_sys::{BinaryType, MessageEvent, WebSocket};
 
 #[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(catch, js_namespace = window)]
+    fn save_configuration(bytes: &js_sys::Uint8Array, name: &str) -> Result<(), JsValue>;
+    #[wasm_bindgen(js_namespace = window)]
+    fn open_configuration(limit: u32) -> js_sys::Promise;
+}
+
+fn file_dialog(ws: &WebSocket, dialog: crate::FileDialog) {
+    let ws = ws.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        use crate::{FileDialog, FileReply};
+        let reply = match dialog {
+            FileDialog::Save { name, bytes } => match save_configuration(&js_sys::Uint8Array::from(bytes.as_slice()), &name) {
+                Ok(()) => FileReply::Finished,
+                Err(_) => FileReply::Failed("The browser could not download the configuration. Try exporting again.".into()),
+            },
+            FileDialog::Open => match wasm_bindgen_futures::JsFuture::from(open_configuration(crate::MAX_FILE_BYTES as u32)).await {
+                Ok(value) if value.is_null() => FileReply::Finished,
+                Ok(value) => {
+                    let name = js_sys::Reflect::get(&value, &"name".into()).ok().and_then(|v| v.as_string()).unwrap_or_default();
+                    let bytes = js_sys::Reflect::get(&value, &"bytes".into()).ok().map(|v| js_sys::Uint8Array::new(&v).to_vec()).unwrap_or_default();
+                    FileReply::Opened { name, bytes }
+                }
+                Err(_) => FileReply::Failed("Could not open the configuration. Choose an exported .sqlite3 file under 32 MiB.".into()),
+            },
+        };
+        let _ = ws.send_with_u8_array(&pack(&ToHost::File(reply)));
+    });
+}
+
+#[wasm_bindgen]
 pub async fn start(canvas: web_sys::HtmlCanvasElement) -> Result<(), JsValue> {
     std::panic::set_hook(Box::new(|info| {
         let text = format!("rproxy client crashed: {info}");
@@ -178,7 +209,8 @@ impl eframe::App for Client {
                     ctx.request_repaint();
                     break;
                 }
-                if let Ok(frame) = decoded {
+                if let Ok(mut frame) = decoded {
+                    if let Some(dialog) = frame.file_dialog.take() { file_dialog(&s.ws, dialog); }
                     let platform = self.scene.apply(ctx, frame);
                     apply_platform(ctx, platform);
                     if !self.shown {

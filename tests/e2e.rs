@@ -147,7 +147,7 @@ async fn real_core_refresh_select_route_listeners_and_restart() {
     subs.call(Add::new(Source::new(format!("http://127.0.0.1:{provider}/subscription")))).await.unwrap();
     until(&k, "servers", |k| !k.snapshot().get(&SERVERS).is_empty()).await;
     let server = k.snapshot().get(&SERVERS)[0].id;
-    k.cx_for("servers").call(Select { id: Some(server), auto: false }).await.unwrap();
+    k.cx_for("servers").call(Select::manual(Some(server))).await.unwrap();
     let client = proxy_client(port);
     let url = format!("http://127.0.0.1:{origin}/probe");
     assert_eq!(client.get(&url).send().await.unwrap().text().await.unwrap(), "via upstream");
@@ -186,7 +186,7 @@ async fn real_core_refresh_select_route_listeners_and_restart() {
         *body.write().unwrap() = working.clone();
         subs.call(RefreshAll).await.unwrap();
         assert_eq!(k.snapshot().get(&SERVERS)[0].id, server, "ids are stable across refreshes");
-        k.cx_for("servers").call(Select { id: Some(server), auto: false }).await.unwrap();
+        k.cx_for("servers").call(Select::manual(Some(server))).await.unwrap();
     }
 
     // Editing a listener onto a busy port is rejected; the working one stays.
@@ -287,12 +287,12 @@ async fn auto_select_picks_a_healthy_server_and_manual_choice_turns_it_off() {
         .unwrap();
     k.cx_for("health-checks").call(health::CheckAll).await.unwrap();
     // The dead server is excluded and cannot be connected manually.
-    assert!(k.cx_for("servers").call(Select { id: Some(id("Dead")), auto: false }).await.is_err());
+    assert!(k.cx_for("servers").call(Select::manual(Some(id("Dead")))).await.is_err());
     k.cx_for("auto-select").call(SetAuto(true)).await.unwrap();
     until(&k, "automatic selection", |k| *k.snapshot().get(&SELECTED) == Some(id("Good"))).await;
     assert!(k.snapshot().get(&AUTO).enabled);
     // A manual choice turns Auto off.
-    k.cx_for("servers").call(Select { id: None, auto: false }).await.unwrap();
+    k.cx_for("servers").call(Select::manual(None)).await.unwrap();
     assert!(!k.snapshot().get(&AUTO).enabled);
     host.shutdown().await;
 }

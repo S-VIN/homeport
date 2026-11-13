@@ -115,11 +115,43 @@ pub fn paint(ui: &Ui, painter: &Painter, pos: egui::Pos2, galley: &Galley, icons
 }
 
 pub fn label(ui: &mut Ui, text: &str, font: FontId, clickable: bool) -> Response {
+    let (response, elided) = text_label_with_elision(ui, egui::RichText::new(text).font(font), !clickable, clickable);
+    if elided {
+        response.on_hover_ui(|ui| { text_label(ui, text, true, false); })
+    } else {
+        response
+    }
+}
+
+/// Shared text renderer, preserving rich text styles and the original accessible label.
+pub fn text_label(ui: &mut Ui, text: impl Into<egui::WidgetText>, wrap: bool, clickable: bool) -> Response {
+    text_label_with_elision(ui, text, wrap, clickable).0
+}
+
+/// Also reports whether layout actually hid part of the text.
+pub fn text_label_with_elision(ui: &mut Ui, text: impl Into<egui::WidgetText>, wrap: bool, clickable: bool) -> (Response, bool) {
+    let text = text.into();
+    let original = text.text().to_owned();
     let color = ui.visuals().text_color();
-    let (job, icons) = layout(text, font, color);
-    let mut label = Label::new(job).selectable(false);
+    let source = text.into_layout_job(ui.style(), egui::FontSelection::Default, egui::Align::Center);
+    let mut job = LayoutJob::default();
+    let mut icons = HashMap::new();
+    for section in &source.sections {
+        let raw = &source.text[section.byte_range.start.0..section.byte_range.end.0];
+        let (part, map) = layout(raw, section.format.font_id.clone(), section.format.color);
+        let offset = job.text.chars().count() as u32;
+        icons.extend(map.into_iter().map(|(i, tile)| (i + offset, tile)));
+        for run in part.sections {
+            let mut format = section.format.clone();
+            format.color = run.format.color;
+            job.append(&part.text[run.byte_range.start.0..run.byte_range.end.0], 0., format);
+        }
+    }
+    job.wrap = source.wrap.clone();
+    let mut label = Label::new(job).selectable(false).show_tooltip_when_elided(false);
+    label = if wrap { label.wrap() } else { label.truncate() };
     if clickable {
-        label = label.truncate().show_tooltip_when_elided(false).sense(Sense::click());
+        label = label.sense(Sense::click());
     }
     let (pos, galley, response) = label.layout_in_ui(ui);
     if ui.is_rect_visible(response.rect) {
@@ -142,10 +174,10 @@ pub fn label(ui: &mut Ui, text: &str, font: FontId, clickable: bool) -> Response
                 egui::Role::Label
             },
             ui.is_enabled(),
-            text,
+            &original,
         )
     });
-    response
+    (response, galley.elided)
 }
 
 pub fn edit(ui: &mut Ui, text: &mut String, width: f32, hint: &str) -> Response {

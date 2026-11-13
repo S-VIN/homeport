@@ -221,21 +221,12 @@ pub fn rule_pattern(pattern: &str) -> Result<(String, Option<IpNet>)> {
         let prefix = p
             .strip_suffix(".*")
             .ok_or_else(|| Error::msg("Use an IP, a CIDR network or a prefix like 192.168.*."))?;
-        let octets = prefix
+        let octets: Vec<u8> = prefix
             .split('.')
-            .map(|octet| {
-                if octet.len() > 1 && octet.starts_with('0') {
-                    return Err(Error::msg("Invalid IPv4 prefix."));
-                }
-                octet
-                    .parse::<u8>()
-                    .map_err(|_| Error::msg("Invalid IPv4 prefix."))
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|_| Error::msg("Invalid IPv4 prefix."))?;
-        if !(1..=3).contains(&octets.len()) {
-            return Err(Error::msg("Invalid IPv4 prefix."));
-        }
+            .map(|octet| octet.parse().ok().filter(|_| octet.len() == 1 || !octet.starts_with('0')))
+            .collect::<Option<_>>()
+            .filter(|o: &Vec<u8>| (1..=3).contains(&o.len()))
+            .ok_or_else(|| Error::msg("Invalid IPv4 prefix."))?;
         let mut a = [0; 4];
         a[..octets.len()].copy_from_slice(&octets);
         return Ok((
@@ -352,13 +343,13 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
             );
         }
     });
-    kit::helper(ui, "Rules apply top to bottom and the first match wins. Other traffic goes via the selected server. Geo lists: geosite:category-ru, geoip:ru; put site lists above IP lists.");
+
     ListEditor::new(&RULES)
         .add_form("Add routing rule", || Rule { id: Id::random(), pattern: String::new(), action: Route::Proxy }, |ui, r, width| {
             let w = (width - 120. - kit::theme::HORIZONTAL_GAP).max(60.);
             let e = kit::input(ui, "pattern", &mut r.pattern, "Domain, IP or network", w, false)
-                .on_hover_text("Examples: *.example.org, 10.0.0.0/8, 192.168.*, geosite:category-ru, geoip:ru");
-            kit::choice(ui, "route", &mut r.action, Route::ALL, 120., "Route");
+                .on_hover_text("First match wins. Unmatched traffic uses the selected server. Examples: *.example.org, 10.0.0.0/8, geosite:category-ru, geoip:ru.");
+            kit::choice(ui, "route", &mut r.action, Route::ALL, 120., "");
             kit::submitted(ui, &e) && !r.pattern.trim().is_empty()
         })
         .column(Column::edit("Pattern", "Domain, IP or network", |r: &mut Rule| &mut r.pattern))
@@ -379,7 +370,7 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
                 _ => ("Not downloaded yet. Check the name or update geo data".into(), kit::Tone::Warning),
             })
         })
-        .empty(Icon::Routing, "No routing rules", "All traffic goes via the selected server. Add a rule to send a domain or network directly or block it.")
+        .empty(Icon::Routing, "No routing rules")
         .show(ui, cx);
 }
 

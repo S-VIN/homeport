@@ -20,7 +20,7 @@ pub static PLUGIN: Plugin = Plugin {
 
 /// Parse the `proxies` list of a Mihomo/Clash document.
 pub fn parse(body: &str) -> Result<Vec<Proxy>> {
-    let doc: Value = serde_yaml_ng::from_str(body.trim_start_matches('\u{feff}')).map_err(|_| Error::msg("Invalid YAML or JSON subscription."))?;
+    let doc: Value = serde_saphyr::from_str(body.trim_start_matches('\u{feff}')).map_err(|_| Error::msg("Invalid YAML or JSON subscription."))?;
     let nodes = doc.get("proxies").and_then(Value::as_array).ok_or_else(|| Error::msg("Expected a proxies list."))?;
     nodes.iter().cloned().enumerate().map(|(i, v)| Proxy::from_value(v, i + 1)).collect()
 }

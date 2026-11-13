@@ -6,3 +6,10 @@ publish = false
 
 [dependencies]
 rproxy-kernel = { path = "../../crates/kernel" }
+
+# Flatpak: the Background portal (same zbus as the desktop shell).
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5.19", default-features = false, features = ["tokio"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"

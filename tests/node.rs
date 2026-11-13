@@ -131,11 +131,14 @@ async fn node(dir: &std::path::Path) -> (Arc<Host>, String, u16) {
     let k = host.kernel();
     let cx = k.cx_for("vless-server");
     let port = free_port().await;
-    cx.call(Update::<vless::Settings>(Box::new(move |s| {
-        s.domain = "node.test".into();
-        s.port = port;
-        s.redirect_http = false;
-    })))
+    cx.call(Update {
+        state: &vless::CONFIG,
+        change: Box::new(move |s| {
+            s.domain = "node.test".into();
+            s.port = port;
+            s.redirect_http = false;
+        }),
+    })
     .await
     .unwrap();
     cx.call(vless::SetEnabled(true)).await.unwrap();
@@ -214,10 +217,7 @@ async fn vless_node_serves_clients_and_disguises_itself() {
     .await;
     let server = k.snapshot().get(&SERVERS)[0].id;
     k.cx_for("servers")
-        .call(Select {
-            id: Some(server),
-            auto: false,
-        })
+        .call(Select::manual(Some(server)))
         .await
         .unwrap();
     let target = origin("from origin").await;
@@ -275,10 +275,7 @@ async fn exit_server_chains_after_the_selected_server_and_fails_closed() {
     .await;
     let server = k.snapshot().get(&SERVERS)[0].id;
     k.cx_for("servers")
-        .call(Select {
-            id: Some(server),
-            auto: false,
-        })
+        .call(Select::manual(Some(server)))
         .await
         .unwrap();
 
@@ -312,10 +309,7 @@ async fn exit_server_chains_after_the_selected_server_and_fails_closed() {
 
     // No entry: traffic stops instead of going to the exit directly.
     k.cx_for("servers")
-        .call(Select {
-            id: None,
-            auto: false,
-        })
+        .call(Select::manual(None))
         .await
         .unwrap();
     assert!(via(inbound.port)
@@ -326,10 +320,7 @@ async fn exit_server_chains_after_the_selected_server_and_fails_closed() {
 
     // Exit off: one hop again.
     k.cx_for("servers")
-        .call(Select {
-            id: Some(server),
-            auto: false,
-        })
+        .call(Select::manual(Some(server)))
         .await
         .unwrap();
     k.cx_for("exit-server").call(exit::Use(None)).await.unwrap();

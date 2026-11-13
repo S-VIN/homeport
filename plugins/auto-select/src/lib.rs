@@ -523,11 +523,12 @@ async fn search(cx: &Cx, w: &World, p: &mut Policy, reason: Reason, above: f64) 
             if !cx.get(&AUTO).enabled || latest.selected != w.selected {
                 return Ok(true);
             }
-            if cx.call(Select { id: Some(id), auto: true }).await.is_err() {
+            if cx.call(Select::auto(Some(id), w.selected)).await.is_err() {
                 failed.push(id);
                 continue;
             }
             drop(probes);
+            announce(cx, id, reason);
             let mut next = p.clone();
             next.switched(w.selected, id, reason, &failed, now());
             let after = World { selected: Some(id), ..World::new(cx.snapshot()) };
@@ -560,16 +561,90 @@ async fn search(cx: &Cx, w: &World, p: &mut Policy, reason: Reason, above: f64) 
     Ok(false)
 }
 
+/// Say why the connection moved, so a switch is never silent.
+fn announce(cx: &Cx, to: Id, reason: Reason) {
+    let servers = cx.get(&servers::SERVERS);
+    let name = servers.iter().find(|s| s.id == to).map_or("another server", |s| s.name.as_str());
+    cx.notify(&format!("Switched to {name}. {}.", reason.label()));
+}
+
 /// mihomo already moved traffic to `backup`: make it the selection.
 async fn adopt(cx: &Cx, w: &World, mut p: Policy, from: Id, backup: Id) -> Result<()> {
-    if cx.call(Select { id: Some(backup), auto: true }).await.is_err() {
+    if cx.call(Select::auto(Some(backup), Some(from))).await.is_err() {
         return save(cx, w, p).await;
     }
+    announce(cx, backup, Reason::Failover);
     p.switched(Some(from), backup, Reason::Failover, &[], now());
     let after = World { selected: Some(backup), ..World::new(cx.snapshot()) };
     p.auto.backups = p.backups(&after, now(), Some(backup));
     p.auto.provisional = false;
     save(cx, &after, p).await
+}
+
+async fn set_auto(cx: Cx, SetAuto(on): SetAuto) -> Result<()> {
+    cx.write(move |w| {
+        w.update(&AUTO, |a| {
+            a.enabled = on;
+            if !on {
+                a.last_reason = None;
+            }
+        });
+        Ok(())
+    })
+    .await?;
+    if on {
+        cx.spawn(Decide(Trigger::Enabled))?;
+    }
+    Ok(())
+}
+
+/// A manual connect or disconnect turns Auto off.
+async fn manual_choice_turns_auto_off(cx: Cx, op: Select, next: Next<Select>) -> Result<()> {
+    let manual = op.auto.is_none();
+    next.run(&cx, op).await?;
+    if manual && cx.get(&AUTO).enabled {
+        cx.call(SetAuto(false)).await?;
+    }
+    Ok(())
+}
+
+fn ui(p: &mut Setup) {
+    p.fill(&servers::TOOLBAR, "auto", 10, |ui, cx, _| {
+        let auto = cx.get(&AUTO);
+        let mut on = auto.enabled;
+        let mut help = "Connecting manually turns Auto select off.".to_owned();
+        if let Some(reason) = auto.last_reason.as_ref().filter(|_| auto.enabled) {
+            help.push_str(&format!("\nLast decision: {reason}"));
+        }
+        let r = kit::toggle(ui, &mut on, "Auto select").on_hover_text(help);
+        if r.changed() {
+            cx.submit("auto", SetAuto(on));
+        }
+    });
+    p.fill(&STATUS, "auto", 5, |ui, cx, _| {
+        let auto = cx.get(&AUTO);
+        if auto.enabled {
+            let pal = kit::colors(ui);
+            let tip = auto.last_reason.clone().map_or_else(String::new, |r| format!("Last decision: {r}"));
+            let r = kit::chip(ui, Some(kit::Lead::Icon(Icon::Auto, pal.accent)), "Auto", &tip);
+            if r.clicked() {
+                cx.toggle_panels_from(&r);
+            }
+        }
+    });
+    p.fill(&servers::CONNECTION, "auto", 50, |ui, cx, _| {
+        let auto = cx.get(&AUTO);
+        if auto.enabled {
+            let pal = kit::colors(ui);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.;
+                kit::icon(ui, Icon::Auto, 14., pal.accent);
+                let text = auto.last_reason.clone().map_or_else(String::new, |r| format!("Last decision: {r}"));
+                ui.add(egui::Label::new(egui::RichText::new(text).size(kit::theme::SMALL).color(pal.muted)).wrap());
+            });
+            ui.add_space(4.);
+        }
+    });
 }
 
 fn setup(p: &mut Setup) -> Result<()> {
@@ -578,39 +653,9 @@ fn setup(p: &mut Setup) -> Result<()> {
     p.collection(&STRIKES);
     p.cascade(&servers::SERVERS, &MEMORY, |m| m.id);
 
-    p.handle(|cx: Cx, SetAuto(on): SetAuto| async move {
-        cx.write(move |w| {
-            w.update(&AUTO, |a| {
-                a.enabled = on;
-                if !on {
-                    a.last_reason = None;
-                }
-            });
-            Ok(())
-        })
-        .await?;
-        if on {
-            cx.spawn(Decide(Trigger::Enabled))?;
-        }
-        Ok(())
-    });
+    p.handle(set_auto);
     p.handle(|cx: Cx, Decide(t): Decide| decide(cx, t));
-    // A manual connect or disconnect turns Auto off.
-    p.wrap(|cx: Cx, op: Select, next: Next<Select>| async move {
-        let manual = !op.auto;
-        next.run(&cx, op).await?;
-        if manual && cx.get(&AUTO).enabled {
-            cx.write(|w| {
-                w.update(&AUTO, |a| {
-                    a.enabled = false;
-                    a.last_reason = None;
-                });
-                Ok(())
-            })
-            .await?;
-        }
-        Ok(())
-    });
+    p.wrap(manual_choice_turns_auto_off);
     // A filter dropped the connected server: stay on and connect another one.
     p.on(|cx: Cx, e: servers::Excluded| async move {
         if !cx.get(&AUTO).enabled {
@@ -646,40 +691,7 @@ fn setup(p: &mut Setup) -> Result<()> {
         })
     });
 
-    p.fill(&servers::TOOLBAR, "auto", 10, |ui, cx, _| {
-        let auto = cx.get(&AUTO);
-        let mut on = auto.enabled;
-        let mut r = kit::toggle(ui, &mut on, "Auto select").on_hover_text("Pick and switch servers automatically. Connecting by hand turns this off.");
-        if let Some(reason) = auto.last_reason.as_ref().filter(|_| auto.enabled) {
-            r = r.on_hover_text(format!("Last decision: {reason}"));
-        }
-        if r.changed() {
-            cx.submit("auto", SetAuto(on));
-        }
-    });
-    p.fill(&STATUS, "auto", 5, |ui, cx, _| {
-        let auto = cx.get(&AUTO);
-        if auto.enabled {
-            let pal = kit::colors(ui);
-            let tip = auto.last_reason.clone().map_or_else(|| "Auto select is on".into(), |r| format!("Auto select · {r}"));
-            if kit::chip(ui, Some(kit::Lead::Icon(Icon::Auto, pal.accent)), "Auto select", &tip).clicked() {
-                cx.toggle_panels();
-            }
-        }
-    });
-    p.fill(&servers::CONNECTION, "auto", 50, |ui, cx, _| {
-        let auto = cx.get(&AUTO);
-        if auto.enabled {
-            let pal = kit::colors(ui);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.;
-                kit::icon(ui, Icon::Auto, 14., pal.accent);
-                let text = auto.last_reason.clone().map_or_else(|| "Auto select is on".into(), |r| format!("Auto select · {r}"));
-                ui.add(egui::Label::new(egui::RichText::new(text).size(kit::theme::SMALL).color(pal.muted)).wrap());
-            });
-            ui.add_space(4.);
-        }
-    });
+    ui(p);
     Ok(())
 }
 

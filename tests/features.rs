@@ -1,4 +1,4 @@
-//! Geo rules, connections, backups and the tunnel with the real bundled mihomo.
+//! Geo rules, connections, configuration exchange and the tunnel with the real bundled mihomo.
 use plugin_inbounds::INBOUNDS;
 use plugin_routing::{Route, Rule, GEO};
 use rproxy_kernel::{list::Add, list::Save, Host, Id, Kernel};
@@ -113,22 +113,21 @@ async fn warp_is_set_up_and_carries_traffic_as_the_exit() {
             .call(plugin_servers::ReplaceFromSource {
                 source: id,
                 proxies,
+                still_current: None,
             })
             .await
             .unwrap();
         let server = k.snapshot().get(&plugin_servers::SERVERS)[0].id;
         k.cx_for("servers")
-            .call(plugin_servers::Select {
-                id: Some(server),
-                auto: false,
-            })
+            .call(plugin_servers::Select::manual(Some(server)))
             .await
             .unwrap();
     } else {
         k.cx_for("exit-server")
-            .call(rproxy_kernel::Update::<exit::Settings>(Box::new(|s| {
-                s.entry = exit::Entry::Direct
-            })))
+            .call(rproxy_kernel::Update {
+                state: &exit::SETTINGS,
+                change: Box::new(|s| s.entry = exit::Entry::Direct),
+            })
             .await
             .unwrap();
     }
@@ -187,6 +186,8 @@ async fn connections_show_live_traffic_and_can_be_closed() {
     use plugin_connections::{Close, TRAFFIC};
     let dir = tempfile::tempdir().unwrap();
     let host = start(dir.path()).await;
+    // An open window: connections are sampled every second.
+    let _window = host.session(&rproxy_kernel::egui::Context::default());
     let k = host.kernel();
     k.cx_for("routing")
         .call(Add::new(Rule {
@@ -241,7 +242,7 @@ async fn connections_show_live_traffic_and_can_be_closed() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_backup_restores_every_setting_and_keeps_the_state_before() {
+async fn configuration_round_trip_preserves_settings_without_automatic_backups() {
     let dir = tempfile::tempdir().unwrap();
     let host = start(dir.path()).await;
     let k = host.kernel();
@@ -254,13 +255,14 @@ async fn a_backup_restores_every_setting_and_keeps_the_state_before() {
         .call(Add::new(rule.clone()))
         .await
         .unwrap();
-    let backup = k.back_up(false).unwrap();
+    let bytes = host.export_configuration().unwrap();
+    let config = host.prepare_import("saved.sqlite3".into(), &bytes).unwrap();
     k.cx_for("routing")
         .call(rproxy_kernel::list::Remove::<Rule>::new(rule.id))
         .await
         .unwrap();
     assert!(k.snapshot().get(&plugin_routing::RULES).is_empty());
-    host.restore(&backup.path).await;
+    host.import_configuration(config).await.unwrap();
     let k = host.kernel();
     assert_eq!(
         k.snapshot()
@@ -270,17 +272,14 @@ async fn a_backup_restores_every_setting_and_keeps_the_state_before() {
             .collect::<Vec<_>>(),
         vec![rule.id]
     );
-    assert!(
-        k.backups().iter().any(|b| b.auto),
-        "the state before the restore is kept"
-    );
+    assert!(!dir.path().join("backups").exists(), "export/import must not create hidden copies");
     assert!(k.core_status().running());
     host.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_tunnel_reports_when_it_cannot_start() {
-    use plugin_inbounds::{Device, TUN_UP};
+    use plugin_inbounds::TUN_UP;
     if std::env::var("USER").as_deref() == Ok("root") {
         return;
     }
@@ -288,7 +287,7 @@ async fn the_tunnel_reports_when_it_cannot_start() {
     let host = start(dir.path()).await;
     let k = host.kernel();
     k.cx_for("inbounds")
-        .call(rproxy_kernel::Update::<Device>(Box::new(|d| d.tun = true)))
+        .call(rproxy_kernel::Update { state: &plugin_inbounds::DEVICE, change: Box::new(|d| d.tun = true) })
         .await
         .unwrap();
     assert!(k.core_status().running(), "the rest keeps working");

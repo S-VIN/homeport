@@ -96,7 +96,11 @@ pub fn route(snap: &Snapshot) -> Target {
 pub struct ReplaceFromSource {
     pub source: Id,
     pub proxies: Vec<Proxy>,
+    /// Checked in the same write as the replacement: `false` drops a stale
+    /// response (say, the subscription link changed while it was loading).
+    pub still_current: Option<SourceCheck>,
 }
+pub type SourceCheck = Box<dyn FnOnce(&rproxy_kernel::Write<'_>) -> bool + Send>;
 #[derive(Clone, Debug, Default)]
 pub struct Replaced {
     pub added: Vec<Id>,
@@ -111,13 +115,104 @@ pub struct RemoveSource(pub Id);
 impl Op for RemoveSource {
     type Reply = ();
 }
-/// Connect to a server (`None` disconnects). `auto` marks automatic decisions.
+/// Connect to a server (`None` disconnects).
 pub struct Select {
     pub id: Option<Id>,
-    pub auto: bool,
+    /// An automatic decision, made while `from` was selected. If the
+    /// selection changed meanwhile (the user picked a server), it is cancelled.
+    pub auto: Option<Option<Id>>,
+}
+impl Select {
+    /// The user's choice.
+    pub fn manual(id: Option<Id>) -> Self {
+        Self { id, auto: None }
+    }
+    /// An automatic switch away from `from`.
+    pub fn auto(id: Option<Id>, from: Option<Id>) -> Self {
+        Self { id, auto: Some(from) }
+    }
 }
 impl Op for Select {
     type Reply = ();
+}
+
+async fn replace_source(cx: Cx, op: ReplaceFromSource) -> Result<Replaced> {
+    let mut fresh = Vec::new();
+    let mut defs = Vec::new();
+    let mut seen = HashSet::new();
+    for proxy in op.proxies {
+        let (server, def) = proxy.normalize(op.source)?;
+        if seen.insert(server.id) {
+            fresh.push(server);
+            defs.push(def);
+        }
+    }
+    cx.write(move |w| {
+        if !op.still_current.is_none_or(|check| check(w)) {
+            return Err(Error::new("cancelled", "Subscription changed while loading"));
+        }
+        let before: Vec<Id> = w
+            .get(&SERVERS)
+            .iter()
+            .filter(|s| s.source == op.source)
+            .map(|s| s.id)
+            .collect();
+        let ids: HashSet<Id> = fresh.iter().map(|s| s.id).collect();
+        let added: Vec<Id> = fresh
+            .iter()
+            .map(|s| s.id)
+            .filter(|id| !before.contains(id))
+            .collect();
+        let removed: Vec<Id> = before
+            .iter()
+            .copied()
+            .filter(|id| !ids.contains(id))
+            .collect();
+        let total = fresh.len();
+        // A refresh that changes the connected server's settings changes its id:
+        // keep the connection on its successor instead of disconnecting.
+        let current = *w.get(&SELECTED);
+        let successor = current
+            .filter(|id| !ids.contains(id))
+            .and_then(|id| w.get(&SERVERS).iter().find(|s| s.id == id && s.source == op.source).cloned())
+            .and_then(|old| successor(&old, &fresh));
+        w.update(&SERVERS, |list| {
+            list.retain(|s| s.source != op.source);
+            list.extend(fresh);
+        });
+        if let Some(next) = successor {
+            w.set(&SELECTED, Some(next));
+            w.emit(SelectionChanged {
+                from: current,
+                to: Some(next),
+                auto: true,
+            });
+        }
+        let alive: HashSet<Id> = w.get(&SERVERS).iter().map(|s| s.id).collect();
+        w.update(&DEFINITIONS, |d| {
+            let map = Arc::make_mut(d);
+            for def in defs {
+                map.entry(def.fields.id).or_insert_with(|| Arc::new(def));
+            }
+            map.retain(|id, _| alive.contains(id));
+        });
+        if w.get(&SELECTED).is_some_and(|id| !alive.contains(&id)) {
+            w.set(&SELECTED, None);
+        }
+        if !added.is_empty() || !removed.is_empty() {
+            w.emit(ServersChanged {
+                source: op.source,
+                added: added.clone(),
+                removed: removed.clone(),
+            });
+        }
+        Ok(Replaced {
+            added,
+            removed,
+            total,
+        })
+    })
+    .await
 }
 
 // ---- events ---------------------------------------------------------------
@@ -207,8 +302,11 @@ pub fn source_tag(ui: &mut egui::Ui, snap: &Snapshot, id: Id, max_width: f32) ->
     let label = source_label(snap, id);
     kit::tag(ui, &label, source_hue(snap, id), max_width)
 }
-/// Sort key that orders "Auto 2" before "Auto 10" (case-insensitive).
+/// Sort key that orders "Auto 2" before "Auto 10" (case-insensitive,
+/// ignoring leading emoji).
 pub fn natural_key(s: &str) -> Vec<(String, u64)> {
+    // Leading flags and emoji ("🇫🇮 Helsinki") do not decide the order.
+    let s = s.trim_start_matches(|c: char| !c.is_alphanumeric());
     let mut out = Vec::new();
     let mut text = String::new();
     let mut chars = s.chars().peekable();
@@ -261,221 +359,125 @@ pub struct Cell {
 
 fn setup(p: &mut Setup) -> Result<()> {
     p.collection(&SERVERS);
-    p.persist(
-        &DEFINITIONS,
-        outbound::register,
-        outbound::read,
-        outbound::sync,
-    );
+    p.persist(&DEFINITIONS, outbound::register, outbound::read, outbound::sync);
     p.setting(&SELECTED);
 
-    p.handle(|cx: Cx, op: ReplaceFromSource| async move {
-        let mut fresh = Vec::new();
-        let mut defs = Vec::new();
-        let mut seen = HashSet::new();
-        for proxy in op.proxies {
-            let (server, def) = proxy.normalize(op.source)?;
-            if seen.insert(server.id) {
-                fresh.push(server);
-                defs.push(def);
-            }
-        }
-        cx.write(move |w| {
-            let before: Vec<Id> = w
-                .get(&SERVERS)
-                .iter()
-                .filter(|s| s.source == op.source)
-                .map(|s| s.id)
-                .collect();
-            let ids: HashSet<Id> = fresh.iter().map(|s| s.id).collect();
-            let added: Vec<Id> = fresh
-                .iter()
-                .map(|s| s.id)
-                .filter(|id| !before.contains(id))
-                .collect();
-            let removed: Vec<Id> = before
-                .iter()
-                .copied()
-                .filter(|id| !ids.contains(id))
-                .collect();
-            let total = fresh.len();
-            // A refresh that changes the connected server's settings changes its id:
-            // keep the connection on its successor instead of disconnecting.
-            let current = *w.get(&SELECTED);
-            let successor = current
-                .filter(|id| !ids.contains(id))
-                .and_then(|id| w.get(&SERVERS).iter().find(|s| s.id == id && s.source == op.source).cloned())
-                .and_then(|old| successor(&old, &fresh));
-            w.update(&SERVERS, |list| {
-                list.retain(|s| s.source != op.source);
-                list.extend(fresh);
-            });
-            if let Some(next) = successor {
-                w.set(&SELECTED, Some(next));
-                w.emit(SelectionChanged {
-                    from: current,
-                    to: Some(next),
-                    auto: true,
-                });
-            }
-            let alive: HashSet<Id> = w.get(&SERVERS).iter().map(|s| s.id).collect();
-            w.update(&DEFINITIONS, |d| {
-                let map = Arc::make_mut(d);
-                for def in defs {
-                    map.entry(def.fields.id).or_insert_with(|| Arc::new(def));
-                }
-                map.retain(|id, _| alive.contains(id));
-            });
-            if w.get(&SELECTED).is_some_and(|id| !alive.contains(&id)) {
-                w.set(&SELECTED, None);
-            }
-            if !added.is_empty() || !removed.is_empty() {
-                w.emit(ServersChanged {
-                    source: op.source,
-                    added: added.clone(),
-                    removed: removed.clone(),
-                });
-            }
-            Ok(Replaced {
-                added,
-                removed,
-                total,
-            })
-        })
-        .await
-    });
-    p.handle(|cx: Cx, RemoveSource(source): RemoveSource| async move {
-        cx.write(move |w| {
-            let removed: Vec<Id> = w
-                .get(&SERVERS)
-                .iter()
-                .filter(|s| s.source == source)
-                .map(|s| s.id)
-                .collect();
-            if removed.is_empty() {
-                return Ok(());
-            }
-            w.update(&SERVERS, |l| l.retain(|s| s.source != source));
-            w.update(&DEFINITIONS, |d| {
-                Arc::make_mut(d).retain(|id, _| !removed.contains(id))
-            });
-            if w.get(&SELECTED).is_some_and(|id| removed.contains(&id)) {
-                w.set(&SELECTED, None);
-            }
-            w.emit(ServersChanged {
-                source,
-                added: vec![],
-                removed,
-            });
-            Ok(())
-        })
-        .await
-    });
-    p.handle(|cx: Cx, op: Select| async move {
-        let snap = cx.snapshot();
-        if let Some(id) = op.id {
-            let server = snap
-                .get(&SERVERS)
-                .iter()
-                .find(|s| s.id == id)
-                .cloned()
-                .ok_or_else(|| Error::msg("Server no longer exists."))?;
-            if let Some(e) = exclusion(&snap, &server) {
-                bail!("{}", e.reason);
-            }
-            if !cx.core().status().running() {
-                bail!("Mihomo is offline. Restart the core first.");
-            }
-        }
-        cx.write(move |w| {
-            let from = *w.get(&SELECTED);
-            if from != op.id {
-                w.set(&SELECTED, op.id);
-                w.emit(SelectionChanged {
-                    from,
-                    to: op.id,
-                    auto: op.auto,
-                });
-            }
-            Ok(())
-        })
-        .await
-    });
+    p.handle(replace_source);
+    p.handle(remove_source);
+    p.handle(select);
     // A filter that excludes the connected server disconnects it.
     p.on(|cx: Cx, _: Changed| async move {
         let snap = cx.snapshot();
         if let Some(s) = selected(&snap) {
             if let Some(e) = exclusion(&snap, &s).filter(|e| e.disconnect) {
-                cx.call(Select {
-                    id: None,
-                    auto: true,
-                })
-                .await?;
+                cx.call(Select::auto(None, Some(s.id))).await?;
                 cx.notify(&format!("Disconnected {}: {}", s.name, e.reason));
-                cx.emit(Excluded {
-                    server: s,
-                    reason: e.reason,
-                });
+                cx.emit(Excluded { server: s, reason: e.reason });
             }
         }
         Ok(())
     });
-
-    p.core(|snap| {
-        let servers = snap.get(&SERVERS);
-        let defs = snap.get(&DEFINITIONS);
-        let proxies: Vec<mihomo::Proxy> = servers
-            .iter()
-            .filter_map(|s| {
-                let def = defs.get(&s.id)?;
-                Some(mihomo::Proxy {
-                    name: s.id.to_string(),
-                    protocol: s.protocol.to_string(),
-                    server: s.address.clone(),
-                    port: s.port,
-                    options: def.options(),
-                })
-            })
-            .collect();
-        let known = |id: &Id| proxies.iter().any(|p| p.name == id.to_string());
-        let selected = (*snap.get(&SELECTED)).filter(known);
-        let failover = selected
-            .and_then(|id| snap.hooks(&FAILOVER, &id).into_iter().flatten().next().map(|f| (id, f)))
-            .map(|(id, mut f)| {
-                f.backups.retain(|b| *b != id && known(b));
-                f.backups.dedup();
-                (id, f)
-            })
-            .filter(|(_, f)| !f.backups.is_empty());
-        let main = match failover {
-            Some((id, f)) => mihomo::Group {
-                name: MAIN.into(),
-                kind: mihomo::GroupKind::Fallback { url: f.url, interval_secs: f.interval_secs },
-                members: std::iter::once(id).chain(f.backups).map(|id| Target::Proxy(id.to_string())).collect(),
-                selected: Some(Target::Proxy(id.to_string())),
-            },
-            None => mihomo::Group {
-                name: MAIN.into(),
-                kind: mihomo::GroupKind::Select,
-                members: proxies
-                    .iter()
-                    .map(|p| Target::Proxy(p.name.clone()))
-                    .collect(),
-                selected: selected.map(|id| Target::Proxy(id.to_string())),
-            },
-        };
-        Fragment {
-            groups: vec![main],
-            proxies,
-            rules: vec![(Stage::Final, CoreRule::Match(route(snap)))],
-            ..Default::default()
-        }
-    });
-    p.hook(&rproxy_kernel::shell::TRAY, |snap, _| {
-        snap.get(&SELECTED).map(|_| TrayLink::Connected)
-    });
+    p.core(fragment);
+    p.hook(&rproxy_kernel::shell::TRAY, |snap, _| snap.get(&SELECTED).map(|_| TrayLink::Connected));
     ui::register(p);
     Ok(())
+}
+
+async fn remove_source(cx: Cx, RemoveSource(source): RemoveSource) -> Result<()> {
+    cx.write(move |w| {
+        let removed: Vec<Id> = w.get(&SERVERS).iter().filter(|s| s.source == source).map(|s| s.id).collect();
+        if removed.is_empty() {
+            return Ok(());
+        }
+        w.update(&SERVERS, |l| l.retain(|s| s.source != source));
+        w.update(&DEFINITIONS, |d| Arc::make_mut(d).retain(|id, _| !removed.contains(id)));
+        if w.get(&SELECTED).is_some_and(|id| removed.contains(&id)) {
+            w.set(&SELECTED, None);
+        }
+        w.emit(ServersChanged { source, added: vec![], removed });
+        Ok(())
+    })
+    .await
+}
+
+async fn select(cx: Cx, op: Select) -> Result<()> {
+    let snap = cx.snapshot();
+    if let Some(id) = op.id {
+        let server = snap
+            .get(&SERVERS)
+            .iter()
+            .find(|s| s.id == id)
+            .cloned()
+            .ok_or_else(|| Error::msg("Server no longer exists."))?;
+        if let Some(e) = exclusion(&snap, &server) {
+            bail!("{}", e.reason);
+        }
+        if !cx.core().status().running() {
+            bail!("Mihomo is offline. Restart the core first.");
+        }
+    }
+    cx.write(move |w| {
+        let from = *w.get(&SELECTED);
+        if op.auto.is_some_and(|expected| expected != from) {
+            return Err(Error::new("cancelled", "The selection changed meanwhile."));
+        }
+        if from != op.id {
+            w.set(&SELECTED, op.id);
+            w.emit(SelectionChanged { from, to: op.id, auto: op.auto.is_some() });
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Every server as a mihomo proxy, and the main group that routes through the
+/// selected one (a fallback group when a plugin offers backups).
+fn fragment(snap: &Snapshot) -> Fragment {
+    let servers = snap.get(&SERVERS);
+    let defs = snap.get(&DEFINITIONS);
+    let proxies: Vec<mihomo::Proxy> = servers
+        .iter()
+        .filter_map(|s| {
+            let def = defs.get(&s.id)?;
+            Some(mihomo::Proxy {
+                name: s.id.to_string(),
+                protocol: s.protocol.to_string(),
+                server: s.address.clone(),
+                port: s.port,
+                options: def.options(),
+            })
+        })
+        .collect();
+    let known: HashSet<Id> = servers.iter().filter(|s| defs.contains_key(&s.id)).map(|s| s.id).collect();
+    let selected = (*snap.get(&SELECTED)).filter(|id| known.contains(id));
+    let failover = selected
+        .and_then(|id| snap.hooks(&FAILOVER, &id).into_iter().flatten().next().map(|f| (id, f)))
+        .map(|(id, mut f)| {
+            let mut seen = HashSet::from([id]);
+            f.backups.retain(|b| known.contains(b) && seen.insert(*b));
+            (id, f)
+        })
+        .filter(|(_, f)| !f.backups.is_empty());
+    let main = match failover {
+        Some((id, f)) => mihomo::Group {
+            name: MAIN.into(),
+            kind: mihomo::GroupKind::Fallback { url: f.url, interval_secs: f.interval_secs },
+            members: std::iter::once(id).chain(f.backups).map(|id| Target::Proxy(id.to_string())).collect(),
+            selected: Some(Target::Proxy(id.to_string())),
+        },
+        None => mihomo::Group {
+            name: MAIN.into(),
+            kind: mihomo::GroupKind::Select,
+            members: proxies.iter().map(|p| Target::Proxy(p.name.clone())).collect(),
+            selected: selected.map(|id| Target::Proxy(id.to_string())),
+        },
+    };
+    Fragment {
+        groups: vec![main],
+        proxies,
+        rules: vec![(Stage::Final, CoreRule::Match(route(snap)))],
+        ..Default::default()
+    }
 }
 
 /// The refreshed server that replaces `old`: same name (preferring the same
@@ -491,10 +493,10 @@ fn successor(old: &Server, fresh: &[Server]) -> Option<Id> {
         .or_else(|| fresh.iter().find(|s| endpoint(s)).map(|s| s.id))
 }
 
-/// Safe, displayable properties of a server's outbound settings:
-/// `(common, rare)`; rare ones belong under "More details".
 /// `(label, value)` lines of a property list.
 pub type Properties = Vec<(String, String)>;
+/// Safe, displayable properties of a server's outbound settings:
+/// `(common, rare)`; rare ones belong under "More details".
 pub fn details(snap: &Snapshot, s: &Server) -> (Properties, Properties) {
     let defs = snap.get(&DEFINITIONS);
     let Some(def) = defs.get(&s.id) else {

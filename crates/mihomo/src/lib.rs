@@ -4,10 +4,12 @@
 //! * [`process`] — the supervised child process and its controller API.
 pub mod config;
 pub mod process;
+pub mod supervisor;
 pub use config::*;
 pub use ipnet;
 pub use process::{
-    bundled, executable, installed, local_address, ApplyReport, Controller, Delay, Mihomo, BINARY,
+    bundled, bundled_version, executable, grant_tun_script, installed, installed_update, installed_version_file,
+    local_address, newer, privileged, unprivileged, version_of, ApplyReport, Controller, Delay, Mihomo, BINARY,
     CHECK_LANES,
 };
 

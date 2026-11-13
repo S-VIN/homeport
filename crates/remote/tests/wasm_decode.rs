@@ -4,12 +4,14 @@ use wasm_bindgen_test::*;
 
 #[derive(serde::Deserialize)]
 struct Head {
+    _file: Option<FileDialog>,
     _ppp: f32,
     _textures: Vec<Texture>,
     _free: Vec<TexId>,
 }
 #[derive(serde::Deserialize)]
 struct WithGalleys {
+    _file: Option<FileDialog>,
     _ppp: f32,
     _textures: Vec<Texture>,
     _free: Vec<TexId>,

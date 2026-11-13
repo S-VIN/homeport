@@ -71,7 +71,7 @@ fn self_signed(domain: &str) -> Result<Arc<CertifiedKey>, String> {
     let generated =
         rcgen::generate_simple_self_signed(vec![domain.to_owned()]).map_err(|e| e.to_string())?;
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-        generated.signing_key.serialize_der(),
+        generated.key_pair.serialize_der(),
     ));
     let key = any_supported_type(&key).map_err(|e| e.to_string())?;
     Ok(Arc::new(CertifiedKey::new(
