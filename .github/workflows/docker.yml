@@ -1,9 +1,7 @@
-name: Docker image
-# Run workflow publishes :latest (from master) or the branch tag; a v* tag publishes its version.
+name: docker
+# Run workflow publishes :latest from the default branch, or the selected ref's tag.
 on:
   workflow_dispatch:
-  push:
-    tags: ['v*']
 permissions:
   contents: read
   packages: write

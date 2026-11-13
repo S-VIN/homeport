@@ -1,21 +1,17 @@
-name: Desktop application
-# Every push to master and every pull request runs the checks.
-# Run workflow (manual) or a v* tag also builds the six desktop packages.
+name: desktop
 on:
   workflow_dispatch:
-  pull_request:
-  push:
-    branches: [master]
-    tags: ['v*']
 permissions:
   contents: read
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   web:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -29,53 +25,16 @@ jobs:
           # wasm-bindgen CLI (pinned to Cargo.lock) lives outside target/.
           cache-directories: .cache/wasm-bindgen
       - run: python3 scripts/build.py --web-only
-      - name: Browser decoding test (wasm32, Node)
-        env:
-          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: ${{ github.workspace }}/.cache/wasm-bindgen/bin/wasm-bindgen-test-runner
-        run: cargo test --locked -p rproxy-remote --target wasm32-unknown-unknown --test wasm_decode
-      - uses: actions/upload-artifact@v7
+      - id: upload
+        uses: actions/upload-artifact@v7
         with:
           name: web-painter
           path: web/pkg
           if-no-files-found: error
           retention-days: 7
 
-  check:
-    needs: web
-    name: check-${{ matrix.os }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - {os: linux, runner: ubuntu-24.04}
-          - {os: win32, runner: windows-2025}
-          - {os: darwin, runner: macos-26}
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          # End-to-end tests run the real Linux x64 core; other OSes only compile.
-          sparse-checkout-cone-mode: false
-          sparse-checkout: |
-            /*
-            !/assets/mihomo/*/*/
-            /assets/mihomo/linux/x64/
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/download-artifact@v8
-        with:
-          name: web-painter
-          path: web/pkg
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - if: matrix.os == 'linux'
-        run: python3 scripts/mihomo.py --os linux --arch x64 && cargo test --workspace --locked
-
   package:
-    needs: check
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    needs: web
     name: ${{ matrix.os }}-${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
@@ -128,18 +87,48 @@ jobs:
       - run: python scripts/package.py --os ${{ matrix.os }} --arch ${{ matrix.arch }}
       - uses: actions/upload-artifact@v7
         with:
-          name: rproxy-${{ matrix.os }}-${{ matrix.arch }}
+          name: packages-${{ matrix.os }}-${{ matrix.arch }}
           path: |
-            dist/*.exe
-            dist/*.zip
-            dist/*.dmg
-            dist/*.AppImage
-            dist/*.flatpak
-            dist/*.pkg.tar.zst
-            dist/*-SHA256SUMS.txt
+            dist/rproxy-*.exe
+            dist/rproxy-*.zip
+            dist/rproxy-*.dmg
+            dist/rproxy-*.AppImage
+            dist/rproxy-*.flatpak
+            dist/rproxy-*.pkg.tar.zst
+            dist/rproxy-*-SHA256SUMS.txt
           if-no-files-found: error
+          retention-days: 7
           # Installers and archives are already compressed.
           compression-level: 0
-      # After the upload, so a failing smoke test still leaves the packages to inspect.
-      - name: Smoke-test the packages
-        run: python scripts/package.py --check --os ${{ matrix.os }} --arch ${{ matrix.arch }}
+
+  artifacts:
+    needs: [web, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: write
+    steps:
+      # Keep both native architectures in one download per OS.
+      - uses: actions/upload-artifact/merge@v7
+        with:
+          name: rproxy-windows
+          pattern: packages-win32-*
+          delete-merged: true
+          compression-level: 0
+      - uses: actions/upload-artifact/merge@v7
+        with:
+          name: rproxy-linux
+          pattern: packages-linux-*
+          delete-merged: true
+          compression-level: 0
+      - uses: actions/upload-artifact/merge@v7
+        with:
+          name: rproxy-macos
+          pattern: packages-darwin-*
+          delete-merged: true
+          compression-level: 0
+      - name: Remove the intermediate browser artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WEB_ARTIFACT_ID: ${{ needs.web.outputs.artifact-id }}
+        run: gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$WEB_ARTIFACT_ID"

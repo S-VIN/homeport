@@ -9,9 +9,9 @@
   сборка на VDS не нужна. Для публичного HTTPS нужны два DNS-имени на IP сервера.
 - **Desktop:** [платформы, пакеты и сборка](#сборки-приложения). Windows setup и
   portable, Linux AppImage/Flatpak/pacman, macOS DMG; везде x64 и ARM64.
-- **GitHub Actions:** `Desktop application` проверяет каждый push в master и pull request,
-  а при ручном запуске или теге `v*` ещё и прикладывает пакеты к запуску Actions.
-  `Docker image` публикует amd64/arm64 в GHCR вручную или тегом `v*`.
+- **GitHub Actions:** только ручной запуск через **Run workflow**. `desktop`
+  собирает три артефакта: Windows, Linux и macOS, каждый с x64 и ARM64.
+  `docker` публикует образ amd64/arm64 в GHCR. Тесты в workflows не запускаются.
 
 ## Запуск
 
@@ -98,7 +98,7 @@ cargo run --locked -- web
 | `assets/` | Ядро mihomo, шрифты, логотипы |
 | `docker/` | Compose, Caddy, Dockerfile и пример `.env` для VDS |
 | `scripts/` | Сборка, упаковка, обслуживание mihomo и проверка Docker-авторизации |
-| `.github/workflows/` | Два процесса CI: Docker image и Desktop application |
+| `.github/workflows/` | Две ручные сборки: desktop и docker |
 
 Плагины включаются и выключаются в **Settings → Plugins**; изменения применяются кнопкой **Restart now**.
 
@@ -120,12 +120,14 @@ CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=$PWD/.cache/wasm-bindgen/bin/wasm-bin
 
 ## Сборки приложения
 
-Workflow `Desktop application` всегда собирает WASM один раз, гоняет на нём
-wasm-тест, затем Clippy на Linux, Windows и macOS и тесты на Linux. Это происходит
-для каждого push в master и pull request. **Actions → Desktop application → Run workflow**
-или тег `v*` после успешных проверок дополнительно запускает шесть нативных сборок.
-Результаты — в Artifacts соответствующего запуска Actions (публикация GitHub Release
-автоматически не выполняется).
+**Actions → desktop → Run workflow** собирает WASM один раз, затем параллельно
+запускает шесть нативных сборок. Workflow запускается только вручную;
+push, pull request и создание тега сборку не запускают. Тесты, Clippy
+и проверки готовых пакетов остаются локальными командами.
+После успешного завершения в Artifacts остаются ровно три архива:
+`rproxy-windows`, `rproxy-linux` и `rproxy-macos`. Каждый содержит пакеты
+обеих архитектур и SHA256SUMS; промежуточные артефакты удаляются.
+Публикация GitHub Release автоматически не выполняется.
 
 | ОС | Архитектуры | Пакеты |
 | --- | --- | --- |
@@ -139,8 +141,8 @@ wasm-bindgen — из Cargo.lock, mihomo — из `assets/mihomo/manifest.json`.
 берёт **свой** бинарник mihomo из `assets/mihomo/<os>/<arch>/`, проверяет его
 SHA-256 по `manifest.json`, компилирует программу и упаковывает её. Checkout
 получает только ядро выбранной платформы. Затем пакеты загружаются в Artifacts
-и проходят `package.py --check`: каждый формат устанавливается или распаковывается
-и запускается с `--smoke-test`. Для каждого набора файлов создаётся SHA256SUMS. Сборки Linux используют Ubuntu
+и объединяются по ОС без повторного сжатия. Для каждого набора файлов создаётся
+SHA256SUMS. Сборки Linux используют Ubuntu
 24.04 для совместимости с glibc 2.39+; Flatpak использует runtime 25.08.
 AppImage использует графические библиотеки установленного Linux-десктопа
 (X11/Wayland, xkbcommon, EGL/OpenGL); Flatpak получает их из runtime.

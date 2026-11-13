@@ -107,13 +107,15 @@ docker compose up -d
 
 ## Публикация образа
 
-**Actions → Docker image → Run workflow** публикует
+**Actions → docker → Run workflow** из основной ветки публикует
 `ghcr.io/s-vin/rproxy:latest` для `linux/amd64` и `linux/arm64`.
-Тег `v0.2.0` публикует версионный тег `0.2.0` (и `latest`). Каждый образ содержит свой
+Workflow запускается только вручную; push, pull request и создание тега
+его не запускают. Ручной запуск для Git-тега `v0.2.0` публикует версию `0.2.0`
+(и `latest`), для другой ветки — тег с её именем. Каждый образ содержит свой
 проверенный бинарник mihomo из Git; скачивания mihomo при сборке нет.
 Архитектуры собираются параллельно на нативных x64/ARM64 runners с отдельными
 кэшами слоёв. После успеха обеих сборок публикуется общий multi-platform тег.
-Тесты и Clippy выполняет workflow `Desktop application`; Docker workflow их не повторяет.
+Оба workflow, `desktop` и `docker`, собирают без тестов и Clippy.
 
 `docker/Dockerfile` собирает в одном build-этапе WASM-клиент и серверный бинарник
 (`--no-default-features`, без символов), выбирает ядро по `TARGETARCH` и копирует
