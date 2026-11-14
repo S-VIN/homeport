@@ -6,13 +6,13 @@ permissions:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: 'true'
 jobs:
   web:
     runs-on: ubuntu-26.04
     timeout-minutes: 30
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: 'true'
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
@@ -23,11 +23,18 @@ jobs:
           sparse-checkout: |
             /*
             !/assets/mihomo/*/*/
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.15'
+      - run: rustup toolchain install
+      - id: build-env
+        run: python scripts/build.py --prepare-ci
       - uses: mozilla-actions/sccache-action@v0.0.11
         with:
           version: v0.19.0
       - uses: Swatinem/rust-cache@v2
         with:
+          workspaces: . -> ${{ steps.build-env.outputs.cache-target }}
           # wasm-bindgen CLI (pinned to Cargo.lock) lives outside target/.
           cache-directories: .cache/wasm-bindgen
       - run: python3 scripts/build.py --web-only
@@ -55,10 +62,6 @@ jobs:
           - {os: win32, arch: arm64, runner: windows-11-arm, target: aarch64-pc-windows-msvc}
           - {os: darwin, arch: x64, runner: macos-26-intel, target: x86_64-apple-darwin}
           - {os: darwin, arch: arm64, runner: macos-26, target: aarch64-apple-darwin}
-    env:
-      CARGO_BUILD_TARGET: ${{ matrix.target }}
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: 'true'
     defaults:
       run:
         shell: bash
@@ -71,15 +74,19 @@ jobs:
             /*
             !/assets/mihomo/*/*/
             /assets/mihomo/${{ matrix.os }}/${{ matrix.arch }}/
-      # rust-toolchain.toml selects the version; this adds the target triple.
-      - run: rustup toolchain install && rustup target add ${{ matrix.target }}
+      # Each runner builds for its own architecture; no explicit --target.
+      - run: rustup toolchain install
       - uses: actions/setup-python@v7
         with:
           python-version: '3.15'
+      - id: build-env
+        run: python scripts/build.py --prepare-ci ${{ matrix.target }}
       - uses: mozilla-actions/sccache-action@v0.0.11
         with:
           version: v0.19.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> ${{ steps.build-env.outputs.cache-target }}
       - uses: actions/download-artifact@v8
         with:
           name: web-painter
@@ -88,7 +95,7 @@ jobs:
         if: matrix.os == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder imagemagick zstd
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder librsvg2-bin zstd
           flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
           # Flatpak's bubblewrap needs unprivileged user namespaces.
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0

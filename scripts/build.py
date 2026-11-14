@@ -13,11 +13,34 @@ def run(*args):
     subprocess.run(args, cwd=ROOT, check=True)
 
 
+def prepare_ci(expected_host):
+    """Configure the same short artifact path for Cargo, packaging and rust-cache."""
+    if expected_host:
+        version = subprocess.check_output(['rustc', '-vV'], cwd=ROOT, text=True)
+        host = next(line.removeprefix('host: ') for line in version.splitlines() if line.startswith('host: '))
+        if host != expected_host:
+            raise SystemExit(f'Runner toolchain is {host}; expected {expected_host}')
+    # Hosted runners are isolated per job. Keep Windows paths short enough for
+    # sccache's rustc dependency scan, which expands the arguments again.
+    target = Path(ROOT.anchor) / 'b' if os.name == 'nt' else Path('/tmp/rproxy-build')
+    target.mkdir(parents=True, exist_ok=True)
+    with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+        env.write(f'CARGO_TARGET_DIR={target}\n')
+    # rust-cache joins this value to the workspace, so it must be relative.
+    with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+        output.write(f'cache-target={os.path.relpath(target, ROOT)}\n')
+
+
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--prepare-ci', nargs='?', const='', metavar='HOST',
+                        help='prepare CI artifact paths, optionally checking the native Rust host')
     parser.add_argument('--web-only', action='store_true')
     parser.add_argument('--native-only', action='store_true')
     args, cargo_args = parser.parse_known_args()
+    if args.prepare_ci is not None:
+        prepare_ci(args.prepare_ci)
+        return
     target = Path(os.environ.get('CARGO_TARGET_DIR', 'target'))
     if not target.is_absolute():
         target = ROOT / target

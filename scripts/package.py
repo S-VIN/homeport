@@ -146,6 +146,8 @@ def copy(source, target):
 def bundle(path, system, arch, *, resources=None):
     suffix = '.exe' if system == 'win32' else ''
     target = Path(os.environ.get('CARGO_TARGET_DIR', ROOT / 'target'))
+    if not target.is_absolute():
+        target = ROOT / target
     if os.environ.get('CARGO_BUILD_TARGET'):
         target /= os.environ['CARGO_BUILD_TARGET']
     copy(target / f'release/rproxy{suffix}', path / f'rproxy{suffix}')
@@ -211,9 +213,9 @@ def linux(arch, name):
     icon = appdir / f'usr/share/icons/hicolor/512x512/apps/{APP_ID}.png'
     scalable = appdir / f'usr/share/icons/hicolor/scalable/apps/{APP_ID}.svg'
     copy(ROOT / 'assets/logos/rproxy-blue.svg', scalable)
-    # The repository logo is resized by ImageMagick, available in Linux CI.
+    # Render the SVG directly, without ImageMagick's external delegate chain.
     icon.parent.mkdir(parents=True, exist_ok=True)
-    run('convert', '-background', 'none', '-density', '384', ROOT / 'assets/logos/rproxy-blue.svg', '-resize', '512x512', icon)
+    run('rsvg-convert', '--width', '512', '--height', '512', '--output', icon, scalable)
     copy(desktop, appdir / f'usr/share/applications/{APP_ID}.desktop')
 
     # Flatpak packages the clean binary tree; platform libraries come from its runtime.
