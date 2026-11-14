@@ -1,12 +1,12 @@
 //! Browser side: paint host frames, forward input. No application code here.
-use crate::{pack, unpack, Frame, Scene, ToHost};
+use crate::{Frame, Scene, ToHost, pack, unpack};
 use egui::epaint::Primitive;
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
     rc::Rc,
 };
-use wasm_bindgen::{prelude::*, JsCast};
+use wasm_bindgen::{JsCast, prelude::*};
 use web_sys::{BinaryType, MessageEvent, WebSocket};
 
 #[wasm_bindgen]
@@ -48,7 +48,11 @@ pub async fn start(canvas: web_sys::HtmlCanvasElement) -> Result<(), JsValue> {
         status(Some(&text));
     }));
     eframe::WebRunner::new()
-        .start(canvas.clone(), eframe::WebOptions::default(), Box::new(move |cc| Ok(Box::new(Client::new(&cc.egui_ctx, &canvas)))))
+        .start(
+            canvas.clone(),
+            eframe::WebOptions::default(),
+            Box::new(move |cc| Ok(Box::new(Client::new(&cc.egui_ctx, &canvas)))),
+        )
         .await
 }
 
@@ -67,7 +71,11 @@ struct Socket {
 impl Socket {
     fn connect(ctx: &egui::Context) -> Option<Self> {
         let loc = web_sys::window()?.location();
-        let scheme = if loc.protocol().ok()? == "https:" { "wss" } else { "ws" };
+        let scheme = if loc.protocol().ok()? == "https:" {
+            "wss"
+        } else {
+            "ws"
+        };
         let ws = WebSocket::new(&format!("{scheme}://{}/ws", loc.host().ok()?)).ok()?;
         ws.set_binary_type(BinaryType::Arraybuffer);
         let inbox: Rc<RefCell<Inbox>> = Rc::default();
@@ -76,7 +84,9 @@ impl Socket {
         let on_message = Closure::<dyn FnMut(JsValue)>::new(move |e: JsValue| {
             let e: MessageEvent = e.unchecked_into();
             if let Ok(buf) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
-                i.borrow_mut().frames.push_back(js_sys::Uint8Array::new(&buf).to_vec());
+                i.borrow_mut()
+                    .frames
+                    .push_back(js_sys::Uint8Array::new(&buf).to_vec());
                 c.request_repaint();
             }
         });
@@ -96,7 +106,11 @@ impl Socket {
         });
         ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
         handlers.push(on_close);
-        Some(Self { ws, inbox, _handlers: handlers })
+        Some(Self {
+            ws,
+            inbox,
+            _handlers: handlers,
+        })
     }
 }
 impl Drop for Socket {
@@ -109,19 +123,18 @@ impl Drop for Socket {
 }
 
 fn apply_platform(ctx: &egui::Context, p: egui::PlatformOutput) {
-
-        ctx.set_cursor_icon(p.cursor_icon);
-        for c in p.commands {
-            match c {
-                egui::OutputCommand::CopyText(t) => ctx.copy_text(t),
-                egui::OutputCommand::OpenUrl(u) => ctx.open_url(u),
-                egui::OutputCommand::CopyImage(_) | egui::OutputCommand::TextSelectionSettled(_) => {}
-            }
+    ctx.set_cursor_icon(p.cursor_icon);
+    for c in p.commands {
+        match c {
+            egui::OutputCommand::CopyText(t) => ctx.copy_text(t),
+            egui::OutputCommand::OpenUrl(u) => ctx.open_url(u),
+            egui::OutputCommand::CopyImage(_) | egui::OutputCommand::TextSelectionSettled(_) => {}
         }
-        ctx.output_mut(|o| {
-            o.ime = p.ime;
-            o.mutable_text_under_cursor = p.mutable_text_under_cursor;
-        });
+    }
+    ctx.output_mut(|o| {
+        o.ime = p.ime;
+        o.mutable_text_under_cursor = p.mutable_text_under_cursor;
+    });
 }
 
 struct Client {
@@ -141,7 +154,12 @@ struct Client {
 }
 
 fn status(text: Option<&str>) {
-    let Some(el) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("status")) else { return };
+    let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("status"))
+    else {
+        return;
+    };
     match text {
         Some(t) => {
             el.set_text_content(Some(t));
@@ -159,12 +177,18 @@ impl Client {
         status(Some("Connecting to rproxy…"));
         let wheel_at: Rc<Cell<Option<egui::Pos2>>> = Rc::default();
         let (at, c, target) = (wheel_at.clone(), ctx.clone(), canvas.clone());
-        let wheel = Closure::<dyn FnMut(web_sys::WheelEvent)>::new(move |e: web_sys::WheelEvent| {
-            let rect = target.get_bounding_client_rect();
-            let zoom = c.zoom_factor();
-            at.set(Some(egui::pos2((e.client_x() as f32 - rect.left() as f32) / zoom, (e.client_y() as f32 - rect.top() as f32) / zoom)));
-        });
-        let listening = canvas.add_event_listener_with_callback("wheel", wheel.as_ref().unchecked_ref()).is_ok();
+        let wheel =
+            Closure::<dyn FnMut(web_sys::WheelEvent)>::new(move |e: web_sys::WheelEvent| {
+                let rect = target.get_bounding_client_rect();
+                let zoom = c.zoom_factor();
+                at.set(Some(egui::pos2(
+                    (e.client_x() as f32 - rect.left() as f32) / zoom,
+                    (e.client_y() as f32 - rect.top() as f32) / zoom,
+                )));
+            });
+        let listening = canvas
+            .add_event_listener_with_callback("wheel", wheel.as_ref().unchecked_ref())
+            .is_ok();
         Self {
             socket: Socket::connect(ctx),
             scene: Scene::default(),
@@ -204,13 +228,17 @@ impl eframe::App for Client {
                 let decoded = unpack::<Frame>(&f);
                 if let Err(e) = &decoded {
                     // Deltas are now out of sync: start over with a fresh connection.
-                    web_sys::console::error_1(&format!("frame decode failed ({} bytes): {e}", f.len()).into());
+                    web_sys::console::error_1(
+                        &format!("frame decode failed ({} bytes): {e}", f.len()).into(),
+                    );
                     s.inbox.borrow_mut().closed = true;
                     ctx.request_repaint();
                     break;
                 }
                 if let Ok(mut frame) = decoded {
-                    if let Some(dialog) = frame.file_dialog.take() { file_dialog(&s.ws, dialog); }
+                    if let Some(dialog) = frame.file_dialog.take() {
+                        file_dialog(&s.ws, dialog);
+                    }
                     let platform = self.scene.apply(ctx, frame);
                     apply_platform(ctx, platform);
                     if !self.shown {
@@ -222,9 +250,13 @@ impl eframe::App for Client {
             let mut raw = ctx.input(|i| i.raw.clone());
             let open = s.inbox.borrow().open;
             // The system theme changes without an input event: forward it on its own.
-            let changed = raw.screen_rect != self.last_screen || raw.system_theme != self.last_theme;
+            let changed =
+                raw.screen_rect != self.last_screen || raw.system_theme != self.last_theme;
             if let Some(at) = self.wheel_at.take() {
-                let wheel = raw.events.iter().position(|e| matches!(e, egui::Event::MouseWheel { .. }));
+                let wheel = raw
+                    .events
+                    .iter()
+                    .position(|e| matches!(e, egui::Event::MouseWheel { .. }));
                 if let Some(i) = wheel.filter(|_| self.pointer != Some(at)) {
                     raw.events.insert(i, egui::Event::PointerMoved(at));
                 }
@@ -247,7 +279,9 @@ impl eframe::App for Client {
         let painter = ctx.layer_painter(egui::LayerId::background());
         for p in &self.scene.primitives {
             if let Primitive::Mesh(m) = &p.primitive {
-                painter.with_clip_rect(p.clip_rect).add(egui::Shape::mesh(m.clone()));
+                painter
+                    .with_clip_rect(p.clip_rect)
+                    .add(egui::Shape::mesh(m.clone()));
             }
         }
     }

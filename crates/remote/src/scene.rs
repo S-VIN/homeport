@@ -1,8 +1,8 @@
 //! Rebuild the host's shapes from frames and tessellate them locally.
-use crate::{image_data, unwire, Frame, Item, ShapeOp, TexId};
+use crate::{Frame, Item, ShapeOp, TexId, image_data, unwire};
 use egui::{
-    epaint::{ClippedPrimitive, Galley, Primitive, Tessellator},
     TextureId,
+    epaint::{ClippedPrimitive, Galley, Primitive, Tessellator},
 };
 use std::{collections::HashMap, sync::Arc};
 
@@ -34,7 +34,14 @@ impl Scene {
                 self.font_size = data.size();
             }
             match (self.textures.get(&t.id), t.pos) {
-                (Some(id), _) => tex.set(*id, egui::epaint::ImageDelta { image: data, options: t.options, pos: t.pos }),
+                (Some(id), _) => tex.set(
+                    *id,
+                    egui::epaint::ImageDelta {
+                        image: data,
+                        options: t.options,
+                        pos: t.pos,
+                    },
+                ),
                 (None, None) => {
                     let id = tex.alloc(format!("remote-{:?}", t.id), data, t.options);
                     self.textures.insert(t.id, id);
@@ -58,14 +65,23 @@ impl Scene {
                 ShapeOp::New(items) => self.items.extend(items),
             }
         }
-        let shapes: Vec<_> = self.items.iter().filter_map(|i| unwire(i, |id| self.galleys.get(&id).cloned())).collect();
-        let size = if self.font_size[0] == 0 { [1, 1] } else { self.font_size };
-        let mut prims = Tessellator::new(frame.ppp, Default::default(), size, Vec::new()).tessellate_shapes(shapes);
+        let shapes: Vec<_> = self
+            .items
+            .iter()
+            .filter_map(|i| unwire(i, |id| self.galleys.get(&id).cloned()))
+            .collect();
+        let size = if self.font_size[0] == 0 {
+            [1, 1]
+        } else {
+            self.font_size
+        };
+        let mut prims = Tessellator::new(frame.ppp, Default::default(), size, Vec::new())
+            .tessellate_shapes(shapes);
         for p in &mut prims {
-            if let Primitive::Mesh(m) = &mut p.primitive {
-                if let Some(id) = self.textures.get(&TexId::from(m.texture_id)) {
-                    m.texture_id = *id;
-                }
+            if let Primitive::Mesh(m) = &mut p.primitive
+                && let Some(id) = self.textures.get(&TexId::from(m.texture_id))
+            {
+                m.texture_id = *id;
             }
         }
         self.primitives = prims;
@@ -78,4 +94,3 @@ impl Scene {
         frame.platform
     }
 }
-

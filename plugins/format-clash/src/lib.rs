@@ -12,22 +12,32 @@ pub static PLUGIN: Plugin = Plugin {
     description: "The proxies: list of Mihomo and Clash configurations (YAML or JSON).",
     category: categories::FORMATS,
     requires: &["subscriptions"],
-    required: false,
-    default_enabled: true,
-    platforms: Platform::ALL,
     setup,
+    ..Plugin::DEFAULT
 };
 
 /// Parse the `proxies` list of a Mihomo/Clash document.
 pub fn parse(body: &str) -> Result<Vec<Proxy>> {
-    let doc: Value = serde_saphyr::from_str(body.trim_start_matches('\u{feff}')).map_err(|_| Error::msg("Invalid YAML or JSON subscription."))?;
-    let nodes = doc.get("proxies").and_then(Value::as_array).ok_or_else(|| Error::msg("Expected a proxies list."))?;
-    nodes.iter().cloned().enumerate().map(|(i, v)| Proxy::from_value(v, i + 1)).collect()
+    let doc: Value = serde_saphyr::from_str(body.trim_start_matches('\u{feff}'))
+        .map_err(|_| Error::msg("Invalid YAML or JSON subscription."))?;
+    let nodes = doc
+        .get("proxies")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::msg("Expected a proxies list."))?;
+    nodes
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(i, v)| Proxy::from_value(v, i + 1))
+        .collect()
 }
 
 fn setup(p: &mut Setup) -> Result<()> {
     p.handle(|_: Cx, op: Parse| async move { parse(&op.body) })
-        .claim(|_, op| (op.body.contains("proxies:") || op.body.contains("\"proxies\"")).then_some(Claim::content(75)));
+        .claim(|_, op| {
+            (op.body.contains("proxies:") || op.body.contains("\"proxies\""))
+                .then_some(Claim::content(75))
+        });
     Ok(())
 }
 
@@ -35,9 +45,19 @@ fn setup(p: &mut Setup) -> Result<()> {
 mod tests {
     #[test]
     fn proxies_list_and_rejects_bad_nodes() {
-        let ok = super::parse("proxies:\n  - { name: a, type: http, server: localhost, port: 8080 }").unwrap();
+        let ok =
+            super::parse("proxies:\n  - { name: a, type: http, server: localhost, port: 8080 }")
+                .unwrap();
         assert_eq!(ok.len(), 1);
-        assert!(super::parse("proxies:\n  - { name: bad, type: http, server: localhost, port: 0 }").is_err());
-        assert!(super::parse("proxies:\n  - { name: x, type: http, server: h, port: 1, dialer-proxy: y }").is_err());
+        assert!(
+            super::parse("proxies:\n  - { name: bad, type: http, server: localhost, port: 0 }")
+                .is_err()
+        );
+        assert!(
+            super::parse(
+                "proxies:\n  - { name: x, type: http, server: h, port: 1, dialer-proxy: y }"
+            )
+            .is_err()
+        );
     }
 }

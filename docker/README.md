@@ -119,7 +119,7 @@ Workflow запускается только вручную; push, pull request 
 
 `docker/Dockerfile` собирает в одном build-этапе WASM-клиент и серверный бинарник
 (`--no-default-features`, без символов), выбирает ядро по `TARGETARCH` и копирует
-в `debian:bookworm-slim` только бинарник, ядро и его лицензию. Cache mounts хранят
+в `debian:trixie-slim` только бинарник, ядро и его лицензию. Cache mounts хранят
 реестр Cargo, `target/` и wasm-bindgen между локальными сборками; в GitHub Actions
 переиспользуются только слои из кэша `gha`.
 

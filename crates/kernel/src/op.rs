@@ -10,7 +10,7 @@ use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 /// Run as a visible background job when spawned.
 #[derive(Clone, Debug)]
 pub struct JobSpec {
-    /// Equal keys join a running job instead of starting another.
+    /// Equal keys join a running job instead of starting another (empty: the op type).
     pub key: String,
     /// Shown in Activity.
     pub label: String,
@@ -19,19 +19,43 @@ pub struct JobSpec {
     /// When a run with the same key is active: `false` joins it (the new op is
     /// dropped), `true` runs the new op right after it (at most one waits per key).
     pub queue: bool,
+    /// When a run with the same key is active: cancel it and run the new op
+    /// right after (the newest request wins, e.g. a subscription link edited
+    /// while it loads).
+    pub latest: bool,
     /// Page that shows the details when the job fails (a toast offers to open it).
     pub page: Option<&'static str>,
 }
 impl JobSpec {
+    /// One job per op type: a second request joins the running one.
     pub fn new(label: impl Into<String>) -> Self {
-        let label = label.into();
-        Self { key: label.clone(), label, quiet: false, queue: false, page: None }
+        Self {
+            key: String::new(),
+            label: label.into(),
+            quiet: false,
+            queue: false,
+            latest: false,
+            page: None,
+        }
     }
+    /// One job per `key` (e.g. per subscription). Keys are local to the plugin
+    /// that handles the op: the kernel prefixes them with its id.
     pub fn keyed(key: impl Into<String>, label: impl Into<String>) -> Self {
-        Self { key: key.into(), label: label.into(), quiet: false, queue: false, page: None }
+        Self {
+            key: key.into(),
+            label: label.into(),
+            quiet: false,
+            queue: false,
+            latest: false,
+            page: None,
+        }
     }
     pub fn queued(mut self) -> Self {
         self.queue = true;
+        self
+    }
+    pub fn latest(mut self) -> Self {
+        self.latest = true;
         self
     }
     pub fn quiet(mut self) -> Self {
@@ -75,7 +99,8 @@ impl Claim {
 }
 
 pub(crate) type BoxFut<T> = Pin<Box<dyn Future<Output = Result<T>> + Send>>;
-pub(crate) type HandlerFn<O> = Arc<dyn Fn(Cx, O, Next<O>) -> BoxFut<<O as Op>::Reply> + Send + Sync>;
+pub(crate) type HandlerFn<O> =
+    Arc<dyn Fn(Cx, O, Next<O>) -> BoxFut<<O as Op>::Reply> + Send + Sync>;
 pub(crate) type ClaimFn<O> = Arc<dyn Fn(&Snapshot, &O) -> Option<Claim> + Send + Sync>;
 
 pub(crate) struct Handler<O: Op> {
@@ -87,7 +112,13 @@ pub(crate) struct Handler<O: Op> {
 }
 impl<O: Op> Clone for Handler<O> {
     fn clone(&self) -> Self {
-        Self { f: self.f.clone(), claim: self.claim.clone(), rank: self.rank, plugin: self.plugin, seq: self.seq }
+        Self {
+            f: self.f.clone(),
+            claim: self.claim.clone(),
+            rank: self.rank,
+            plugin: self.plugin,
+            seq: self.seq,
+        }
     }
 }
 
@@ -102,9 +133,15 @@ impl<O: Op> Next<O> {
     /// Hand the (possibly modified) op to the next handler.
     pub async fn run(self, cx: &Cx, op: O) -> Result<O::Reply> {
         let Some(h) = self.chain.get(self.at).cloned() else {
-            return Err(Error::new("unhandled", format!("No plugin handles {}", short_name::<O>())));
+            return Err(Error::new(
+                "unhandled",
+                format!("No plugin handles {}", short_name::<O>()),
+            ));
         };
-        let next = Next { chain: self.chain, at: self.at + 1 };
+        let next = Next {
+            chain: self.chain,
+            at: self.at + 1,
+        };
         (h.f)(cx.as_plugin(Some(h.plugin)), op, next).await
     }
     /// True when another handler follows.
@@ -113,9 +150,15 @@ impl<O: Op> Next<O> {
     }
 }
 
-pub(crate) fn short_name<T>() -> &'static str {
-    let n = std::any::type_name::<T>();
-    n.rsplit("::").next().unwrap_or(n)
+/// A type's name without module paths: `Add<Source>`.
+pub(crate) fn short_name<T>() -> String {
+    let mut out = String::new();
+    for part in std::any::type_name::<T>().split_inclusive(['<', '>', ',', ' ']) {
+        let (path, end) = part.split_at(part.trim_end_matches(['<', '>', ',', ' ']).len());
+        out.push_str(path.rsplit("::").next().unwrap_or(path));
+        out.push_str(end);
+    }
+    out
 }
 
 /// Order the handlers that accept `op`: rank, claim weight, dependents before
@@ -138,12 +181,23 @@ pub(crate) fn chain<O: Op>(all: &[Handler<O>], snap: &Snapshot, op: &O) -> Vec<H
     out.into_iter().map(|(h, _)| h).collect()
 }
 
-pub(crate) fn run<O: Op>(cx: &Cx, handlers: Option<&(dyn Any + Send + Sync)>, op: O) -> BoxFut<O::Reply> {
+pub(crate) fn run<O: Op>(
+    cx: &Cx,
+    handlers: Option<&(dyn Any + Send + Sync)>,
+    op: O,
+) -> BoxFut<O::Reply> {
     let snap = cx.snapshot();
     let list = handlers
         .and_then(|h| h.downcast_ref::<Handlers<O>>())
         .map(|h| chain(&h.0, &snap, &op))
         .unwrap_or_default();
     let cx = cx.clone();
-    Box::pin(async move { Next { chain: Arc::new(list), at: 0 }.run(&cx, op).await })
+    Box::pin(async move {
+        Next {
+            chain: Arc::new(list),
+            at: 0,
+        }
+        .run(&cx, op)
+        .await
+    })
 }

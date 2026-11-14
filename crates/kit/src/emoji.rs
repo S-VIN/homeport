@@ -1,7 +1,7 @@
 //! egui lays out the text. A local Noto atlas supplies the color glyphs it cannot shape.
 use egui::{
-    self, text::LayoutJob, Color32, FontId, Galley, Label, Painter, Rect, Response, Sense,
-    TextFormat, Ui,
+    self, Color32, FontId, Galley, Label, Painter, Rect, Response, Sense, TextFormat, Ui,
+    text::LayoutJob,
 };
 use std::{collections::HashMap, sync::LazyLock};
 use unicode_segmentation::UnicodeSegmentation;
@@ -63,7 +63,13 @@ pub fn layout(raw: &str, font: FontId, color: Color32) -> (LayoutJob, HashMap<u3
 }
 
 /// Draw the color glyphs of a galley laid out with [`layout`].
-pub fn paint(ui: &Ui, painter: &Painter, pos: egui::Pos2, galley: &Galley, icons: &HashMap<u32, u16>) {
+pub fn paint(
+    ui: &Ui,
+    painter: &Painter,
+    pos: egui::Pos2,
+    galley: &Galley,
+    icons: &HashMap<u32, u16>,
+) {
     if icons.is_empty() {
         return;
     }
@@ -92,7 +98,10 @@ pub fn paint(ui: &Ui, painter: &Painter, pos: egui::Pos2, galley: &Galley, icons
     let glyphs = galley.rows.iter().flat_map(|row| {
         let start = index;
         index += row.glyphs.len() as u32 + row.ends_with_newline as u32;
-        row.glyphs.iter().enumerate().map(move |(i, g)| (start + i as u32, row.pos, g))
+        row.glyphs
+            .iter()
+            .enumerate()
+            .map(move |(i, g)| (start + i as u32, row.pos, g))
     });
     for (index, row_pos, glyph) in glyphs.filter(|(_, _, g)| g.chr == SPACE) {
         if let Some(&tile) = icons.get(&index) {
@@ -102,7 +111,9 @@ pub fn paint(ui: &Ui, painter: &Painter, pos: egui::Pos2, galley: &Galley, icons
                 (origin / atlas).to_pos2(),
                 ((origin + egui::Vec2::splat(32.)) / atlas).to_pos2(),
             );
-            let r = glyph.logical_rect().translate(pos.to_vec2() + row_pos.to_vec2());
+            let r = glyph
+                .logical_rect()
+                .translate(pos.to_vec2() + row_pos.to_vec2());
             let size = r.width().min(r.height());
             painter.image(
                 tex.id(),
@@ -115,25 +126,46 @@ pub fn paint(ui: &Ui, painter: &Painter, pos: egui::Pos2, galley: &Galley, icons
 }
 
 pub fn label(ui: &mut Ui, text: &str, font: FontId, clickable: bool) -> Response {
-    let (response, elided) = text_label_with_elision(ui, egui::RichText::new(text).font(font), !clickable, clickable);
+    let (response, elided) = text_label_with_elision(
+        ui,
+        egui::RichText::new(text).font(font),
+        !clickable,
+        clickable,
+    );
     if elided {
-        response.on_hover_ui(|ui| { text_label(ui, text, true, false); })
+        response.on_hover_ui(|ui| {
+            text_label(ui, text, true, false);
+        })
     } else {
         response
     }
 }
 
 /// Shared text renderer, preserving rich text styles and the original accessible label.
-pub fn text_label(ui: &mut Ui, text: impl Into<egui::WidgetText>, wrap: bool, clickable: bool) -> Response {
+pub fn text_label(
+    ui: &mut Ui,
+    text: impl Into<egui::WidgetText>,
+    wrap: bool,
+    clickable: bool,
+) -> Response {
     text_label_with_elision(ui, text, wrap, clickable).0
 }
 
 /// Also reports whether layout actually hid part of the text.
-pub fn text_label_with_elision(ui: &mut Ui, text: impl Into<egui::WidgetText>, wrap: bool, clickable: bool) -> (Response, bool) {
+pub fn text_label_with_elision(
+    ui: &mut Ui,
+    text: impl Into<egui::WidgetText>,
+    wrap: bool,
+    clickable: bool,
+) -> (Response, bool) {
     let text = text.into();
     let original = text.text().to_owned();
     let color = ui.visuals().text_color();
-    let source = text.into_layout_job(ui.style(), egui::FontSelection::Default, egui::Align::Center);
+    let source = text.into_layout_job(
+        ui.style(),
+        egui::FontSelection::Default,
+        egui::Align::Center,
+    );
     let mut job = LayoutJob::default();
     let mut icons = HashMap::new();
     for section in &source.sections {
@@ -144,11 +176,17 @@ pub fn text_label_with_elision(ui: &mut Ui, text: impl Into<egui::WidgetText>, w
         for run in part.sections {
             let mut format = section.format.clone();
             format.color = run.format.color;
-            job.append(&part.text[run.byte_range.start.0..run.byte_range.end.0], 0., format);
+            job.append(
+                &part.text[run.byte_range.start.0..run.byte_range.end.0],
+                0.,
+                format,
+            );
         }
     }
     job.wrap = source.wrap.clone();
-    let mut label = Label::new(job).selectable(false).show_tooltip_when_elided(false);
+    let mut label = Label::new(job)
+        .selectable(false)
+        .show_tooltip_when_elided(false);
     label = if wrap { label.wrap() } else { label.truncate() };
     if clickable {
         label = label.sense(Sense::click());

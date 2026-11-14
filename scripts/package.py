@@ -218,7 +218,7 @@ def linux(arch, name):
 
     # Flatpak packages the clean binary tree; platform libraries come from its runtime.
     manifest = {
-        'app-id': APP_ID, 'runtime': 'org.freedesktop.Platform', 'runtime-version': '25.08',
+        'app-id': APP_ID, 'runtime': 'org.freedesktop.Platform', 'runtime-version': '26.08',
         'sdk': 'org.freedesktop.Sdk', 'command': 'rproxy',
         'finish-args': ['--filesystem=xdg-run/rproxy:create', '--share=network', '--share=ipc', '--socket=wayland', '--socket=fallback-x11',
                         '--device=dri', '--talk-name=org.kde.StatusNotifierWatcher'],

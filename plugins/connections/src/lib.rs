@@ -20,14 +20,10 @@ use std::{
 pub static PLUGIN: Plugin = Plugin {
     id: "connections",
     name: "Connections",
-    description:
-        "Live connections and traffic: what goes where, by which rule, through which server.",
-    category: categories::NETWORK,
+    description: "Live connections and traffic: what goes where, by which rule, through which server.",
     requires: &["servers"],
-    required: false,
-    default_enabled: true,
-    platforms: Platform::ALL,
     setup,
+    ..Plugin::DEFAULT
 };
 
 /// One open connection.
@@ -156,31 +152,35 @@ impl Op for Close {
 
 fn setup(p: &mut Setup) -> Result<()> {
     p.live(&TRAFFIC, Traffic::default);
-    p.service("poll", |_| Some(()), |cx: Cx, ()| async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
-        let mut idle = 0;
-        loop {
-            tick.tick().await;
-            // Nobody watching (a server without an open browser tab): sample
-            // every 10 s, enough for the session totals.
-            idle = if cx.ui_open() { 0 } else { (idle + 1) % 10 };
-            if idle != 0 {
-                continue;
+    p.service(
+        "poll",
+        |_| Some(()),
+        |cx: Cx, ()| async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            let mut idle = 0;
+            loop {
+                tick.tick().await;
+                // Nobody watching (a server without an open browser tab): sample
+                // every 10 s, enough for the session totals.
+                idle = if cx.ui_open() { 0 } else { (idle + 1) % 10 };
+                if idle != 0 {
+                    continue;
+                }
+                match cx.core().connections().await {
+                    Ok(v) => cx.update_live(&TRAFFIC, |t| {
+                        t.update(&v);
+                        t.online = true;
+                    }),
+                    Err(_) => cx.update_live(&TRAFFIC, |t| {
+                        t.online = false;
+                        t.up_rate = 0;
+                        t.down_rate = 0;
+                        t.sampled = None;
+                    }),
+                }
             }
-            match cx.core().connections().await {
-                Ok(v) => cx.update_live(&TRAFFIC, |t| {
-                    t.update(&v);
-                    t.online = true;
-                }),
-                Err(_) => cx.update_live(&TRAFFIC, |t| {
-                    t.online = false;
-                    t.up_rate = 0;
-                    t.down_rate = 0;
-                    t.sampled = None;
-                }),
-            }
-        }
-    });
+        },
+    );
     p.handle(|cx: Cx, Close(id): Close| async move {
         match id {
             Some(id) => cx.core().close_connection(&id).await,
@@ -224,154 +224,235 @@ fn age(started: Instant) -> String {
 }
 
 fn ui(p: &mut Setup) {
-    p.page_fn(PageSpec { id: "connections", title: "Connections", icon: Icon::Activity, order: 35 }, |ui, cx| {
-        let snap = cx.snapshot().clone();
-        let t = cx.live(&TRAFFIC);
-        let counter = if t.online { format!("{} open", t.conns.len()) } else { "Core offline".into() };
-        let online = t.online;
-        let has = online && !t.conns.is_empty();
-        let mut close_all = false;
-        kit::page_header(ui, "Connections", &counter, |ui| {
-            close_all = kit::Button::ghost("Close all").tone(kit::Tone::Danger).enabled(has).show(ui).on_hover_text("Apps may reconnect automatically.").clicked();
-        });
-
-        kit::card(ui, |ui| {
-            kit::stats(
-                ui,
-                &[
-                    ("Download", kit::rate(t.down_rate), None),
-                    ("Upload", kit::rate(t.up_rate), None),
-                    ("Downloaded", kit::bytes(t.down_total), None),
-                    ("Uploaded", kit::bytes(t.up_total), None),
-                ],
-            );
-        });
-        ui.add_space(theme::SECTION_GAP);
-        let filter_id = egui::Id::unique("connections-filter");
-        let mut filter: String = ui.data(|d| d.get_temp(filter_id)).unwrap_or_default();
-        kit::input(ui, "filter", &mut filter, "Filter by host, rule or server", ui.available_width(), false);
-        ui.data_mut(|d| d.insert_temp(filter_id, filter.clone()));
-        ui.add_space(theme::SPACE_M);
-        let needle = filter.trim().to_lowercase();
-        let mut rows: Vec<(Conn, String)> = t
-            .conns
-            .iter()
-            .map(|c| (c.clone(), route(&snap, &c.chain)))
-            .filter(|(c, r)| needle.is_empty() || [c.target.as_str(), c.rule.as_str(), r.as_str()].iter().any(|s| s.to_lowercase().contains(&needle)))
-            .collect();
-        let matched = rows.len();
-        rows.truncate(300);
-        drop(t);
-        if !online && !rows.is_empty() {
-            kit::banner(ui, kit::Tone::Warning, "Core offline · Last known connections", None);
-        }
-        if matched > rows.len() {
-            kit::hint(ui, format!("Showing {} of {matched} matches", rows.len()));
-        }
-        if close_all {
-            cx.submit("close-all", Close(None));
-        }
-        if let Some(Ok(())) = cx.outcome("close-all") {
-            cx.notify("All connections closed. Apps may reconnect.");
-        }
-        if rows.is_empty() {
-            if !needle.is_empty() {
-                kit::empty(ui, Icon::Filter, "Nothing matches");
-                ui.vertical_centered(|ui| {
-                    if kit::Button::secondary("Clear filter").show(ui).clicked() {
-                        ui.data_mut(|d| d.insert_temp(filter_id, String::new()));
-                    }
-                });
-            } else {
-                kit::list_card(ui, |ui| {
-                    if online {
-                        kit::empty(ui, Icon::Activity, "No open connections");
-                        ui.vertical_centered(|ui| kit::hint(ui, "Apps that use the proxy show up here."));
-                    } else {
-                        kit::empty(ui, Icon::Warning, "Core offline");
-                    }
-                    ui.add_space(theme::SPACE_M);
-                });
-            }
-            return;
-        }
-        kit::page_scroll(ui, "connections", |ui| {
-            kit::list_card(ui, |ui| {
-                for (c, via) in rows {
-                    kit::row(ui, ("conn", &c.id), false, |ui, _| {
-                        kit::row_line(ui, 54., |ui| {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if kit::icon_button_ex(ui, Icon::Close, "Close this connection", online, kit::Emphasis::Quiet, true).clicked() {
-                                    cx.submit(("close", &c.id), Close(Some(c.id.clone())));
-                                }
-                                ui.allocate_ui_with_layout(egui::vec2(88., 36.), egui::Layout::top_down(egui::Align::Max), |ui| {
-                                    kit::hint(ui, format!("↓ {}", kit::bytes(c.down)));
-                                    kit::caption(ui, format!("↑ {}", kit::bytes(c.up)));
-                                });
-                                let width = ui.available_width().max(40.);
-                                ui.allocate_ui_with_layout(egui::vec2(width, 38.), egui::Layout::top_down(egui::Align::Min), |ui| {
-                                    ui.set_width(width);
-                                    kit::truncated(ui, egui::RichText::new(&c.target).color(kit::colors(ui).foreground), Some(&c.target));
-                                    let detail = format!("{} · {} · {} · Seen {}", c.network, via, c.rule, age(c.started));
-                                    kit::truncated(ui, egui::RichText::new(&detail).size(theme::SMALL).color(kit::colors(ui).muted), Some(&detail));
-                                });
-                            });
-                        });
-                    });
-                }
-            });
-        });
-    });
-    p.fill(&STATUS, "traffic", 40, |ui, cx, _| {
-        let t = cx.live(&TRAFFIC);
-        let (down, up) = (t.down_rate, t.up_rate);
-        if down + up == 0 {
-            return;
-        }
-        let pal = kit::colors(ui);
-        let r = kit::chip(
-            ui,
-            Some(kit::Lead::Icon(Icon::Activity, pal.muted)),
-            &format!("↓ {}", kit::rate(down)),
-            &format!("Download {} · upload {}", kit::rate(down), kit::rate(up)),
-        );
-        if r.clicked() {
-            // Wide windows show the traffic panel beside the page already.
-            if cx.wide() {
-                cx.navigate("connections");
-            } else {
-                cx.toggle_panels_from(&r);
-            }
-        }
-    });
-    p.fill(&PANELS, "traffic", 30, |ui, cx, _| {
-        let t = cx.live(&TRAFFIC);
-        if !t.online || (t.conns.is_empty() && t.down_rate + t.up_rate == 0) {
-            return;
-        }
-        panel_title(ui, "Traffic", |ui| {
-            kit::badge(ui, &format!("{} open", t.conns.len()), kit::Tone::Neutral);
-        });
-        kit::property(ui, "Download", &kit::rate(t.down_rate));
-        kit::property(ui, "Upload", &kit::rate(t.up_rate));
-        kit::property(ui, "This session", &format!("↓ {} · ↑ {}", kit::bytes(t.down_total), kit::bytes(t.up_total)));
-        if cx.page() != "connections" {
-            ui.add_space(6.);
-            if kit::Button::secondary("Open Connections").icon(Icon::Activity).show(ui).clicked() {
-                cx.navigate("connections");
-            }
-        }
-    });
+    p.page_fn(
+        PageSpec {
+            id: "connections",
+            title: "Connections",
+            icon: Icon::Activity,
+            order: 35,
+        },
+        page,
+    );
+    p.fill(&STATUS, "traffic", 40, traffic_chip);
+    p.fill(&PANELS, "traffic", 30, traffic_panel);
     p.fill(&servers::DETAILS, "traffic", 30, |ui, cx, s: &Server| {
         let (up, down) = cx.live(&TRAFFIC).by_server(s.id);
         if up + down > 0 {
-            kit::property(
-                ui,
-                "Traffic",
-                &format!("↓ {}  ↑ {} this session", kit::bytes(down), kit::bytes(up)),
-            );
+            let text = format!("↓ {}  ↑ {} this session", kit::bytes(down), kit::bytes(up));
+            kit::property(ui, "Traffic", &text);
         }
     });
+}
+
+fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
+    let snap = cx.snapshot().clone();
+    let t = cx.live(&TRAFFIC);
+    let online = t.online;
+    let counter = if online {
+        format!("{} open", t.conns.len())
+    } else {
+        "Core offline".into()
+    };
+    let mut close_all = false;
+    kit::page_header(ui, "Connections", &counter, |ui| {
+        close_all = kit::Button::ghost("Close all")
+            .tone(kit::Tone::Danger)
+            .enabled(online && !t.conns.is_empty())
+            .show(ui)
+            .on_hover_text("Apps may reconnect automatically.")
+            .clicked();
+    });
+    if close_all {
+        cx.submit("close-all", Close(None));
+    }
+    if let Some(Ok(())) = cx.outcome("close-all") {
+        cx.notify("All connections closed. Apps may reconnect.");
+    }
+    kit::card(ui, |ui| {
+        kit::stats(
+            ui,
+            &[
+                ("Download", kit::rate(t.down_rate), None),
+                ("Upload", kit::rate(t.up_rate), None),
+                ("Downloaded", kit::bytes(t.down_total), None),
+                ("Uploaded", kit::bytes(t.up_total), None),
+            ],
+        );
+    });
+    ui.add_space(theme::SECTION_GAP);
+    let filter_id = egui::Id::unique("connections-filter");
+    let mut filter: String = ui.data(|d| d.get_temp(filter_id)).unwrap_or_default();
+    kit::input(
+        ui,
+        "filter",
+        &mut filter,
+        "Filter by host, rule or server",
+        ui.available_width(),
+        false,
+    );
+    ui.data_mut(|d| d.insert_temp(filter_id, filter.clone()));
+    ui.add_space(theme::SPACE_M);
+    let needle = filter.trim().to_lowercase();
+    let matches = |c: &Conn, route: &str| {
+        needle.is_empty()
+            || [c.target.as_str(), c.rule.as_str(), route]
+                .iter()
+                .any(|s| s.to_lowercase().contains(&needle))
+    };
+    let mut rows: Vec<(Conn, String)> = t
+        .conns
+        .iter()
+        .map(|c| (c.clone(), route(&snap, &c.chain)))
+        .filter(|(c, r)| matches(c, r))
+        .collect();
+    drop(t);
+    let matched = rows.len();
+    rows.truncate(300);
+    if !online && !rows.is_empty() {
+        kit::banner(
+            ui,
+            kit::Tone::Warning,
+            "Core offline · Last known connections",
+            None,
+        );
+    }
+    if matched > rows.len() {
+        kit::hint(ui, format!("Showing {} of {matched} matches", rows.len()));
+    }
+    if rows.is_empty() {
+        if needle.is_empty() {
+            kit::list_card(ui, |ui| {
+                if online {
+                    kit::empty(ui, Icon::Activity, "No open connections");
+                    ui.vertical_centered(|ui| {
+                        kit::hint(ui, "Apps that use the proxy show up here.")
+                    });
+                } else {
+                    kit::empty(ui, Icon::Warning, "Core offline");
+                }
+                ui.add_space(theme::SPACE_M);
+            });
+        } else {
+            kit::empty(ui, Icon::Filter, "Nothing matches");
+            ui.vertical_centered(|ui| {
+                if kit::Button::secondary("Clear filter").show(ui).clicked() {
+                    ui.data_mut(|d| d.insert_temp(filter_id, String::new()));
+                }
+            });
+        }
+        return;
+    }
+    kit::page_scroll(ui, "connections", |ui| {
+        kit::list_card(ui, |ui| {
+            for (c, via) in &rows {
+                connection_row(ui, cx, c, via, online);
+            }
+        });
+    });
+}
+
+/// Target and how it goes on the left, bytes and a close button on the right.
+fn connection_row(ui: &mut egui::Ui, cx: &mut UiCx, c: &Conn, via: &str, online: bool) {
+    kit::row(ui, ("conn", &c.id), false, |ui, _| {
+        kit::row_line(ui, 54., |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let close = kit::icon_button_ex(
+                    ui,
+                    Icon::Close,
+                    "Close this connection",
+                    online,
+                    kit::Emphasis::Quiet,
+                    true,
+                );
+                if close.clicked() {
+                    cx.submit(("close", &c.id), Close(Some(c.id.clone())));
+                }
+                ui.allocate_ui_with_layout(
+                    egui::vec2(88., 36.),
+                    egui::Layout::top_down(egui::Align::Max),
+                    |ui| {
+                        kit::hint(ui, format!("↓ {}", kit::bytes(c.down)));
+                        kit::caption(ui, format!("↑ {}", kit::bytes(c.up)));
+                    },
+                );
+                let width = ui.available_width().max(40.);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, 38.),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_width(width);
+                        let pal = kit::colors(ui);
+                        kit::truncated(
+                            ui,
+                            egui::RichText::new(&c.target).color(pal.foreground),
+                            Some(&c.target),
+                        );
+                        let detail = format!(
+                            "{} · {via} · {} · Seen {}",
+                            c.network,
+                            c.rule,
+                            age(c.started)
+                        );
+                        kit::truncated(
+                            ui,
+                            egui::RichText::new(&detail)
+                                .size(theme::SMALL)
+                                .color(pal.muted),
+                            Some(&detail),
+                        );
+                    },
+                );
+            });
+        });
+    });
+}
+
+fn traffic_chip(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
+    let t = cx.live(&TRAFFIC);
+    let (down, up) = (t.down_rate, t.up_rate);
+    // Shown while anything is open, also at 0 B/s, so the bar doesn't flicker.
+    if t.conns.is_empty() && down + up == 0 {
+        return;
+    }
+    let pal = kit::colors(ui);
+    let tip = format!("Download {} · upload {}", kit::rate(down), kit::rate(up));
+    cx.status_chip(
+        ui,
+        kit::Lead::Icon(Icon::Activity, pal.muted),
+        &format!("↓ {}", kit::rate(down)),
+        &tip,
+    );
+}
+
+fn traffic_panel(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
+    let t = cx.live(&TRAFFIC);
+    if !t.online || (t.conns.is_empty() && t.down_rate + t.up_rate == 0) {
+        return;
+    }
+    panel_title(ui, "Traffic", |ui| {
+        kit::badge(ui, &format!("{} open", t.conns.len()), kit::Tone::Neutral);
+    });
+    kit::property(ui, "Download", &kit::rate(t.down_rate));
+    kit::property(ui, "Upload", &kit::rate(t.up_rate));
+    kit::property(
+        ui,
+        "This session",
+        &format!(
+            "↓ {} · ↑ {}",
+            kit::bytes(t.down_total),
+            kit::bytes(t.up_total)
+        ),
+    );
+    if cx.page() != "connections" {
+        ui.add_space(6.);
+        if kit::Button::secondary("Open Connections")
+            .icon(Icon::Activity)
+            .show(ui)
+            .clicked()
+        {
+            cx.navigate("connections");
+        }
+    }
 }
 
 #[cfg(test)]

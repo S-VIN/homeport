@@ -26,7 +26,16 @@ pub struct Button<'a> {
 }
 impl<'a> Button<'a> {
     pub fn new(kind: Kind, text: &'a str) -> Self {
-        Self { kind, icon: None, text, width: 0., enabled: true, selected: false, count: None, tone: None }
+        Self {
+            kind,
+            icon: None,
+            text,
+            width: 0.,
+            enabled: true,
+            selected: false,
+            count: None,
+            tone: None,
+        }
     }
     pub fn primary(text: &'a str) -> Self {
         Self::new(Kind::Primary, text)
@@ -78,37 +87,103 @@ impl<'a> Button<'a> {
         }
         let p = theme::palette(ui);
         let font = FontId::proportional(theme::BODY);
-        let galley = ui.painter().layout_no_wrap(self.text.to_owned(), font.clone(), Color32::PLACEHOLDER);
-        let count = self.count.as_ref().map(|c| ui.painter().layout_no_wrap(c.clone(), FontId::proportional(theme::CAPTION), Color32::PLACEHOLDER));
+        let galley =
+            ui.painter()
+                .layout_no_wrap(self.text.to_owned(), font.clone(), Color32::PLACEHOLDER);
+        let count = self.count.as_ref().map(|c| {
+            ui.painter().layout_no_wrap(
+                c.clone(),
+                FontId::proportional(theme::CAPTION),
+                Color32::PLACEHOLDER,
+            )
+        });
         let pad = if self.text.is_empty() { 5. } else { 10. };
-        let icon_w = if self.icon.is_some() { 16. + if self.text.is_empty() { 0. } else { 6. } } else { 0. };
+        let icon_w = if self.icon.is_some() {
+            16. + if self.text.is_empty() { 0. } else { 6. }
+        } else {
+            0.
+        };
         let count_w = count.as_ref().map_or(0., |c| c.size().x + 12.);
         let content = icon_w + galley.size().x + count_w;
         let width = (content + pad * 2.).max(self.width);
-        let (rect, response) = ui.allocate_exact_size(vec2(width, CONTROL), if self.enabled { Sense::click() } else { Sense::hover() });
+        let (rect, response) = ui.allocate_exact_size(
+            vec2(width, CONTROL),
+            if self.enabled {
+                Sense::click()
+            } else {
+                Sense::hover()
+            },
+        );
         let hovered = self.enabled && (response.hovered() || response.has_focus());
         let pressed = self.enabled && response.is_pointer_button_down_on();
         let (fill, stroke, ink) = match self.kind {
-            Kind::Primary => (if hovered { p.action_hover } else { p.action_bg }, Stroke::NONE, p.action_fg),
-            Kind::Danger => (p.danger, Stroke::NONE, if p.dark { p.background } else { Color32::WHITE }),
-            Kind::Secondary if self.selected => (p.selected(), Stroke::new(1_f32, p.tint(p.accent, 0.45)), p.accent),
+            Kind::Primary => (
+                if hovered { p.action_hover } else { p.action_bg },
+                Stroke::NONE,
+                p.action_fg,
+            ),
+            Kind::Danger => (
+                p.danger,
+                Stroke::NONE,
+                if p.dark { p.background } else { Color32::WHITE },
+            ),
+            Kind::Secondary if self.selected => (
+                p.selected(),
+                Stroke::new(1_f32, p.tint(p.accent, 0.45)),
+                p.accent,
+            ),
             Kind::Secondary => {
-                let fill = if pressed { p.subtle } else if hovered { p.hover } else { p.surface };
+                let fill = if pressed {
+                    p.subtle
+                } else if hovered {
+                    p.hover
+                } else {
+                    p.surface
+                };
                 match self.tone.filter(|t| *t != Tone::Neutral) {
                     // A toned secondary (e.g. Disconnect): colored ink, tinted border.
-                    Some(t) => (if hovered { p.soft(p.tone(t)) } else { fill }, Stroke::new(1_f32, p.tint(p.tone(t), if hovered { 0.7 } else { 0.45 })), p.tone(t)),
-                    None => (fill, Stroke::new(1_f32, if hovered { p.faint } else { p.control_border }), p.foreground),
+                    Some(t) => (
+                        if hovered { p.soft(p.tone(t)) } else { fill },
+                        Stroke::new(1_f32, p.tint(p.tone(t), if hovered { 0.7 } else { 0.45 })),
+                        p.tone(t),
+                    ),
+                    None => (
+                        fill,
+                        Stroke::new(1_f32, if hovered { p.faint } else { p.control_border }),
+                        p.foreground,
+                    ),
                 }
             }
             Kind::Ghost => (
-                if hovered || self.selected { p.subtle } else { Color32::TRANSPARENT },
+                if hovered || self.selected {
+                    p.subtle
+                } else {
+                    Color32::TRANSPARENT
+                },
                 Stroke::NONE,
                 self.tone.map_or(p.foreground, |t| p.tone(t)),
             ),
         };
-        let (fill, ink) = if self.enabled { (fill, ink) } else { (if self.kind == Kind::Ghost { fill } else { p.subtle }, p.faint) };
+        let (fill, ink) = if self.enabled {
+            (fill, ink)
+        } else {
+            (
+                if self.kind == Kind::Ghost {
+                    fill
+                } else {
+                    p.subtle
+                },
+                p.faint,
+            )
+        };
         let painter = ui.painter();
-        painter.rect(rect, RADIUS_CONTROL, fill, if self.enabled { stroke } else { Stroke::NONE }, egui::StrokeKind::Inside);
+        painter.rect(
+            rect,
+            RADIUS_CONTROL,
+            fill,
+            if self.enabled { stroke } else { Stroke::NONE },
+            egui::StrokeKind::Inside,
+        );
         let mut x = rect.center().x - content / 2.;
         if let Some(icon) = self.icon {
             crate::icons::paint_sized(painter, pos2(x + 8., rect.center().y), icon, 16., ink);
@@ -117,7 +192,10 @@ impl<'a> Button<'a> {
         painter.galley(pos2(x, rect.center().y - galley.size().y / 2.), galley, ink);
         if let Some(c) = count {
             let x = rect.center().x + content / 2. - count_w + 6.;
-            let pill = Rect::from_min_size(pos2(x - 4., rect.center().y - 8.), vec2(c.size().x + 8., 16.));
+            let pill = Rect::from_min_size(
+                pos2(x - 4., rect.center().y - 8.),
+                vec2(c.size().x + 8., 16.),
+            );
             let pill_fill = match self.kind {
                 Kind::Primary | Kind::Danger => Color32::from_white_alpha(50),
                 _ if self.selected => p.tint(p.accent, 0.25),
@@ -128,7 +206,9 @@ impl<'a> Button<'a> {
         }
         focus_ring(ui, &response);
         let label = full_label.to_owned();
-        response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, self.enabled, self.selected, &label));
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::Role::Button, self.enabled, self.selected, &label)
+        });
         if self.text.is_empty() && !full_label.is_empty() {
             return response.on_hover_text(full_label);
         }
@@ -142,30 +222,62 @@ pub fn action(ui: &mut Ui, text: &str, enabled: bool) -> bool {
 }
 /// Secondary button with a minimum width.
 pub fn button(ui: &mut Ui, text: &str, width: f32, enabled: bool) -> Response {
-    Button::secondary(text).width(width).enabled(enabled).show(ui)
+    Button::secondary(text)
+        .width(width)
+        .enabled(enabled)
+        .show(ui)
 }
 
 /// Button that turns into "■ done/total" with a progress line while its task runs.
 /// Its width is the widest of both states, so neighbors never move.
-pub fn task_button(ui: &mut Ui, icon: Icon, idle: &str, width: f32, running: Option<(u64, Option<u64>)>, enabled: bool) -> Response {
-    let measure = |ui: &Ui, text: &str| ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(theme::BODY), Color32::PLACEHOLDER).size().x + 16. + 6. + 20.;
+pub fn task_button(
+    ui: &mut Ui,
+    icon: Icon,
+    idle: &str,
+    running: Option<(u64, Option<u64>)>,
+    enabled: bool,
+) -> Response {
+    let measure = |ui: &Ui, text: &str| {
+        ui.painter()
+            .layout_no_wrap(
+                text.to_owned(),
+                FontId::proportional(theme::BODY),
+                Color32::PLACEHOLDER,
+            )
+            .size()
+            .x
+            + 16.
+            + 6.
+            + 20.
+    };
     let sample = match running.and_then(|r| r.1) {
         Some(t) => format!("{t}/{t}"),
         None => "888/888".into(),
     };
-    let width = width.max(measure(ui, idle)).max(measure(ui, &sample)).ceil();
+    let width = measure(ui, idle).max(measure(ui, &sample)).ceil();
     let response = match running {
-        None => Button::secondary(idle).icon(icon).width(width).enabled(enabled).show(ui),
+        None => Button::secondary(idle)
+            .icon(icon)
+            .width(width)
+            .enabled(enabled)
+            .show(ui),
         Some((done, total)) => {
             let text = match total {
                 Some(t) => format!("{done}/{t}"),
                 None => "Stop".into(),
             };
-            Button::secondary(&text).icon(Icon::Stop).width(width).show(ui)
+            Button::secondary(&text)
+                .icon(Icon::Stop)
+                .width(width)
+                .show(ui)
         }
     };
     if let Some((done, Some(total))) = running.filter(|r| r.1.is_some_and(|t| t > 0)) {
-        progress_line(ui, response.rect.shrink2(vec2(3., 1.)), done as f32 / total as f32);
+        progress_line(
+            ui,
+            response.rect.shrink2(vec2(3., 1.)),
+            done as f32 / total as f32,
+        );
     }
     if running.is_some() {
         response.on_hover_text(format!("Stop {}", idle.to_lowercase()))
@@ -190,8 +302,17 @@ pub fn toggle(ui: &mut Ui, value: &mut bool, label: &str) -> Response {
 pub fn toggle_named(ui: &mut Ui, value: &mut bool, label: &str, accessible: &str) -> Response {
     let p = theme::palette(ui);
     let enabled = ui.is_enabled();
-    let text = ui.painter().layout_no_wrap(label.to_owned(), FontId::proportional(theme::BODY), Color32::PLACEHOLDER);
-    let width = 30. + if label.is_empty() { 0. } else { 8. + text.size().x };
+    let text = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::proportional(theme::BODY),
+        Color32::PLACEHOLDER,
+    );
+    let width = 30.
+        + if label.is_empty() {
+            0.
+        } else {
+            8. + text.size().x
+        };
     let (rect, mut response) = ui.allocate_exact_size(vec2(width, CONTROL), Sense::click());
     if response.clicked() {
         *value = !*value;
@@ -200,18 +321,35 @@ pub fn toggle_named(ui: &mut Ui, value: &mut bool, label: &str, accessible: &str
     let how_on = ui.ctx().animate_bool_responsive(response.id, *value);
     let track = Rect::from_center_size(rect.left_center() + vec2(15., 0.), vec2(30., 18.));
     let off = p.control_border;
-    let ink = if !enabled { p.subtle } else { off.lerp_to_gamma(p.action_bg, how_on) };
+    let ink = if !enabled {
+        p.subtle
+    } else {
+        off.lerp_to_gamma(p.action_bg, how_on)
+    };
     ui.painter().rect_filled(track, 9, ink);
     let knob = pos2(track.left() + 9. + how_on * 12., track.center().y);
-    ui.painter().circle_filled(knob + vec2(0., 0.5), 7., Color32::from_black_alpha(30));
-    ui.painter().circle_filled(knob, 7., if enabled { Color32::WHITE } else { p.surface });
+    ui.painter()
+        .circle_filled(knob + vec2(0., 0.5), 7., Color32::from_black_alpha(30));
+    ui.painter()
+        .circle_filled(knob, 7., if enabled { Color32::WHITE } else { p.surface });
     if !label.is_empty() {
-        ui.painter().galley(pos2(track.right() + 8., rect.center().y - text.size().y / 2.), text, if enabled { p.foreground } else { p.faint });
+        ui.painter().galley(
+            pos2(track.right() + 8., rect.center().y - text.size().y / 2.),
+            text,
+            if enabled { p.foreground } else { p.faint },
+        );
     }
     if response.has_focus() {
-        ui.painter().rect_stroke(track.expand(2.), 11, Stroke::new(2_f32, p.accent), egui::StrokeKind::Outside);
+        ui.painter().rect_stroke(
+            track.expand(2.),
+            11,
+            Stroke::new(2_f32, p.accent),
+            egui::StrokeKind::Outside,
+        );
     }
-    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, *value, accessible));
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, *value, accessible)
+    });
     response
 }
 
@@ -219,27 +357,64 @@ pub fn toggle_named(ui: &mut Ui, value: &mut bool, label: &str, accessible: &str
 pub fn segmented<T: Copy + PartialEq>(ui: &mut Ui, value: &mut T, options: &[(T, &str)]) -> bool {
     let before = *value;
     let p = theme::palette(ui);
-    egui::Frame::NONE.fill(p.subtle).corner_radius(RADIUS_CONTROL).inner_margin(2).show(ui, |ui| {
-        ui.spacing_mut().item_spacing.x = 2.;
-        ui.horizontal(|ui| {
-            for (option, label) in options {
-                let active = *value == *option;
-                let galley = ui.painter().layout_no_wrap((*label).to_owned(), FontId::proportional(theme::SMALL), Color32::PLACEHOLDER);
-                let (rect, r) = ui.allocate_exact_size(vec2(galley.size().x + 20., CONTROL - 4.), Sense::click());
-                if active {
-                    ui.painter().rect(rect, RADIUS_CONTROL - 1, p.surface, Stroke::new(1_f32, p.border), egui::StrokeKind::Inside);
-                } else if r.hovered() {
-                    ui.painter().rect_filled(rect, RADIUS_CONTROL - 1, p.hover);
+    egui::Frame::NONE
+        .fill(p.subtle)
+        .corner_radius(RADIUS_CONTROL)
+        .inner_margin(2)
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 2.;
+            ui.horizontal(|ui| {
+                for (option, label) in options {
+                    let active = *value == *option;
+                    let galley = ui.painter().layout_no_wrap(
+                        (*label).to_owned(),
+                        FontId::proportional(theme::SMALL),
+                        Color32::PLACEHOLDER,
+                    );
+                    let (rect, r) = ui.allocate_exact_size(
+                        vec2(galley.size().x + 20., CONTROL - 4.),
+                        Sense::click(),
+                    );
+                    if active {
+                        ui.painter().rect(
+                            rect,
+                            RADIUS_CONTROL - 1,
+                            p.surface,
+                            Stroke::new(1_f32, p.border),
+                            egui::StrokeKind::Inside,
+                        );
+                    } else if r.hovered() {
+                        ui.painter().rect_filled(rect, RADIUS_CONTROL - 1, p.hover);
+                    }
+                    let ink = if active { p.foreground } else { p.muted };
+                    ui.painter()
+                        .galley(rect.center() - galley.size() / 2., galley, ink);
+                    focus_ring(ui, &r);
+                    r.widget_info(|| {
+                        egui::WidgetInfo::selected(egui::Role::RadioButton, true, active, *label)
+                    });
+                    if r.clicked() {
+                        *value = *option;
+                    }
                 }
-                let ink = if active { p.foreground } else { p.muted };
-                ui.painter().galley(rect.center() - galley.size() / 2., galley, ink);
-                focus_ring(ui, &r);
-                r.widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, true, active, *label));
-                if r.clicked() {
-                    *value = *option;
-                }
-            }
+            });
         });
-    });
     *value != before
+}
+
+/// The button of a toolbar tool: icon, label and a count badge; pressed while
+/// its panel is open. Phones show the icon only (the label becomes the tooltip).
+pub fn tool_button(ui: &mut Ui, icon: Icon, label: &str, count: usize, open: bool) -> Response {
+    let text = if phone(ui) { "" } else { label };
+    let r = Button::secondary(text)
+        .icon(icon)
+        .count((count > 0).then_some(count))
+        .selected(open)
+        .show(ui);
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+    if text.is_empty() {
+        r.on_hover_text(label)
+    } else {
+        r
+    }
 }

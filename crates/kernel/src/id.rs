@@ -1,16 +1,17 @@
 use crate::store::{
-    rusqlite::{
-        self,
-        types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef},
-        ToSql,
-    },
     ColumnType, PrimaryKey,
+    rusqlite::{
+        self, ToSql,
+        types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef},
+    },
 };
 use std::{fmt, str::FromStr};
 use uuid::Uuid;
 
 /// Stable record identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct Id(pub Uuid);
 impl Id {
     pub fn random() -> Self {
@@ -77,7 +78,10 @@ macro_rules! sql_text {
             const SQL_TYPE: &'static str = "TEXT";
         }
         impl $crate::store::rusqlite::ToSql for $ty {
-            fn to_sql(&self) -> $crate::store::rusqlite::Result<$crate::store::rusqlite::types::ToSqlOutput<'_>> {
+            fn to_sql(
+                &self,
+            ) -> $crate::store::rusqlite::Result<$crate::store::rusqlite::types::ToSqlOutput<'_>>
+            {
                 Ok(self.to_string().into())
             }
         }

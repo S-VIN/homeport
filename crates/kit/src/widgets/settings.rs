@@ -8,7 +8,8 @@ pub fn settings_row(ui: &mut Ui, label: &str, help: &str, control: impl FnOnce(&
         ui,
         label,
         |ui| {
-            let response = ui.add(egui::Label::new(RichText::new(label).color(p.foreground)).wrap());
+            let response =
+                ui.add(egui::Label::new(RichText::new(label).color(p.foreground)).wrap());
             if !help.is_empty() {
                 response.on_hover_text(help);
             }
@@ -17,8 +18,14 @@ pub fn settings_row(ui: &mut Ui, label: &str, help: &str, control: impl FnOnce(&
     );
 }
 /// [`settings_row`] with custom content on the left (title with badges, notes…).
-pub fn settings_item(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, left: impl FnOnce(&mut Ui), control: impl FnOnce(&mut Ui)) {
-    let first = ui.data_mut(|d| std::mem::replace(d.get_temp_mut_or(settings_first(), false), false));
+pub fn settings_item(
+    ui: &mut Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    left: impl FnOnce(&mut Ui),
+    control: impl FnOnce(&mut Ui),
+) {
+    let first =
+        ui.data_mut(|d| std::mem::replace(d.get_temp_mut_or(settings_first(), false), false));
     if !first {
         separator(ui);
     }
@@ -32,7 +39,10 @@ pub fn settings_item(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, le
     let narrow = ui.available_width() - control_width - theme::SPACE_L < 170.;
     let remember = |ui: &mut Ui, sizes: (f32, f32, f32)| {
         let old = (control_width, control_height, text_height);
-        if (sizes.0 - old.0).abs() > 0.5 || (sizes.1 - old.1).abs() > 0.5 || (sizes.2 - old.2).abs() > 0.5 {
+        if (sizes.0 - old.0).abs() > 0.5
+            || (sizes.1 - old.1).abs() > 0.5
+            || (sizes.2 - old.2).abs() > 0.5
+        {
             ui.data_mut(|d| d.insert_temp(id, sizes));
             ui.ctx().request_discard("settings row resized");
         }
@@ -49,9 +59,11 @@ pub fn settings_item(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, le
         .inner
     };
     let place_control = |ui: &mut Ui, height: f32| -> egui::Vec2 {
-        ui.allocate_ui_with_layout(vec2(ui.available_width(), height), Layout::left_to_right(Align::Center), |ui| {
-            ui.scope(control).response.rect.size()
-        })
+        ui.allocate_ui_with_layout(
+            vec2(ui.available_width(), height),
+            Layout::left_to_right(Align::Center),
+            |ui| ui.scope(control).response.rect.size(),
+        )
         .inner
     };
     if narrow {
@@ -62,14 +74,20 @@ pub fn settings_item(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, le
         ui.add_space(SETTINGS_PAD);
         return;
     }
-    ui.allocate_ui_with_layout(vec2(ui.available_width(), row), Layout::left_to_right(Align::Center), |ui| {
-        let total = ui.available_width();
-        let label_width = (total - control_width - theme::SPACE_L).max(120.);
-        let t = text(ui, label_width, row, Box::new(left));
-        ui.add_space((total - label_width - control_width - theme::HORIZONTAL_GAP * 2.).max(0.));
-        let c = place_control(ui, row);
-        remember(ui, (c.x, c.y, t));
-    });
+    ui.allocate_ui_with_layout(
+        vec2(ui.available_width(), row),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            let total = ui.available_width();
+            let label_width = (total - control_width - theme::SPACE_L).max(120.);
+            let t = text(ui, label_width, row, Box::new(left));
+            ui.add_space(
+                (total - label_width - control_width - theme::HORIZONTAL_GAP * 2.).max(0.),
+            );
+            let c = place_control(ui, row);
+            remember(ui, (c.x, c.y, t));
+        },
+    );
     ui.add_space(SETTINGS_PAD);
 }
 const SETTINGS_PAD: f32 = 7.;
@@ -95,34 +113,56 @@ const PERIODS: [(u32, &str); 7] = [
 /// Returns true when the user committed a new value.
 pub fn interval(ui: &mut Ui, id: impl egui::AsIdSalt, value: &mut u32) -> bool {
     let key = egui::Id::unique(("kit-interval", id));
-    let mut custom: bool = ui.data(|d| d.get_temp(key.with("custom"))).unwrap_or(false) || !PERIODS.iter().any(|(s, _)| s == value);
-    let mut unit: u32 = ui.data(|d| d.get_temp(key.with("unit"))).unwrap_or(if value.is_multiple_of(3600) { 3600 } else { 60 });
-    let mut amount: u32 = ui.data(|d| d.get_temp(key.with("amount"))).unwrap_or((*value / unit).max(1));
+    let mut custom: bool = ui.data(|d| d.get_temp(key.with("custom"))).unwrap_or(false)
+        || !PERIODS.iter().any(|(s, _)| s == value);
+    let mut unit: u32 = ui
+        .data(|d| d.get_temp(key.with("unit")))
+        .unwrap_or(if value.is_multiple_of(3600) { 3600 } else { 60 });
+    let mut amount: u32 = ui
+        .data(|d| d.get_temp(key.with("amount")))
+        .unwrap_or((*value / unit).max(1));
     let mut next = None;
     ui.push_id(key, |ui| {
         if custom {
             let r = ui.add_sized(
                 [56., CONTROL],
-                egui::DragValue::new(&mut amount).range(1..=if unit == 60 { 10_080 } else { 168 }).speed(0.2),
+                egui::DragValue::new(&mut amount)
+                    .range(1..=if unit == 60 { 10_080 } else { 168 })
+                    .speed(0.2),
             );
             if crate::widgets::committed(ui, &r) || r.drag_stopped() {
                 next = Some(amount * unit);
             }
             let units = [(60, "minutes"), (3600, "hours")];
-            let label = units.iter().find(|(u, _)| *u == unit).map_or("minutes", |(_, l)| l);
+            let label = units
+                .iter()
+                .find(|(u, _)| *u == unit)
+                .map_or("minutes", |(_, l)| l);
             select(ui, "unit", label, 92., |ui| {
                 for (u, l) in units {
                     if ui.selectable_value(&mut unit, u, l).clicked() {
-                        amount = ((*value + u / 2) / u).clamp(1, if u == 60 { 10_080 } else { 168 });
+                        amount =
+                            ((*value + u / 2) / u).clamp(1, if u == 60 { 10_080 } else { 168 });
                         next = Some(amount * u);
                     }
                 }
             });
         }
-        let label = if custom { "Custom".to_owned() } else { PERIODS.iter().find(|(s, _)| s == value).map_or("Custom", |(_, l)| l).to_owned() };
+        let label = if custom {
+            "Custom".to_owned()
+        } else {
+            PERIODS
+                .iter()
+                .find(|(s, _)| s == value)
+                .map_or("Custom", |(_, l)| l)
+                .to_owned()
+        };
         select(ui, "preset", &label, 150., |ui| {
             for (secs, text) in PERIODS {
-                if ui.selectable_label(!custom && *value == secs, text).clicked() {
+                if ui
+                    .selectable_label(!custom && *value == secs, text)
+                    .clicked()
+                {
                     custom = false;
                     next = Some(secs);
                 }

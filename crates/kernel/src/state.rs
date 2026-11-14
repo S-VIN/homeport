@@ -1,10 +1,10 @@
 //! Typed state cells, immutable snapshots and copy-on-write transactions.
 use crate::{
+    Id, Kernel, Result,
     setup::Registry,
     store::{Store, Table, Tx},
-    Id, Kernel, Result,
 };
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{any::Any, collections::HashMap, marker::PhantomData, sync::Arc};
 
 /// A typed key into the shared state. Declare it as a `pub static` so other
@@ -20,7 +20,10 @@ pub struct State<T: 'static> {
 impl<T> State<T> {
     /// The name must start with the owning plugin id and a dot.
     pub const fn new(name: &'static str) -> Self {
-        Self { name, _t: PhantomData }
+        Self {
+            name,
+            _t: PhantomData,
+        }
     }
 }
 
@@ -58,16 +61,21 @@ impl Snapshot {
     /// Read a state cell. Panics if its plugin is not enabled — list it in `requires`.
     pub fn get<T: Send + Sync + 'static>(&self, s: &State<T>) -> Arc<T> {
         self.try_get(s).unwrap_or_else(|| {
-            panic!("state {} is not available; is its plugin enabled and listed in `requires`?", s.name)
+            panic!(
+                "state {} is not available; is its plugin enabled and listed in `requires`?",
+                s.name
+            )
         })
     }
     /// Read a state cell of an optional plugin.
     pub fn try_get<T: Send + Sync + 'static>(&self, s: &State<T>) -> Option<Arc<T>> {
         self.cells.get(s.name).map(|c| {
-            c.value
-                .clone()
-                .downcast::<T>()
-                .unwrap_or_else(|_| panic!("state {} read with the wrong type (a live state is read with `live`)", s.name))
+            c.value.clone().downcast::<T>().unwrap_or_else(|_| {
+                panic!(
+                    "state {} read with the wrong type (a live state is read with `live`)",
+                    s.name
+                )
+            })
         })
     }
     /// The latest value of a live state (see [`Setup::live`](crate::Setup::live)).
@@ -81,8 +89,16 @@ impl Snapshot {
         self.rev
     }
     /// Ask every plugin that answers a [`Hook`](crate::Hook).
-    pub fn hooks<I: ?Sized + 'static, O: 'static>(&self, hook: &crate::Hook<I, O>, input: &I) -> Vec<O> {
-        self.reg.hook_fns(hook).iter().map(|f| f(self, input)).collect()
+    pub fn hooks<I: ?Sized + 'static, O: 'static>(
+        &self,
+        hook: &crate::Hook<I, O>,
+        input: &I,
+    ) -> Vec<O> {
+        self.reg
+            .hook_fns(hook)
+            .iter()
+            .map(|f| f(self, input))
+            .collect()
     }
     pub(crate) fn with(&self, changed: HashMap<&'static str, Value>) -> Snapshot {
         let rev = self.rev + 1;
@@ -90,7 +106,11 @@ impl Snapshot {
         for (k, v) in changed {
             cells.insert(k, Cell { value: v });
         }
-        Snapshot { cells: Arc::new(cells), reg: self.reg.clone(), rev }
+        Snapshot {
+            cells: Arc::new(cells),
+            reg: self.reg.clone(),
+            rev,
+        }
     }
 }
 
@@ -106,7 +126,12 @@ pub struct Write<'a> {
 }
 impl<'a> Write<'a> {
     pub(crate) fn new(base: &'a Snapshot, plugin: Option<usize>) -> Self {
-        Self { base, changed: HashMap::new(), events: Vec::new(), plugin }
+        Self {
+            base,
+            changed: HashMap::new(),
+            events: Vec::new(),
+            plugin,
+        }
     }
     /// The snapshot this transaction started from.
     pub fn base(&self) -> &Snapshot {
@@ -120,7 +145,11 @@ impl<'a> Write<'a> {
         }
     }
     /// Modify a cell this plugin owns.
-    pub fn update<T: Clone + Send + Sync + 'static, R>(&mut self, s: &State<T>, f: impl FnOnce(&mut T) -> R) -> R {
+    pub fn update<T: Clone + Send + Sync + 'static, R>(
+        &mut self,
+        s: &State<T>,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> R {
         self.check(s.name);
         let base = self.base;
         let entry = self
@@ -159,9 +188,12 @@ pub struct Changed {
 // ---- persistence ----------------------------------------------------------
 
 pub(crate) struct Persist {
-    pub register: Box<dyn Fn(&Store) -> Result<()> + Send + Sync>,
+    /// Create or update the storage; `strict` after migrations ran.
+    pub register: Box<dyn Fn(&Store, bool) -> Result<()> + Send + Sync>,
     pub load: Box<dyn Fn(&Tx<'_>) -> Result<Value> + Send + Sync>,
     pub save: Box<dyn Fn(&Tx<'_>, &Value, &Value) -> Result<()> + Send + Sync>,
+    /// The value to start with when the saved one cannot be read (settings).
+    pub fallback: Option<Box<dyn Fn() -> Value + Send + Sync>>,
 }
 
 #[derive(crate::Table, Serialize, Deserialize, Clone, PartialEq)]
@@ -177,6 +209,13 @@ pub(crate) struct SettingRow {
     pub id: String,
     pub json: String,
 }
+/// A plugin migration that ran: `plugin|version`.
+#[derive(crate::Table, Serialize, Deserialize, Clone, PartialEq)]
+#[table(name = "kernel_migrations")]
+pub(crate) struct MigrationRow {
+    pub id: String,
+    pub at: i64,
+}
 #[derive(crate::Table, Serialize, Deserialize, Clone, PartialEq)]
 #[table(name = "kernel_plugins")]
 pub(crate) struct PluginRow {
@@ -188,24 +227,29 @@ fn typed<T: 'static>(v: &Value) -> &T {
     v.downcast_ref::<T>().expect("persisted state type")
 }
 
-fn sync_rows<T: Record>(tx: &Tx<'_>, before: &[T], after: &[T]) -> Result<()> {
+fn sync_rows<T: Record>(tx: &Tx<'_>, table: &str, before: &[T], after: &[T]) -> Result<()> {
     let mut old: HashMap<Id, &T> = before.iter().map(|v| (v.id(), v)).collect();
     for v in after {
         if old.remove(&v.id()) != Some(v) {
-            tx.put(v)?;
+            tx.put_in(table, v)?;
         }
     }
     for id in old.keys() {
-        tx.delete::<T>(id)?;
+        tx.delete_in::<T>(table, id)?;
     }
     Ok(())
 }
 
-pub(crate) fn list<T: Record + DeserializeOwned>(name: &'static str, ordered: bool) -> Persist {
+/// A list stored in `table`, one row per item (`ordered` keeps positions).
+pub(crate) fn list<T: Record + DeserializeOwned>(
+    name: &'static str,
+    ordered: bool,
+    table: &'static str,
+) -> Persist {
     Persist {
-        register: Box::new(|s| s.register::<T>()),
+        register: Box::new(move |s, strict| s.register_in::<T>(table, strict)),
         load: Box::new(move |tx| {
-            let mut rows: Vec<T> = tx.all()?;
+            let mut rows: Vec<T> = tx.all_in(table)?;
             if ordered {
                 let pos: HashMap<String, u32> = tx
                     .all::<OrderRow>()?
@@ -213,43 +257,65 @@ pub(crate) fn list<T: Record + DeserializeOwned>(name: &'static str, ordered: bo
                     .filter(|r| r.list == name)
                     .map(|r| (r.id, r.position))
                     .collect();
-                rows.sort_by_key(|r| pos.get(&format!("{name}|{}", r.id())).copied().unwrap_or(u32::MAX));
+                rows.sort_by_key(|r| {
+                    pos.get(&format!("{name}|{}", r.id()))
+                        .copied()
+                        .unwrap_or(u32::MAX)
+                });
             }
             Ok(Arc::new(rows) as Value)
         }),
         save: Box::new(move |tx, before, after| {
             let (before, after) = (typed::<Vec<T>>(before), typed::<Vec<T>>(after));
-            sync_rows(tx, before, after)?;
+            sync_rows(tx, table, before, after)?;
             if ordered {
-                let ids = |v: &[T]| v.iter().map(|r| r.id()).collect::<Vec<_>>();
-                if ids(before) != ids(after) {
-                    for r in before {
-                        tx.delete::<OrderRow>(format!("{name}|{}", r.id()).as_str())?;
-                    }
-                    for (i, r) in after.iter().enumerate() {
-                        tx.put(&OrderRow { id: format!("{name}|{}", r.id()), list: name.into(), position: i as u32 })?;
-                    }
+                // Only rows whose position changed are written.
+                let old: HashMap<Id, usize> = before
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| (r.id(), i))
+                    .collect();
+                let new: HashMap<Id, usize> =
+                    after.iter().enumerate().map(|(i, r)| (r.id(), i)).collect();
+                for id in old.keys().filter(|id| !new.contains_key(id)) {
+                    tx.delete::<OrderRow>(format!("{name}|{id}").as_str())?;
+                }
+                for (id, &i) in new.iter().filter(|(id, i)| old.get(id) != Some(i)) {
+                    tx.put(&OrderRow {
+                        id: format!("{name}|{id}"),
+                        list: name.into(),
+                        position: i as u32,
+                    })?;
                 }
             }
             Ok(())
         }),
+        fallback: None,
     }
 }
 
-pub(crate) fn setting<T: Serialize + DeserializeOwned + Default + Send + Sync + 'static>(name: &'static str) -> Persist {
+pub(crate) fn setting<T: Serialize + DeserializeOwned + Default + Send + Sync + 'static>(
+    name: &'static str,
+) -> Persist {
     Persist {
-        register: Box::new(|_| Ok(())),
+        register: Box::new(|_, _| Ok(())),
         load: Box::new(move |tx| {
             let value: T = match tx.get::<SettingRow>(name)? {
-                Some(row) => serde_json::from_str(&row.json)
-                    .map_err(|_| crate::Error::msg(format!("Invalid saved setting: {name}")))?,
+                Some(row) => serde_json::from_str(&row.json).map_err(|_| {
+                    crate::Error::new("setting", format!("Invalid saved setting: {name}"))
+                })?,
                 None => T::default(),
             };
             Ok(Arc::new(value) as Value)
         }),
         save: Box::new(move |tx, _, after| {
-            let json = serde_json::to_string(typed::<T>(after)).map_err(|e| crate::Error::msg(e.to_string()))?;
-            tx.put(&SettingRow { id: name.into(), json })
+            let json = serde_json::to_string(typed::<T>(after))
+                .map_err(|e| crate::Error::msg(e.to_string()))?;
+            tx.put(&SettingRow {
+                id: name.into(),
+                json,
+            })
         }),
+        fallback: Some(Box::new(|| Arc::new(T::default()) as Value)),
     }
 }

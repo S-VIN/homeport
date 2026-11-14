@@ -7,25 +7,27 @@
 pub use crate::icons::Icon;
 pub use crate::palette::Tone;
 pub(crate) use crate::theme::{self, CONTROL, INSET, RADIUS, RADIUS_CONTROL};
-pub(crate) use egui::{pos2, vec2, Align, Color32, FontId, Layout, Rect, Response, RichText, Sense, Stroke, Ui};
+pub(crate) use egui::{
+    Align, Color32, FontId, Layout, Rect, Response, RichText, Sense, Stroke, Ui, pos2, vec2,
+};
 pub(crate) use std::fmt::Display;
 
-mod text;
-mod icon_buttons;
 mod buttons;
+mod format;
+mod icon_buttons;
 mod inputs;
 mod page;
-mod settings;
 mod pieces;
 mod properties;
-mod format;
+mod settings;
+mod text;
 
-pub use text::*;
-pub use icon_buttons::*;
 pub use buttons::*;
+pub use format::*;
+pub use icon_buttons::*;
 pub use inputs::*;
 pub use page::*;
-pub use settings::*;
 pub use pieces::*;
 pub use properties::*;
-pub use format::*;
+pub use settings::*;
+pub use text::*;

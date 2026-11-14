@@ -2,7 +2,7 @@
 # Build from the repository root: docker build -f docker/Dockerfile .
 # rust-toolchain.toml is the source of truth for Rust: rustup installs that
 # version automatically if this image tag ever falls behind it.
-FROM rust:1.99.1-bookworm AS build
+FROM rust:1.100.0-trixie AS build
 WORKDIR /src
 COPY . .
 ARG TARGETARCH
@@ -15,7 +15,7 @@ RUN --mount=type=cache,id=rproxy-cargo-registry,target=/usr/local/cargo/registry
     && cp target/release/rproxy /rproxy \
     && python3 scripts/mihomo.py --os linux --arch "$TARGETARCH" --output /core
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir /data

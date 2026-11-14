@@ -28,12 +28,10 @@ pub static PLUGIN: Plugin = Plugin {
     id: "vless-server",
     name: "VLESS server",
     description: "Let other devices connect to this machine over VLESS with REALITY and XHTTP, disguised as your own website.",
-    category: categories::NETWORK,
     requires: &["servers"],
-    required: false,
     default_enabled: false,
-    platforms: Platform::ALL,
     setup,
+    ..Plugin::DEFAULT
 };
 
 choices!(pub enum Website {
@@ -99,7 +97,7 @@ impl Op for SetEnabled {
 }
 
 pub fn generate_keys() -> Keys {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     let secret = x25519_dalek::StaticSecret::from(random_bytes::<32>());
     let public = x25519_dalek::PublicKey::from(&secret);
     let site_port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -310,7 +308,9 @@ fn setup(p: &mut Setup) -> Result<()> {
             })
         },
         |cx: Cx, spec: site::Spec| async move {
-            site::run(spec, move |state| cx.set_live(&CERTIFICATE, state)).await.map_err(Error::msg)
+            site::run(spec, move |state| cx.set_live(&CERTIFICATE, state))
+                .await
+                .map_err(Error::msg)
         },
     );
     ui(p);
@@ -345,7 +345,14 @@ fn status_rows(ui: &mut egui::Ui, cx: &mut UiCx) {
             Icon::Error,
             pal.danger,
             "Listener",
-            &format!("{e}{}", if cfg!(target_os = "linux") && c.port < 1024 { " Ports below 1024 need root or CAP_NET_BIND_SERVICE." } else { "" }),
+            &format!(
+                "{e}{}",
+                if cfg!(target_os = "linux") && c.port < 1024 {
+                    " Ports below 1024 need root or CAP_NET_BIND_SERVICE."
+                } else {
+                    ""
+                }
+            ),
         ),
         None if listener(&snap).is_some() && core.running() => line(
             ui,
@@ -360,9 +367,24 @@ fn status_rows(ui: &mut egui::Ui, cx: &mut UiCx) {
         let (icon, color, text) = match &*snap.live(&CERTIFICATE) {
             _ if !c.enabled => (Icon::Info, pal.muted, "Starts with the server".to_owned()),
             site::Certificate::Starting => (Icon::Info, pal.muted, "Starting…".to_owned()),
-            site::Certificate::SelfSigned(why) => (Icon::Warning, pal.warning, format!("Self-signed for now. {why}")),
-            site::Certificate::Issued => (Icon::Shield, pal.success, format!("Let's Encrypt certificate for {}", c.domain)),
-            site::Certificate::Failed(e) => (Icon::Error, pal.danger, format!("Let's Encrypt failed: {e}. Check that {} points to this machine and port {} is reachable.", c.domain, c.port)),
+            site::Certificate::SelfSigned(why) => (
+                Icon::Warning,
+                pal.warning,
+                format!("Self-signed for now. {why}"),
+            ),
+            site::Certificate::Issued => (
+                Icon::Shield,
+                pal.success,
+                format!("Let's Encrypt certificate for {}", c.domain),
+            ),
+            site::Certificate::Failed(e) => (
+                Icon::Error,
+                pal.danger,
+                format!(
+                    "Let's Encrypt failed: {e}. Check that {} points to this machine and port {} is reachable.",
+                    c.domain, c.port
+                ),
+            ),
         };
         line(ui, icon, color, "Website", &text);
     }
@@ -397,11 +419,14 @@ fn status_rows(ui: &mut egui::Ui, cx: &mut UiCx) {
                 {
                     cx.submit(
                         "exit-rule",
-                        Add::new(routing::Rule {
-                            id: Id::random(),
-                            pattern: "*".into(),
-                            action: routing::Route::Direct,
-                        }),
+                        Add::new(
+                            &routing::RULES,
+                            routing::Rule {
+                                id: Id::random(),
+                                pattern: "*".into(),
+                                action: routing::Route::Direct,
+                            },
+                        ),
                     );
                 }
             });
@@ -417,23 +442,35 @@ fn status_rows(ui: &mut egui::Ui, cx: &mut UiCx) {
 }
 
 fn ui(p: &mut Setup) {
-    p.page_fn(PageSpec { id: "vless-server", title: "VLESS server", icon: Icon::Shield, order: 55 }, |ui, cx| {
-        let snap = cx.snapshot().clone();
-        let c = (*snap.get(&CONFIG)).clone();
-        let clients = snap.get(&CLIENTS);
-        let counter = if c.enabled { format!("On · {}", kit::plural(clients.len(), "client", "clients")) } else { "Off".into() };
-        kit::page_header(ui, "VLESS server", &counter, |ui| {
-            let mut on = c.enabled;
-            if kit::toggle_named(ui, &mut on, "", "VLESS server").changed() {
-                cx.submit("enabled", SetEnabled(on));
-            }
-        });
+    p.page_fn(
+        PageSpec {
+            id: "vless-server",
+            title: "VLESS server",
+            icon: Icon::Shield,
+            order: 55,
+        },
+        |ui, cx| {
+            let snap = cx.snapshot().clone();
+            let c = (*snap.get(&CONFIG)).clone();
+            let clients = snap.get(&CLIENTS);
+            let counter = if c.enabled {
+                format!("On · {}", kit::plural(clients.len(), "client", "clients"))
+            } else {
+                "Off".into()
+            };
+            kit::page_header(ui, "VLESS server", &counter, |ui| {
+                let mut on = c.enabled;
+                if kit::toggle_named(ui, &mut on, "", "VLESS server").changed() {
+                    cx.submit("enabled", SetEnabled(on));
+                }
+            });
 
-        if let Some(why) = problem(&snap).filter(|_| c.enabled) {
-            kit::banner(ui, kit::Tone::Warning, why, None);
-        }
-        kit::page_scroll(ui, "vless-server", |ui| body(ui, cx, &c));
-    });
+            if let Some(why) = problem(&snap).filter(|_| c.enabled) {
+                kit::banner(ui, kit::Tone::Warning, why, None);
+            }
+            kit::page_scroll(ui, "vless-server", |ui| body(ui, cx, &c));
+        },
+    );
     status_chip(p);
 }
 
@@ -566,9 +603,7 @@ fn body(ui: &mut egui::Ui, cx: &mut UiCx, c: &Settings) {
             })
             .right(),
         )
-        .empty(
-            Icon::Users,
-            "No clients")
+        .empty(Icon::Users, "No clients")
         .show(ui, cx);
     // The QR code of one client, large enough for a phone camera.
     let snap = cx.snapshot().clone();
@@ -582,7 +617,11 @@ fn body(ui: &mut egui::Ui, cx: &mut UiCx, c: &Settings) {
                 ui.vertical(|ui| {
                     ui.label(kit::bold(client.name.clone(), theme::BODY));
                     ui.add_space(theme::SPACE_M);
-                    if kit::Button::secondary("Copy link").icon(Icon::Copy).show(ui).clicked() {
+                    if kit::Button::secondary("Copy link")
+                        .icon(Icon::Copy)
+                        .show(ui)
+                        .clicked()
+                    {
                         ui.ctx().copy_text(link(&snap, &client));
                         cx.notify("Link copied");
                     }
@@ -610,16 +649,12 @@ fn status_chip(p: &mut Setup) {
         let failed =
             cx.core_status().listener_errors.contains_key("vless") || problem(&snap).is_some();
         let color = if failed { pal.danger } else { pal.success };
-        if kit::chip(
+        cx.status_chip(
             ui,
-            Some(kit::Lead::Icon(Icon::Shield, color)),
+            kit::Lead::Icon(Icon::Shield, color),
             "VLESS server",
             "This machine accepts VLESS clients",
-        )
-        .clicked()
-        {
-            cx.navigate("vless-server");
-        }
+        );
     });
 }
 

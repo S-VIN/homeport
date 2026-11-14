@@ -1,6 +1,6 @@
 //! Explicit configuration exchange. Temporary files are private and removed on drop;
 //! no scheduled copies or backup directory are created.
-use crate::{store::Store, Error, Host, Kernel, Result};
+use crate::{Error, Host, Kernel, Result, store::Store};
 use std::{io::Write, path::Path, sync::Arc};
 
 pub const MAX_BYTES: usize = 32 * 1024 * 1024;
@@ -22,7 +22,10 @@ impl Host {
     /// Save beside the chosen destination, then atomically replace it. Never
     /// overwrite an installation's live database, lock, identity or sidecars.
     pub fn export_configuration_to(&self, path: &Path) -> Result<()> {
-        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
         let parent = parent.canonicalize().map_err(io)?;
         let live = self.dir.join(crate::host::DATABASE);
         if parent.starts_with(self.dir.canonicalize().map_err(io)?)
@@ -68,7 +71,11 @@ impl Host {
             .map_err(|_| Error::msg("This configuration is damaged or incompatible with this version of rproxy. Your settings have not changed."))?;
         let active = Kernel::load_configuration(&self.catalog, &candidate, scratch.path(), false)?;
         crate::core::compose(&active.reg, &active)?;
-        Ok(Arc::new(Import { name, size: bytes.len(), file }))
+        Ok(Arc::new(Import {
+            name,
+            size: bytes.len(),
+            file,
+        }))
     }
 }
 

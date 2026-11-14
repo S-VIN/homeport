@@ -1,7 +1,7 @@
 # Комплектные бинарники mihomo
 
-В Git хранятся шесть готовых бинарников **mihomo v1.19.32** из
-[официального релиза](https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.32).
+В Git хранятся шесть готовых бинарников **mihomo v1.19.34** из
+[официального релиза](https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.34).
 Это входные файлы сборки rproxy. Сам mihomo в CI не компилируется и не скачивается.
 
 | Платформа | Файл |

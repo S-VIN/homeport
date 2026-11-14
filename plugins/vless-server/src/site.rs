@@ -10,9 +10,10 @@
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::Full;
-use hyper::{body::Incoming, header, Request, Response, StatusCode};
+use hyper::{Request, Response, StatusCode, body::Incoming, header};
 use hyper_util::{rt::TokioExecutor, rt::TokioIo, server::conn::auto};
 use rustls_acme::{
+    AcmeConfig, EventOk, ResolvesServerCertAcme,
     caches::DirCache,
     rustls::{
         self,
@@ -21,7 +22,6 @@ use rustls_acme::{
         server::{ClientHello, ResolvesServerCert},
         sign::CertifiedKey,
     },
-    AcmeConfig, EventOk, ResolvesServerCertAcme,
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::net::TcpListener;
@@ -70,9 +70,7 @@ impl ResolvesServerCert for Resolver {
 fn self_signed(domain: &str) -> Result<Arc<CertifiedKey>, String> {
     let generated =
         rcgen::generate_simple_self_signed(vec![domain.to_owned()]).map_err(|e| e.to_string())?;
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-        generated.key_pair.serialize_der(),
-    ));
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(generated.key_pair.serialize_der()));
     let key = any_supported_type(&key).map_err(|e| e.to_string())?;
     Ok(Arc::new(CertifiedKey::new(
         vec![CertificateDer::from(generated.cert.der().to_vec())],

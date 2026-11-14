@@ -29,9 +29,11 @@ pub mod categories {
     /// The server catalog and everything that fills, filters or measures it.
     pub const SERVERS: Category = Category::new("servers", "Servers", Multiple);
     /// Parsers of subscription documents.
-    pub const FORMATS: Category = Category::new("subscription-format", "Subscription formats", Multiple);
+    pub const FORMATS: Category =
+        Category::new("subscription-format", "Subscription formats", Multiple);
     /// Strategies that pick the server automatically; one at a time.
-    pub const SERVER_SELECTION: Category = Category::new("server-selection", "Server selection", Exclusive);
+    pub const SERVER_SELECTION: Category =
+        Category::new("server-selection", "Server selection", Exclusive);
     /// Local traffic (routing, listeners) and desktop integration.
     pub const NETWORK: Category = Category::new("network", "Network & system", Multiple);
 }
@@ -47,7 +49,12 @@ pub enum Platform {
 }
 impl Platform {
     /// For plugins without OS-specific code.
-    pub const ALL: &'static [Platform] = &[Platform::Linux, Platform::Windows, Platform::Macos, Platform::Docker];
+    pub const ALL: &'static [Platform] = &[
+        Platform::Linux,
+        Platform::Windows,
+        Platform::Macos,
+        Platform::Docker,
+    ];
     /// For plugins that integrate with a desktop session.
     pub const DESKTOP: &'static [Platform] = &[Platform::Linux, Platform::Windows, Platform::Macos];
     /// The system this process runs on. Plugins may branch on it at runtime,
@@ -59,7 +66,9 @@ impl Platform {
         *CURRENT.get_or_init(|| {
             let container = cfg!(target_os = "linux")
                 && (std::env::var_os("RPROXY_DOCKER").is_some_and(|v| v == "1")
-                    || ["/.dockerenv", "/run/.containerenv"].iter().any(|f| std::path::Path::new(f).exists()));
+                    || ["/.dockerenv", "/run/.containerenv"]
+                        .iter()
+                        .any(|f| std::path::Path::new(f).exists()));
             if container {
                 Some(Platform::Docker)
             } else if cfg!(target_os = "linux") {
@@ -80,7 +89,9 @@ impl Platform {
     /// Flatpak's sandbox cannot configure the host system proxy or TUN through
     /// the native command integrations.
     pub fn is_flatpak() -> bool {
-        cfg!(target_os = "linux") && (std::env::var_os("FLATPAK_ID").is_some() || std::path::Path::new("/.flatpak-info").is_file())
+        cfg!(target_os = "linux")
+            && (std::env::var_os("FLATPAK_ID").is_some()
+                || std::path::Path::new("/.flatpak-info").is_file())
     }
     /// The AppImage file this process runs from. `APPIMAGE` alone is not
     /// enough: it leaks into programs the AppImage starts.
@@ -107,8 +118,13 @@ pub struct Plugin {
     pub name: &'static str,
     pub description: &'static str,
     pub category: Category,
-    /// Plugins that must be enabled for this one to work.
+    /// Plugin ids (or capabilities, see `provides`) that must be enabled
+    /// for this one to work.
     pub requires: &'static [&'static str],
+    /// Capabilities this plugin implements, e.g. `"health"` from
+    /// `rproxy_contracts::health`: another plugin can require the capability
+    /// instead of this plugin, so an alternative implementation fits in.
+    pub provides: &'static [&'static str],
     /// Required plugins cannot be disabled.
     pub required: bool,
     pub default_enabled: bool,
@@ -120,6 +136,22 @@ pub struct Plugin {
     pub setup: fn(&mut Setup) -> Result<()>,
 }
 impl Plugin {
+    /// The usual values; a plugin states only what differs:
+    /// `Plugin { id: "routing", name: "Routing", setup, ..Plugin::DEFAULT }`.
+    /// Off by default only with `default_enabled: false`; every system unless
+    /// `platforms` says otherwise.
+    pub const DEFAULT: Plugin = Plugin {
+        id: "",
+        name: "",
+        description: "",
+        category: categories::NETWORK,
+        requires: &[],
+        provides: &[],
+        required: false,
+        default_enabled: true,
+        platforms: Platform::ALL,
+        setup: |_| Ok(()),
+    };
     /// Whether the plugin runs on this system.
     pub fn supported(&self) -> bool {
         Platform::current().is_some_and(|p| self.platforms.contains(&p))
@@ -146,18 +178,49 @@ impl Plugin {
 mod tests {
     use super::*;
     fn plugin(platforms: &'static [Platform]) -> Plugin {
-        Plugin { id: "p", name: "P", description: "", category: categories::NETWORK, requires: &[], required: false, default_enabled: true, platforms, setup: |_| Ok(()) }
+        Plugin {
+            id: "p",
+            name: "P",
+            description: "",
+            category: categories::NETWORK,
+            requires: &[],
+            provides: &[],
+            required: false,
+            default_enabled: true,
+            platforms,
+            setup: |_| Ok(()),
+        }
     }
     #[test]
     fn platforms_decide_support_and_the_note() {
         assert!(plugin(Platform::ALL).supported());
         assert_eq!(plugin(Platform::ALL).platforms_note(), None);
-        assert_eq!(plugin(Platform::DESKTOP).platforms_note().as_deref(), Some("Desktop only"));
-        assert_eq!(plugin(&[Platform::Linux]).platforms_note().as_deref(), Some("Linux only"));
-        assert_eq!(plugin(&[Platform::Linux, Platform::Windows]).platforms_note().as_deref(), Some("Linux and Windows only"));
-        assert_eq!(plugin(&[Platform::Linux, Platform::Docker]).platforms_note().as_deref(), Some("Linux and Docker only"));
+        assert_eq!(
+            plugin(Platform::DESKTOP).platforms_note().as_deref(),
+            Some("Desktop only")
+        );
+        assert_eq!(
+            plugin(&[Platform::Linux]).platforms_note().as_deref(),
+            Some("Linux only")
+        );
+        assert_eq!(
+            plugin(&[Platform::Linux, Platform::Windows])
+                .platforms_note()
+                .as_deref(),
+            Some("Linux and Windows only")
+        );
+        assert_eq!(
+            plugin(&[Platform::Linux, Platform::Docker])
+                .platforms_note()
+                .as_deref(),
+            Some("Linux and Docker only")
+        );
         assert!(!plugin(&[]).supported());
-        let elsewhere: &'static [Platform] = if cfg!(windows) { &[Platform::Linux] } else { &[Platform::Windows] };
+        let elsewhere: &'static [Platform] = if cfg!(windows) {
+            &[Platform::Linux]
+        } else {
+            &[Platform::Windows]
+        };
         assert!(!plugin(elsewhere).supported());
     }
     #[test]
@@ -166,7 +229,10 @@ mod tests {
         assert_eq!(current, Platform::current());
         assert!(current.is_some());
         // Docker supports exactly the plugins that declare it.
-        assert_eq!(plugin(Platform::DESKTOP).supported(), current != Some(Platform::Docker));
+        assert_eq!(
+            plugin(Platform::DESKTOP).supported(),
+            current != Some(Platform::Docker)
+        );
         assert!(plugin(Platform::ALL).supported());
         assert!(Platform::appimage().is_none() || std::env::var_os("APPDIR").is_some());
     }

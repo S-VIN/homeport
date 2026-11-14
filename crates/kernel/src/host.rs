@@ -1,13 +1,13 @@
 //! The process-wide owner of the data directory and the running kernel.
 //! Restarting (after plugin changes) replaces the kernel; open windows and
 //! browser sessions keep running and simply draw the new one.
-use crate::{shell, store::Store, ui::SessionState, Error, Kernel, Plugin, Result};
+use crate::{Error, Kernel, Plugin, Result, shell, store::Store, ui::SessionState};
 use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, RwLock, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -41,8 +41,15 @@ impl Host {
         #[cfg(unix)]
         builder.mode(0o700);
         builder.create(dir).map_err(io)?;
-        let lock = fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("instance.lock")).map_err(io)?;
-        lock.try_lock().map_err(|_| Error::msg("This data directory is already open in another rproxy instance."))?;
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join("instance.lock"))
+            .map_err(io)?;
+        lock.try_lock().map_err(|_| {
+            Error::msg("This data directory is already open in another rproxy instance.")
+        })?;
         let path = dir.join(DATABASE);
         let mut options = fs::OpenOptions::new();
         options.create(true).truncate(false).write(true);
@@ -69,7 +76,9 @@ impl Host {
     }
 
     async fn launch(&self) -> Result<()> {
-        if self.closing.load(Ordering::Acquire) { return Err(Error::msg("rproxy is shutting down.")); }
+        if self.closing.load(Ordering::Acquire) {
+            return Err(Error::msg("rproxy is shutting down."));
+        }
         let me = self.me.clone();
         let restart = Arc::new(move || {
             if let Some(h) = me.upgrade() {
@@ -80,15 +89,27 @@ impl Host {
         let restore = Arc::new(move |config: Arc<crate::configuration::Import>| {
             if let Some(h) = me.upgrade() {
                 tokio::spawn(async move {
-                    if let Err(e) = h.import_configuration(config).await {
-                        if let Some(k) = h.try_kernel() { k.notify_error("Import failed", &e.message); }
+                    if let Err(e) = h.import_configuration(config).await
+                        && let Some(k) = h.try_kernel()
+                    {
+                        k.notify_error("Import failed", &e.message);
                     }
                 });
             }
         });
         let me = self.me.clone();
-        let ui_open = Arc::new(move || me.upgrade().is_some_and(|h| !h.contexts.lock().unwrap().is_empty()));
-        let k = Kernel::start(self.catalog.clone(), self.store.clone(), self.dir.clone(), restart, restore, ui_open)
+        let ui_open = Arc::new(move || {
+            me.upgrade()
+                .is_some_and(|h| !h.contexts.lock().unwrap().is_empty())
+        });
+        let k = Kernel::start(
+            self.catalog.clone(),
+            self.store.clone(),
+            self.dir.clone(),
+            restart,
+            restore,
+            ui_open,
+        )
         .await?;
         if self.closing.load(Ordering::Acquire) {
             k.shutdown().await;
@@ -127,7 +148,9 @@ impl Host {
     pub fn restart(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let _r = self.restarting.lock().await;
-            if self.closing.load(Ordering::Acquire) { return; }
+            if self.closing.load(Ordering::Acquire) {
+                return;
+            }
             let old = self.current.write().unwrap().take();
             if let Some(k) = old {
                 k.shutdown().await;
@@ -145,17 +168,24 @@ impl Host {
 
     /// Apply a previously validated configuration, rolling back on startup failure.
     /// The rollback copy exists only during this operation and is then deleted.
-    pub fn import_configuration(&self, config: Arc<crate::configuration::Import>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    pub fn import_configuration(
+        &self,
+        config: Arc<crate::configuration::Import>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(self.import_inner(config))
     }
     async fn import_inner(&self, config: Arc<crate::configuration::Import>) -> Result<()> {
         let _r = self.restarting.lock().await;
-        if self.closing.load(Ordering::Acquire) { return Err(Error::msg("rproxy is shutting down.")); }
+        if self.closing.load(Ordering::Acquire) {
+            return Err(Error::msg("rproxy is shutting down."));
+        }
         let previous = tempfile::tempdir().map_err(crate::configuration::io)?;
         let rollback = previous.path().join("rollback.sqlite3");
         let old = self.current.write().unwrap().take();
         let was_running = old.as_ref().is_some_and(|k| k.core_status().running());
-        if let Some(k) = &old { k.shutdown().await; }
+        if let Some(k) = &old {
+            k.shutdown().await;
+        }
         // The stopped writer cannot commit after this snapshot.
         if let Err(e) = self.store.backup_to(&rollback) {
             self.relaunch().await;
@@ -165,20 +195,34 @@ impl Host {
         let result = match replaced {
             Ok(()) => self.launch().await.and_then(|_| {
                 if was_running && self.try_kernel().is_none_or(|k| !k.core_status().running()) {
-                    Err(Error::msg("The imported configuration could not start the core."))
-                } else { Ok(()) }
+                    Err(Error::msg(
+                        "The imported configuration could not start the core.",
+                    ))
+                } else {
+                    Ok(())
+                }
             }),
             Err(e) => Err(e),
         };
         if let Err(e) = result {
             let failed = self.current.write().unwrap().take();
-            if let Some(k) = failed { k.shutdown().await; }
+            if let Some(k) = failed {
+                k.shutdown().await;
+            }
             self.store.restore_from(&rollback)?;
             self.relaunch().await;
-            return Err(Error::msg(format!("{} Previous settings were restored.", e.message)));
+            return Err(Error::msg(format!(
+                "{} Previous settings were restored.",
+                e.message
+            )));
         }
         *self.failure.lock().unwrap() = None;
-        if let Some(k) = self.try_kernel() { k.notify("Configuration imported", "Your settings and lists have been replaced."); }
+        if let Some(k) = self.try_kernel() {
+            k.notify(
+                "Configuration imported",
+                "Your settings and lists have been replaced.",
+            );
+        }
         self.repaint();
         Ok(())
     }
@@ -203,7 +247,15 @@ impl Host {
         let id = self.next_session.fetch_add(1, Ordering::Relaxed);
         self.contexts.lock().unwrap().push((id, ctx.clone()));
         style(ctx);
-        Session { host: self.clone(), id, epoch: 0, state: None, ctx: ctx.clone(), warm: false, can_exit: false }
+        Session {
+            host: self.clone(),
+            id,
+            epoch: 0,
+            state: None,
+            ctx: ctx.clone(),
+            warm: false,
+            can_exit: false,
+        }
     }
 }
 
@@ -227,8 +279,20 @@ impl Session {
         ctx.data_mut(|target| *target = data);
         self.ctx = ctx.clone();
         self.warm = false;
-        if let Some(state) = &mut self.state { state.ctx = ctx.clone(); state.theme = None; }
-        if let Some((_, context)) = self.host.contexts.lock().unwrap().iter_mut().find(|(id, _)| *id == self.id) { *context = ctx.clone(); }
+        if let Some(state) = &mut self.state {
+            state.ctx = ctx.clone();
+            state.theme = None;
+        }
+        if let Some((_, context)) = self
+            .host
+            .contexts
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|(id, _)| *id == self.id)
+        {
+            *context = ctx.clone();
+        }
         style(ctx);
     }
     pub fn ui(&mut self, ui: &mut egui::Ui) {
@@ -289,17 +353,23 @@ impl Session {
     /// Native-only fallback when the desktop cannot provide a tray menu.
     pub fn set_exit_available(&mut self, available: bool) {
         self.can_exit = available;
-        if let Some(state) = &mut self.state { state.can_exit = available; }
+        if let Some(state) = &mut self.state {
+            state.can_exit = available;
+        }
     }
     pub fn take_exit_request(&mut self) -> bool {
-        self.state.as_mut().is_some_and(|state| std::mem::take(&mut state.exit_requested))
+        self.state
+            .as_mut()
+            .is_some_and(|state| std::mem::take(&mut state.exit_requested))
     }
     /// Consumed by the native or browser frontend to open its own file dialog.
     pub fn take_file_action(&mut self) -> Option<crate::configuration::FileAction> {
         self.state.as_mut().and_then(|s| s.file_action.take())
     }
     pub fn file_finished(&mut self, file: Result<Option<(String, Vec<u8>)>>) {
-        let Some(state) = self.state.as_mut() else { return };
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
         match file {
             Ok(Some((name, bytes))) => {
                 // Loading a large file takes a moment: validate it off the UI thread.
@@ -327,7 +397,11 @@ impl Session {
 }
 impl Drop for Session {
     fn drop(&mut self) {
-        self.host.contexts.lock().unwrap().retain(|(id, _)| *id != self.id);
+        self.host
+            .contexts
+            .lock()
+            .unwrap()
+            .retain(|(id, _)| *id != self.id);
     }
 }
 

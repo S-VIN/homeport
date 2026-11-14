@@ -1,7 +1,7 @@
 [package]
 name = "rproxy-kit"
 version = "0.2.0"
-edition = "2021"
+edition = "2024"
 publish = false
 description = "rproxy design system for egui: tokens, palette, fonts, icons, widgets"
 

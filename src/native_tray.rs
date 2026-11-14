@@ -1,7 +1,13 @@
 //! Windows/macOS tray, owned by the main UI thread (required by AppKit).
 use crate::icon::{self, Link};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-use tray_icon::{menu::{Menu, MenuEvent, MenuItem}, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use tray_icon::{
+    MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
+    menu::{Menu, MenuEvent, MenuItem},
+};
 
 pub struct NativeTray {
     icon: TrayIcon,
@@ -26,16 +32,20 @@ impl NativeTray {
         let open = MenuItem::new("Open rproxy", true, None);
         let quit = MenuItem::new("Quit rproxy", true, None);
         menu.append_items(&[&open, &quit])?;
-        let icon = TrayIconBuilder::new().with_menu(Box::new(menu)).with_icon(image(Link::Idle))
+        let icon = TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_icon(image(Link::Idle))
             .with_tooltip("rproxy · not connected")
-            .with_menu_on_left_click(false).build()?;
+            .with_menu_on_left_click(false)
+            .build()?;
         let quitting = Arc::new(AtomicBool::new(false));
         let (open_id, quit_id) = (open.id().clone(), quit.id().clone());
         let context = ctx.clone();
         let stop = quitting.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-            if event.id == open_id { show(&context); }
-            else if event.id == quit_id {
+            if event.id == open_id {
+                show(&context);
+            } else if event.id == quit_id {
                 stop.store(true, Ordering::Release);
                 context.send_viewport_cmd(egui::ViewportCommand::Close);
                 context.request_repaint();
@@ -43,15 +53,34 @@ impl NativeTray {
         }));
         let context = ctx.clone();
         TrayIconEvent::set_event_handler(Some(move |event| {
-            if matches!(event, TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. }) { show(&context); }
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                }
+            ) {
+                show(&context);
+            }
         }));
-        Ok(Self { icon, link: Link::Idle, quitting })
+        Ok(Self {
+            icon,
+            link: Link::Idle,
+            quitting,
+        })
     }
     pub fn update(&mut self, link: Link) {
-        if self.link == link { return; }
+        if self.link == link {
+            return;
+        }
         if self.icon.set_icon(Some(image(link))).is_ok() {
             self.link = link;
-            let text = match link { Link::Idle => "rproxy · not connected", Link::Selected => "rproxy · connected", Link::Failed => "rproxy · connection error" };
+            let text = match link {
+                Link::Idle => "rproxy · not connected",
+                Link::Selected => "rproxy · connected",
+                Link::Failed => "rproxy · connection error",
+            };
             let _ = self.icon.set_tooltip(Some(text));
         }
     }

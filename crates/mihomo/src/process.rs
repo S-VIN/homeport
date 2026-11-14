@@ -1,8 +1,8 @@
 //! Owns one mihomo child. Control uses a private Unix socket or authenticated loopback TCP on Windows.
-use crate::config::{self, overlaps, Config, Listener, System, Target};
+use crate::config::{self, Config, Listener, System, Target, overlaps};
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     fs,
@@ -62,11 +62,17 @@ pub struct Controller {
 }
 impl Controller {
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
-        let r = req.send().await.map_err(|_| "Mihomo control socket is unavailable.".to_string())?;
+        let r = req
+            .send()
+            .await
+            .map_err(|_| "Mihomo control socket is unavailable.".to_string())?;
         if !r.status().is_success() {
             let status = r.status().as_u16();
             let body = r.text().await.unwrap_or_default();
-            return Err(format!("Mihomo rejected the request (HTTP {status}). {}", body.trim()));
+            return Err(format!(
+                "Mihomo rejected the request (HTTP {status}). {}",
+                body.trim()
+            ));
         }
         Ok(r)
     }
@@ -75,18 +81,35 @@ impl Controller {
         struct V {
             version: String,
         }
-        let v: V = self.send(self.http.get(self.url("version"))).await?.json().await.map_err(|e| e.to_string())?;
+        let v: V = self
+            .send(self.http.get(self.url("version")))
+            .await?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(v.version)
     }
     pub async fn select(&self, group: &str, target: Option<&Target>) -> Result<()> {
         let name = target.map(Target::wire).unwrap_or_else(|| "REJECT".into());
-        self.send(self.http.put(self.url(&format!("proxies/{group}"))).json(&json!({ "name": name }))).await.map(drop)
+        self.send(
+            self.http
+                .put(self.url(&format!("proxies/{group}")))
+                .json(&json!({ "name": name })),
+        )
+        .await
+        .map(drop)
     }
     /// Delay test (HEAD request, redirects not followed) run by mihomo through
     /// `proxy`. `expected` is mihomo's status syntax, e.g. `204` or `200-299/301`.
     /// Mihomo answers a status mismatch with a delay and only marks its history
     /// entry with zero, so the history decides it.
-    pub async fn delay(&self, proxy: &str, test_url: &str, timeout_ms: u32, expected: Option<&str>) -> Result<Delay> {
+    pub async fn delay(
+        &self,
+        proxy: &str,
+        test_url: &str,
+        timeout_ms: u32,
+        expected: Option<&str>,
+    ) -> Result<Delay> {
         #[derive(Deserialize)]
         struct D {
             delay: u32,
@@ -110,13 +133,19 @@ impl Controller {
             200 => {}
             status => {
                 let body = r.text().await.unwrap_or_default();
-                return Err(format!("Mihomo rejected the request (HTTP {status}). {}", body.trim()));
+                return Err(format!(
+                    "Mihomo rejected the request (HTTP {status}). {}",
+                    body.trim()
+                ));
             }
         }
         let d: D = r.json().await.map_err(|e| e.to_string())?;
         if expected.is_some() {
             let info = self.proxy(proxy).await?;
-            let last = info["extra"][test_url]["history"].as_array().and_then(|h| h.last()).and_then(|e| e["delay"].as_u64());
+            let last = info["extra"][test_url]["history"]
+                .as_array()
+                .and_then(|h| h.last())
+                .and_then(|e| e["delay"].as_u64());
             if last == Some(0) {
                 return Ok(Delay::WrongStatus);
             }
@@ -125,20 +154,35 @@ impl Controller {
     }
     /// `GET /proxies/{name}` as returned by mihomo.
     pub async fn proxy(&self, name: &str) -> Result<Value> {
-        self.send(self.http.get(self.url(&format!("proxies/{name}")))).await?.json().await.map_err(|e| e.to_string())
+        self.send(self.http.get(self.url(&format!("proxies/{name}"))))
+            .await?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
     }
     /// The member a group currently uses (`now`).
     pub async fn group_now(&self, group: &str) -> Result<Option<String>> {
-        Ok(self.proxy(group).await?["now"].as_str().filter(|n| !n.is_empty()).map(str::to_owned))
+        Ok(self.proxy(group).await?["now"]
+            .as_str()
+            .filter(|n| !n.is_empty())
+            .map(str::to_owned))
     }
     pub async fn connections(&self) -> Result<Value> {
-        self.send(self.http.get(self.url("connections"))).await?.json().await.map_err(|e| e.to_string())
+        self.send(self.http.get(self.url("connections")))
+            .await?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
     }
     pub async fn close_connection(&self, id: &str) -> Result<()> {
-        self.send(self.http.delete(self.url(&format!("connections/{id}")))).await.map(drop)
+        self.send(self.http.delete(self.url(&format!("connections/{id}"))))
+            .await
+            .map(drop)
     }
     pub async fn close_all(&self) -> Result<()> {
-        self.send(self.http.delete(self.url("connections"))).await.map(drop)
+        self.send(self.http.delete(self.url("connections")))
+            .await
+            .map(drop)
     }
     /// `GET /providers/rules`: `{providers: {name: {ruleCount, updatedAt, …}}}`.
     pub async fn rule_providers(&self) -> Result<Value> {
@@ -168,7 +212,9 @@ impl Controller {
     }
 }
 impl Controller {
-    fn url(&self, path: &str) -> String { format!("{}/{path}", self.base) }
+    fn url(&self, path: &str) -> String {
+        format!("{}/{path}", self.base)
+    }
 }
 
 pub struct Mihomo {
@@ -207,7 +253,9 @@ pub fn installed_version_file(home: &Path) -> PathBuf {
 pub fn bundled_version() -> &'static str {
     static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     VERSION.get_or_init(|| {
-        let manifest: Value = serde_json::from_str(include_str!("../../../assets/mihomo/manifest.json")).unwrap_or_default();
+        let manifest: Value =
+            serde_json::from_str(include_str!("../../../assets/mihomo/manifest.json"))
+                .unwrap_or_default();
         manifest["version"].as_str().unwrap_or_default().to_owned()
     })
 }
@@ -244,7 +292,9 @@ pub fn privileged(home: &Path) -> PathBuf {
 #[cfg(target_os = "macos")]
 fn privileged_copy_of(copy: &Path, core: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let (Ok(c), Ok(o)) = (fs::metadata(copy), fs::metadata(core)) else { return false };
+    let (Ok(c), Ok(o)) = (fs::metadata(copy), fs::metadata(core)) else {
+        return false;
+    };
     c.uid() == 0 && c.mode() & 0o4000 != 0 && c.len() == o.len() && c.mtime() == o.mtime()
 }
 /// The shell commands that make [`privileged`] a setuid-root copy of `core`;
@@ -260,7 +310,10 @@ pub fn grant_tun_script(core: &Path, target: &Path) -> String {
         target = q(target),
     );
     // AppleScript string literal: escape backslashes and quotes.
-    format!("do shell script \"{}\" with administrator privileges", commands.replace('\\', "\\\\").replace('"', "\\\""))
+    format!(
+        "do shell script \"{}\" with administrator privileges",
+        commands.replace('\\', "\\\\").replace('"', "\\\"")
+    )
 }
 
 /// The core without the macOS setuid copy: an installed update newer than the
@@ -294,7 +347,10 @@ pub fn bundled() -> PathBuf {
     // Packages contain only their own core beside the executable. Development
     // builds use the corresponding checked-in platform directory, never a host fallback.
     let bundled = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../assets/mihomo").join(platform).join(arch).join(binary);
+        .join("../../assets/mihomo")
+        .join(platform)
+        .join(arch)
+        .join(binary);
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join(binary)))
@@ -327,13 +383,17 @@ impl Mihomo {
                 Err(e) => error = e,
             }
             // Only a core that could not run at all is removed, not a slow start.
-            let broken = error.starts_with("Cannot start mihomo") || error == "Mihomo exited during startup.";
+            let broken = error.starts_with("Cannot start mihomo")
+                || error == "Mihomo exited during startup.";
             if broken && core == installed(home) {
                 let _ = fs::remove_file(installed_version_file(home));
                 let _ = fs::remove_file(&core);
             }
             if core != bundled() {
-                eprintln!("rproxy: {} failed ({error}); trying the next core.", core.display());
+                eprintln!(
+                    "rproxy: {} failed ({error}); trying the next core.",
+                    core.display()
+                );
             }
         }
         Err(error)
@@ -360,41 +420,58 @@ impl Mihomo {
         }
         drop(probes);
         let routed_port = check_ports.pop().expect("one port for the routed listener");
-        let http = Client::builder().no_proxy().timeout(Duration::from_secs(4));
+        let http = crate::http().no_proxy().timeout(Duration::from_secs(4));
         #[cfg(unix)]
         let (http, base, endpoint) = (
-            http.unix_socket(socket.clone()), "http://localhost".to_owned(),
+            http.unix_socket(socket.clone()),
+            "http://localhost".to_owned(),
             json!({"external-controller-unix": socket}),
         );
         #[cfg(windows)]
         let (http, base, endpoint) = {
-            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|e| e.to_string())?;
+            let listener =
+                TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|e| e.to_string())?;
             let addr = listener.local_addr().map_err(|e| e.to_string())?;
             let secret = uuid::Uuid::new_v4().to_string();
             let mut headers = reqwest::header::HeaderMap::new();
-            let mut auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {secret}")).unwrap();
+            let mut auth =
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {secret}")).unwrap();
             auth.set_sensitive(true);
             headers.insert(reqwest::header::AUTHORIZATION, auth);
-            (http.default_headers(headers), format!("http://{addr}"),
-                json!({"external-controller": addr.to_string(), "secret": secret}))
+            (
+                http.default_headers(headers),
+                format!("http://{addr}"),
+                json!({"external-controller": addr.to_string(), "secret": secret}),
+            )
         };
-        let http = http.build().map_err(|_| "Cannot create mihomo client.".to_string())?;
+        let http = http
+            .build()
+            .map_err(|_| "Cannot create mihomo client.".to_string())?;
         let path = dir.path().join("config.json");
         let mut initial = json!({"mode": "rule", "rules": ["MATCH,REJECT"],
             "dns": {"enable": false}, "log-level": "silent"});
-        initial.as_object_mut().unwrap().extend(endpoint.as_object().unwrap().clone());
+        initial
+            .as_object_mut()
+            .unwrap()
+            .extend(endpoint.as_object().unwrap().clone());
         fs::write(&path, initial.to_string()).map_err(|e| e.to_string())?;
         let supervised = crate::supervisor::executable().is_some();
         let mut cmd = if let Some(guard) = crate::supervisor::executable() {
             let mut cmd = Command::new(guard);
             cmd.arg(crate::supervisor::ARG).arg(core);
             cmd
-        } else { Command::new(core) };
+        } else {
+            Command::new(core)
+        };
         cmd.arg("-d")
             .arg(home)
             .arg("-f")
             .arg(path)
-            .stdin(if supervised { Stdio::piped() } else { Stdio::null() })
+            .stdin(if supervised {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .kill_on_drop(!supervised);
         // RPROXY_MIHOMO_LOG=debug|info|warning shows the core's log on stderr.
         if config::log_level() == "silent" {
@@ -406,23 +483,34 @@ impl Mihomo {
         #[cfg(target_os = "linux")]
         let parent = std::process::id();
         #[cfg(target_os = "linux")]
-        if !supervised { unsafe {
-            cmd.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::getppid() as u32 != parent {
-                    return Err(std::io::Error::other("Parent exited"));
-                }
-                Ok(())
-            });
-        } }
+        if !supervised {
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::getppid() as u32 != parent {
+                        return Err(std::io::Error::other("Parent exited"));
+                    }
+                    Ok(())
+                });
+            }
+        }
         #[cfg(windows)]
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        let child = cmd.spawn().map_err(|e| format!("Cannot start mihomo: {e}"))?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| format!("Cannot start mihomo: {e}"))?;
         #[cfg(windows)]
-        let job = if supervised { None } else {
-            Some(crate::windows_job::Job::attach(child.id().ok_or("Mihomo exited before job assignment")?).map_err(|e| e.to_string())?)
+        let job = if supervised {
+            None
+        } else {
+            Some(
+                crate::windows_job::Job::attach(
+                    child.id().ok_or("Mihomo exited before job assignment")?,
+                )
+                .map_err(|e| e.to_string())?,
+            )
         };
         let mut core = Self {
             child,
@@ -458,14 +546,19 @@ impl Mihomo {
         if self.supervised {
             // Never kill the guard first: closing the pipe asks it to kill+reap.
             drop(self.child.stdin.take());
-        } else { let _ = self.child.start_kill(); }
+        } else {
+            let _ = self.child.start_kill();
+        }
         let _ = self.child.wait().await;
     }
     pub fn check_ports(&self) -> &[u16] {
         &self.check_ports
     }
     pub fn applied(&self) -> Option<&Config> {
-        self.applied.as_ref().filter(|_| !self.force).map(|(c, _)| c)
+        self.applied
+            .as_ref()
+            .filter(|_| !self.force)
+            .map(|(c, _)| c)
     }
     /// Re-send the full configuration on the next apply (retries failed listeners).
     pub fn force_next(&mut self) {
@@ -485,11 +578,14 @@ impl Mihomo {
 
     /// HTTP client that exits through the isolated check lane `lane`.
     pub fn check_client(&self, lane: usize) -> Result<Client> {
-        let port = *self.check_ports.get(lane).ok_or_else(|| "Unknown check lane.".to_string())?;
+        let port = *self
+            .check_ports
+            .get(lane)
+            .ok_or_else(|| "Unknown check lane.".to_string())?;
         let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}"))
             .map_err(|_| "Invalid test listener.".to_string())?
             .basic_auth("check", &self.check_password);
-        Client::builder()
+        crate::http()
             .no_proxy()
             .proxy(proxy)
             .redirect(reqwest::redirect::Policy::none())
@@ -502,7 +598,7 @@ impl Mihomo {
         let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{}", self.routed_port))
             .map_err(|_| "Invalid routed listener.".to_string())?
             .basic_auth("check", &self.check_password);
-        Client::builder()
+        crate::http()
             .no_proxy()
             .proxy(proxy)
             .connect_timeout(Duration::from_secs(20))
@@ -513,7 +609,8 @@ impl Mihomo {
         if lane >= self.check_targets.len() {
             return Err("Unknown check lane.".into());
         }
-        self.select(&format!("test-{lane}"), target.as_ref()).await?;
+        self.select(&format!("test-{lane}"), target.as_ref())
+            .await?;
         self.check_targets[lane] = target;
         Ok(())
     }
@@ -531,32 +628,54 @@ impl Mihomo {
     }
     async fn apply_inner(&mut self, cfg: &Config) -> Result<ApplyReport> {
         let force = std::mem::take(&mut self.force);
-        if let Some((old, _)) = self.applied.as_ref().filter(|_| !force) {
-            if old.same_structure(cfg) {
-                for g in &cfg.groups {
-                    let before = old.groups.iter().find(|o| o.name == g.name).map(|o| &o.selected);
-                    if g.kind == config::GroupKind::Select && before != Some(&g.selected) {
-                        self.select(&g.name, g.selected.as_ref()).await?;
-                    }
+        if let Some((old, _)) = self.applied.as_ref().filter(|_| !force)
+            && old.same_structure(cfg)
+        {
+            for g in &cfg.groups {
+                let before = old
+                    .groups
+                    .iter()
+                    .find(|o| o.name == g.name)
+                    .map(|o| &o.selected);
+                if g.kind == config::GroupKind::Select && before != Some(&g.selected) {
+                    self.select(&g.name, g.selected.as_ref()).await?;
                 }
-                let listeners = self.applied.as_ref().unwrap().1.clone();
-                let mut report = ApplyReport::default();
-                for l in cfg.listeners.iter().filter(|l| !listeners.iter().any(|a| a.name == l.name)) {
-                    let e = self.last_errors.get(&l.name).cloned().unwrap_or_else(|| "Listener is not running.".into());
-                    report.listener_errors.insert(l.name.clone(), e);
-                }
-                self.applied = Some((cfg.clone(), listeners));
-                return Ok(report);
             }
+            let listeners = self.applied.as_ref().unwrap().1.clone();
+            let mut report = ApplyReport::default();
+            for l in cfg
+                .listeners
+                .iter()
+                .filter(|l| !listeners.iter().any(|a| a.name == l.name))
+            {
+                let e = self
+                    .last_errors
+                    .get(&l.name)
+                    .cloned()
+                    .unwrap_or_else(|| "Listener is not running.".into());
+                report.listener_errors.insert(l.name.clone(), e);
+            }
+            self.applied = Some((cfg.clone(), listeners));
+            return Ok(report);
         }
-        let previous: Vec<Listener> = self.applied.as_ref().map(|(_, l)| l.clone()).unwrap_or_default();
+        let previous: Vec<Listener> = self
+            .applied
+            .as_ref()
+            .map(|(_, l)| l.clone())
+            .unwrap_or_default();
         // Optional listeners may fail softly at startup or when they were already
         // configured (and failing) before; a newly requested listener must work.
-        let known = |l: &Listener| self.applied.as_ref().is_none_or(|(c, _)| c.listeners.contains(l));
+        let known = |l: &Listener| {
+            self.applied
+                .as_ref()
+                .is_none_or(|(c, _)| c.listeners.contains(l))
+        };
         let mut report = ApplyReport::default();
         let mut active: Vec<Listener> = Vec::new();
         for l in &cfg.listeners {
-            let ours = previous.iter().any(|p| p.listen == l.listen && p.port == l.port);
+            let ours = previous
+                .iter()
+                .any(|p| p.listen == l.listen && p.port == l.port);
             if ours {
                 active.push(l.clone());
                 continue;
@@ -567,22 +686,36 @@ impl Mihomo {
                 && TcpListener::bind(addr).is_ok()
                 && UdpSocket::bind(addr).is_ok();
             // A wildcard and a specific address on the same port collide with our own old socket.
-            let ours_overlap = previous.iter().any(|p| p.port == l.port && overlaps(p.listen, l.listen));
+            let ours_overlap = previous
+                .iter()
+                .any(|p| p.port == l.port && overlaps(p.listen, l.listen));
             if free || ours_overlap {
                 active.push(l.clone());
             } else if l.optional && known(l) {
-                report.listener_errors.insert(l.name.clone(), format!("Cannot listen on {addr}. Check the address and port."));
+                report.listener_errors.insert(
+                    l.name.clone(),
+                    format!("Cannot listen on {addr}. Check the address and port."),
+                );
             } else {
-                return Err(format!("Cannot listen on {addr}. Check the address and port."));
+                return Err(format!(
+                    "Cannot listen on {addr}. Check the address and port."
+                ));
             }
         }
         // Release overlapping old sockets before binding replacements.
         let overlapping: Vec<&Listener> = active
             .iter()
-            .filter(|l| previous.iter().any(|p| p.port == l.port && p.listen != l.listen && overlaps(p.listen, l.listen)))
+            .filter(|l| {
+                previous.iter().any(|p| {
+                    p.port == l.port && p.listen != l.listen && overlaps(p.listen, l.listen)
+                })
+            })
             .collect();
         if !overlapping.is_empty() {
-            let interim: Vec<&Listener> = active.iter().filter(|l| !overlapping.iter().any(|o| o.name == l.name)).collect();
+            let interim: Vec<&Listener> = active
+                .iter()
+                .filter(|l| !overlapping.iter().any(|o| o.name == l.name))
+                .collect();
             self.put_config(cfg, &interim).await?;
         }
         let refs: Vec<&Listener> = active.iter().collect();
@@ -619,7 +752,14 @@ impl Mihomo {
             },
             listeners,
         );
-        self.ctl.send(self.ctl.http.put(self.ctl.url("configs?force=false")).json(&json!({"payload": doc.to_string()}))).await?;
+        self.ctl
+            .send(
+                self.ctl
+                    .http
+                    .put(self.ctl.url("configs?force=false"))
+                    .json(&json!({"payload": doc.to_string()})),
+            )
+            .await?;
         // A reload can keep an old selection by name; acknowledge every select group explicitly.
         for g in &cfg.groups {
             if g.kind == config::GroupKind::Select {
@@ -632,7 +772,10 @@ impl Mihomo {
 
 async fn handshake(l: &Listener) -> Result<()> {
     let addr = local_address(l.listen, l.port);
-    let socks = matches!(l.kind, config::ListenerKind::Mixed | config::ListenerKind::Socks);
+    let socks = matches!(
+        l.kind,
+        config::ListenerKind::Mixed | config::ListenerKind::Socks
+    );
     timeout(Duration::from_secs(2), async {
         let mut stream = TcpStream::connect(addr).await?;
         if !socks {
@@ -644,7 +787,9 @@ async fn handshake(l: &Listener) -> Result<()> {
         let mut reply = [0; 2];
         stream.read_exact(&mut reply).await?;
         if reply != [5, method] {
-            return Err(std::io::Error::other("SOCKS authentication method mismatch"));
+            return Err(std::io::Error::other(
+                "SOCKS authentication method mismatch",
+            ));
         }
         Ok(())
     })
@@ -656,7 +801,12 @@ async fn handshake(l: &Listener) -> Result<()> {
 fn rand() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    );
     h.finish()
 }
 
@@ -667,7 +817,11 @@ mod tests {
     fn an_installed_core_is_used_only_while_newer_than_the_bundled_one() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
-        assert!(version_of(bundled_version()).is_some(), "manifest version {:?}", bundled_version());
+        assert!(
+            version_of(bundled_version()).is_some(),
+            "manifest version {:?}",
+            bundled_version()
+        );
         assert_eq!(executable(home), bundled());
         fs::create_dir_all(home.join("bin")).unwrap();
         fs::write(installed(home), b"core").unwrap();
@@ -682,7 +836,10 @@ mod tests {
     }
     #[test]
     fn versions_compare_numerically() {
-        assert_eq!(version_of("Mihomo Meta v1.19.32 linux amd64"), Some(vec![1, 19, 32]));
+        assert_eq!(
+            version_of("Mihomo Meta v1.19.32 linux amd64"),
+            Some(vec![1, 19, 32])
+        );
         assert!(newer("1.19.34", "v1.19.32"));
         assert!(newer("1.20.0", "1.19.99"));
         assert!(!newer("1.19.32", "Mihomo Meta v1.19.32"));
@@ -690,10 +847,21 @@ mod tests {
     }
     #[test]
     fn the_grant_script_quotes_paths_for_the_shell_and_applescript() {
-        let script = grant_tun_script(Path::new("/Applications/r proxy.app/Contents/MacOS/mihomo"), Path::new("/Users/o'neil/core/bin/mihomo-tun"));
-        assert!(script.starts_with("do shell script \"mkdir -p '/Users/o'\\\\''neil/core/bin'"), "{script}");
+        let script = grant_tun_script(
+            Path::new("/Applications/r proxy.app/Contents/MacOS/mihomo"),
+            Path::new("/Users/o'neil/core/bin/mihomo-tun"),
+        );
+        assert!(
+            script.starts_with("do shell script \"mkdir -p '/Users/o'\\\\''neil/core/bin'"),
+            "{script}"
+        );
         assert!(script.contains("cp -p '/Applications/r proxy.app/Contents/MacOS/mihomo' "));
         assert!(script.contains("chown root:wheel") && script.contains("chmod 4755"));
-        assert!(script.ends_with("'/Users/o'\\\\''neil/core/bin/mihomo-tun'\" with administrator privileges"), "{script}");
+        assert!(
+            script.ends_with(
+                "'/Users/o'\\\\''neil/core/bin/mihomo-tun'\" with administrator privileges"
+            ),
+            "{script}"
+        );
     }
 }

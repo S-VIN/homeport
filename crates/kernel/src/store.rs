@@ -1,11 +1,12 @@
-//! One SQLite table per registered Rust type.
+//! One SQLite table per persisted list: by default the record type's own
+//! (`#[table(name)]`), or another one chosen for a second list of that type.
 mod legacy;
 mod schema;
 
 use crate::{Error, Result};
 #[doc(hidden)]
 pub use rusqlite;
-use rusqlite::{params_from_iter, Connection, OptionalExtension, Row, ToSql, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Row, ToSql, TransactionBehavior, params_from_iter};
 pub use schema::{Column, ColumnType, PrimaryKey};
 use serde::de::DeserializeOwned;
 use std::{
@@ -46,11 +47,11 @@ fn columns<T: Table>() -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
-fn insert_sql<T: Table>() -> String {
+fn insert_sql<T: Table>(table: &str) -> String {
     let args = vec!["?"; T::COLUMNS.len()].join(", ");
     format!(
         "INSERT INTO {} ({}) VALUES ({args})",
-        quoted(T::NAME),
+        quoted(table),
         columns::<T>()
     )
 }
@@ -58,7 +59,8 @@ fn insert_sql<T: Table>() -> String {
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path).map_err(db)?;
-        conn.pragma_update(None, "trusted_schema", false).map_err(db)?;
+        conn.pragma_update(None, "trusted_schema", false)
+            .map_err(db)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -79,7 +81,8 @@ impl Store {
     /// rproxy database; nothing changes when it is not.
     pub fn restore_from(&self, path: &Path) -> Result<()> {
         Self::check_configuration(path)?;
-        let src = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(db)?;
+        let src = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(db)?;
         let mut conn = self
             .conn
             .lock()
@@ -89,18 +92,33 @@ impl Store {
             .map_err(db)
     }
     pub(crate) fn check_configuration(path: &Path) -> Result<()> {
-        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(db)?;
-        conn.pragma_update(None, "trusted_schema", false).map_err(db)?;
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(db)?;
+        conn.pragma_update(None, "trusted_schema", false)
+            .map_err(db)?;
         let ours: bool = conn.query_row("SELECT count(*) = 1 FROM sqlite_schema WHERE type = 'table' AND name = 'kernel_plugins'", [], |r| r.get(0)).map_err(db)?;
         let safe: bool = conn.query_row("SELECT count(*) = 0 FROM sqlite_schema WHERE type NOT IN ('table', 'index') OR upper(sql) LIKE '%VIRTUAL TABLE%'", [], |r| r.get(0)).map_err(db)?;
-        let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0)).map_err(db)?;
+        let integrity: String = conn
+            .query_row("PRAGMA quick_check", [], |r| r.get(0))
+            .map_err(db)?;
         if !ours || !safe || integrity != "ok" {
-            return Err(Error::msg("This file is not a valid rproxy configuration. Your settings have not changed."));
+            return Err(Error::msg(
+                "This file is not a valid rproxy configuration. Your settings have not changed.",
+            ));
         }
         Ok(())
     }
     /// Register at startup before serving requests. A failed upgrade leaves the old data intact.
     pub fn register<T: Table + DeserializeOwned>(&self) -> Result<()> {
+        self.register_in::<T>(T::NAME, true)
+    }
+    /// [`Self::register`] for rows of `T` kept in another table; not `strict`
+    /// keeps columns `T` no longer has (for migrations that still read them).
+    pub fn register_in<T: Table + DeserializeOwned>(
+        &self,
+        table: &str,
+        strict: bool,
+    ) -> Result<()> {
         let mut conn = self
             .conn
             .lock()
@@ -108,8 +126,10 @@ impl Store {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db)?;
-        schema::ensure::<T>(&tx)?;
-        legacy::import::<T>(&tx)?;
+        schema::ensure::<T>(&tx, table, strict)?;
+        if strict && table == T::NAME {
+            legacy::import::<T>(&tx)?;
+        }
         tx.commit().map_err(db)
     }
     /// A failing closure rolls back every change. Keep network I/O outside it.
@@ -127,6 +147,9 @@ impl Store {
 }
 impl Tx<'_> {
     pub fn put<T: Table>(&self, record: &T) -> Result<()> {
+        self.put_in(T::NAME, record)
+    }
+    pub fn put_in<T: Table>(&self, table: &str, record: &T) -> Result<()> {
         let updates: Vec<_> = T::COLUMNS
             .iter()
             .filter(|c| c.name != T::KEY)
@@ -142,16 +165,14 @@ impl Tx<'_> {
         };
         let sql = format!(
             "{} ON CONFLICT ({}) DO {action}",
-            insert_sql::<T>(),
+            insert_sql::<T>(table),
             quoted(T::KEY)
         );
-        let count = self
-            .conn
+        self.conn
             .prepare_cached(&sql)
             .map_err(db)?
             .execute(params_from_iter(record.values()))
             .map_err(db)?;
-        let _ = count;
         Ok(())
     }
     pub fn get<T: Table>(&self, id: &T::Key) -> Result<Option<T>> {
@@ -180,10 +201,13 @@ impl Tx<'_> {
     }
     /// All rows in insertion order.
     pub fn all<T: Table>(&self) -> Result<Vec<T>> {
+        self.all_in(T::NAME)
+    }
+    pub fn all_in<T: Table>(&self, table: &str) -> Result<Vec<T>> {
         let sql = format!(
             "SELECT {} FROM {} ORDER BY _rowid_",
             columns::<T>(),
-            quoted(T::NAME)
+            quoted(table)
         );
         let mut stmt = self.conn.prepare_cached(&sql).map_err(db)?;
         let rows = stmt.query_map([], T::from_row).map_err(db)?;
@@ -194,11 +218,10 @@ impl Tx<'_> {
         self.conn
     }
     pub fn delete<T: Table>(&self, id: &T::Key) -> Result<bool> {
-        let sql = format!(
-            "DELETE FROM {} WHERE {} = ?",
-            quoted(T::NAME),
-            quoted(T::KEY)
-        );
+        self.delete_in::<T>(T::NAME, id)
+    }
+    pub fn delete_in<T: Table>(&self, table: &str, id: &T::Key) -> Result<bool> {
+        let sql = format!("DELETE FROM {} WHERE {} = ?", quoted(table), quoted(T::KEY));
         let removed = self
             .conn
             .prepare_cached(&sql)

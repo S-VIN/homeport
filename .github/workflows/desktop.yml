@@ -8,7 +8,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   web:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       RUSTC_WRAPPER: sccache
@@ -25,7 +25,7 @@ jobs:
             !/assets/mihomo/*/*/
       - uses: mozilla-actions/sccache-action@v0.0.11
         with:
-          version: v0.16.0
+          version: v0.19.0
       - uses: Swatinem/rust-cache@v2
         with:
           # wasm-bindgen CLI (pinned to Cargo.lock) lives outside target/.
@@ -48,6 +48,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux packages stay on 24.04: its glibc 2.39 is the binaries' minimum (26.04 has 2.43).
           - {os: linux, arch: x64, runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu}
           - {os: linux, arch: arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu}
           - {os: win32, arch: x64, runner: windows-2025, target: x86_64-pc-windows-msvc}
@@ -74,10 +75,10 @@ jobs:
       - run: rustup toolchain install && rustup target add ${{ matrix.target }}
       - uses: actions/setup-python@v7
         with:
-          python-version: '3.13'
+          python-version: '3.15'
       - uses: mozilla-actions/sccache-action@v0.0.11
         with:
-          version: v0.16.0
+          version: v0.19.0
       - uses: Swatinem/rust-cache@v2
       - uses: actions/download-artifact@v8
         with:
@@ -93,7 +94,8 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Windows installer tools
         if: matrix.os == 'win32'
-        run: choco install nsis --no-progress -y
+        # upgrade also replaces an older preinstalled NSIS (windows-11-arm ships 3.10).
+        run: choco upgrade nsis --version 3.13.0 --no-progress -y
       - run: python scripts/build.py --native-only --release
       - run: python scripts/package.py --os ${{ matrix.os }} --arch ${{ matrix.arch }}
       - uses: actions/upload-artifact@v7
@@ -114,7 +116,7 @@ jobs:
 
   artifacts:
     needs: [web, package]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
       actions: write

@@ -1,6 +1,6 @@
 # rproxy
 
-Менеджер прокси для Linux, Windows и macOS (x64 и ARM64) с общим интерфейсом egui для нативного окна и браузера. Окно egui, хендлеры, планировщик и SQLite работают в одном процессе. Приложение само запускает комплектный mihomo 1.19.32 и управляет им через приватный Unix-сокет (Linux/macOS) или loopback-контроллер со случайным секретом (Windows).
+Менеджер прокси для Linux, Windows и macOS (x64 и ARM64) с общим интерфейсом egui для нативного окна и браузера. Окно egui, хендлеры, планировщик и SQLite работают в одном процессе. Приложение само запускает комплектный mihomo 1.19.34 и управляет им через приватный Unix-сокет (Linux/macOS) или loopback-контроллер со случайным секретом (Windows).
 
 ## Установка на сервер и готовые приложения
 
@@ -117,6 +117,7 @@ Linux использует оформление окон оконной сист
 python3 scripts/build.py --web-only
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo fmt --all --check
 # декодирование кадров под wasm32 (нужен Node.js)
 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=$PWD/.cache/wasm-bindgen/bin/wasm-bindgen-test-runner \
   cargo test --locked -p rproxy-remote --target wasm32-unknown-unknown --test wasm_decode
@@ -155,7 +156,7 @@ SHA-256 по `manifest.json`, компилирует программу и уп�
 получает только ядро выбранной платформы. Затем пакеты загружаются в Artifacts
 и объединяются по ОС без повторного сжатия. Для каждого набора файлов создаётся
 SHA256SUMS. Сборки Linux используют Ubuntu
-24.04 для совместимости с glibc 2.39+; Flatpak использует runtime 25.08.
+24.04 для совместимости с glibc 2.39+; Flatpak использует runtime 26.08.
 AppImage использует графические библиотеки установленного Linux-десктопа
 (X11/Wayland, xkbcommon, EGL/OpenGL); Flatpak получает их из runtime.
 

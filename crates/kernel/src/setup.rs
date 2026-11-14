@@ -1,14 +1,13 @@
 //! Registration: the only API a plugin's `setup` function uses.
 use crate::{
-    list,
+    Claim, Cx, Hook, Id, Next, Op, Plugin, Rank, Record, Result, Slot, Snapshot, State, list,
     mihomo::Fragment,
     op::{BoxFut, Handler, Handlers},
     slot::{Contribution, Contributions, HookFn, HookFns, ViewFn},
     state::{self, Persist, Value},
     ui::{Page, PageSpec, UiCx},
-    Claim, Cx, Hook, Id, Next, Op, Plugin, Rank, Record, Result, Slot, Snapshot, State,
 };
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use std::{
     any::{Any, TypeId},
     collections::HashMap,
@@ -17,10 +16,73 @@ use std::{
     time::Duration,
 };
 
-pub(crate) type ObserverFn = Arc<dyn Fn(Cx, &(dyn Any + Send + Sync)) -> Option<BoxFut<()>> + Send + Sync>;
+pub(crate) type ObserverFn =
+    Arc<dyn Fn(Cx, &(dyn Any + Send + Sync)) -> Option<BoxFut<()>> + Send + Sync>;
 pub(crate) struct Observer {
     pub plugin: usize,
     pub f: ObserverFn,
+    pub policy: Policy,
+}
+
+/// What happens when an event arrives while the observer still handles the
+/// previous one. Set with [`ObserverSpec`].
+pub(crate) enum Policy {
+    /// Every event gets its own run (the default).
+    Parallel,
+    /// The newest event wins: the previous run is cancelled.
+    Latest(std::sync::Mutex<Option<tokio::task::AbortHandle>>),
+    /// One run at a time; the next run handles the newest event that arrived
+    /// meanwhile (older waiting ones are dropped).
+    Queued(
+        Arc<tokio::sync::Mutex<()>>,
+        Arc<std::sync::Mutex<Option<BoxFut<()>>>>,
+    ),
+}
+impl Policy {
+    pub(crate) fn run(&self, cx: &Cx, fut: BoxFut<()>) {
+        match self {
+            Policy::Parallel => drop(cx.k.track(cx, fut)),
+            Policy::Latest(last) => {
+                let run = cx.k.track(cx, fut);
+                if let Some(previous) = last.lock().unwrap().replace(run.abort_handle()) {
+                    previous.abort();
+                }
+            }
+            Policy::Queued(turn, next) => {
+                if next.lock().unwrap().replace(fut).is_some() {
+                    return;
+                }
+                let (turn, next) = (turn.clone(), next.clone());
+                drop(cx.k.track(cx, async move {
+                    let _turn = turn.lock().await;
+                    let fut = next.lock().unwrap().take();
+                    match fut {
+                        Some(fut) => fut.await,
+                        None => Ok(()),
+                    }
+                }));
+            }
+        }
+    }
+}
+
+/// Returned by [`Setup::on`] and [`Setup::on_change`] to choose how repeated
+/// events are handled.
+pub struct ObserverSpec<'a> {
+    observer: &'a mut Observer,
+}
+impl ObserverSpec<'_> {
+    /// Cancel the running handler when a newer event arrives (e.g. reload
+    /// something after every edit: only the last reload matters).
+    pub fn latest(self) -> Self {
+        self.observer.policy = Policy::Latest(Default::default());
+        self
+    }
+    /// One run at a time; of the events that arrive meanwhile only the newest runs.
+    pub fn queued(self) -> Self {
+        self.observer.policy = Policy::Queued(Default::default(), Default::default());
+        self
+    }
 }
 pub(crate) struct Schedule {
     pub plugin: usize,
@@ -38,6 +100,7 @@ pub(crate) struct Service {
     pub same: Arc<dyn Fn(&(dyn Any + Send + Sync), &(dyn Any + Send + Sync)) -> bool + Send + Sync>,
     pub run: Arc<dyn Fn(Cx, Arc<dyn Any + Send + Sync>) -> BoxFut<()> + Send + Sync>,
     pub stop: Option<Arc<dyn Fn(Cx, Arc<dyn Any + Send + Sync>) -> BoxFut<()> + Send + Sync>>,
+    pub restart: bool,
 }
 
 /// Returned by [`Setup::service`] to add a cleanup step.
@@ -46,9 +109,15 @@ pub struct ServiceSetup<'a, S> {
     _spec: std::marker::PhantomData<fn(S)>,
 }
 impl<S: Clone + Send + Sync + 'static> ServiceSetup<'_, S> {
+    /// Run again after an error (2 s, then doubling up to 5 min) while the
+    /// spec stays the same. Without it a failed service waits for a new spec.
+    pub fn restart_on_error(self) -> Self {
+        self.service.restart = true;
+        self
+    }
     /// Undo what a run did, after it stopped: its spec changed, it was turned
     /// off, or the app quits. The next run starts only after this finished.
-    pub fn on_stop<F, Fut>(self, f: F)
+    pub fn on_stop<F, Fut>(self, f: F) -> Self
     where
         F: Fn(Cx, S) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
@@ -57,6 +126,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceSetup<'_, S> {
             let s = s.downcast_ref::<S>().expect("service spec type").clone();
             Box::pin(f(cx, s))
         }));
+        self
     }
 }
 pub(crate) struct PageEntry {
@@ -82,12 +152,21 @@ pub(crate) struct Registry {
     pub slot_edits: Vec<SlotEdit>,
     /// `(slot id, plugin)` of every contribution: where a plugin shows its UI.
     pub fills: Vec<(&'static str, usize)>,
+    /// `(table, state)` of every persisted list and collection.
+    pub tables: Vec<(&'static str, &'static str)>,
     pub pages: Vec<PageEntry>,
     pub fragments: Vec<(usize, Arc<dyn Fn(&Snapshot) -> Fragment + Send + Sync>)>,
     pub schedules: Vec<Schedule>,
     pub services: Vec<Service>,
     pub cascades: Vec<Cascade>,
-    pub migrations: Vec<(usize, Box<dyn Fn(&crate::store::rusqlite::Connection) -> Result<()> + Send + Sync>)>,
+    /// `(plugin, version, step)`; each runs once, in version order.
+    pub migrations: Vec<(
+        usize,
+        u32,
+        Box<dyn Fn(&crate::store::rusqlite::Connection) -> Result<()> + Send + Sync>,
+    )>,
+    /// Problems met while loading saved data (shown once the app runs).
+    pub warnings: Vec<String>,
     pub seq: usize,
     pub data_dir: std::path::PathBuf,
 }
@@ -107,7 +186,10 @@ impl Registry {
             .and_then(|s| s.downcast_ref::<Contributions<P>>())
             .map_or(&[], |c| &c.0)
     }
-    fn contributions_mut<P: 'static>(&mut self, slot: &'static Slot<P>) -> &mut Vec<Contribution<P>> {
+    fn contributions_mut<P: 'static>(
+        &mut self,
+        slot: &'static Slot<P>,
+    ) -> &mut Vec<Contribution<P>> {
         &mut self
             .slots
             .entry(slot.id)
@@ -115,6 +197,33 @@ impl Registry {
             .downcast_mut::<Contributions<P>>()
             .expect("slot props type")
             .0
+    }
+    /// The contribution `plugin/id` in `slot`. It may be missing only when
+    /// its plugin is off; a typo or a renamed contribution is reported.
+    fn target<P: 'static>(
+        &mut self,
+        slot: &'static Slot<P>,
+        contribution: &str,
+    ) -> impl Iterator<Item = &mut Contribution<P>> {
+        let owner = contribution.split('/').next().unwrap_or_default();
+        let found = self
+            .contributions(slot)
+            .iter()
+            .any(|c| c.id == contribution);
+        if !found && self.plugin_index(owner).is_some() {
+            let ids: Vec<&str> = self
+                .contributions(slot)
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect();
+            panic!(
+                "no contribution `{contribution}` in zone `{}`; it has {ids:?}",
+                slot.id
+            );
+        }
+        self.contributions_mut(slot)
+            .iter_mut()
+            .filter(move |c| c.id == contribution)
     }
     pub fn plugin_index(&self, id: &str) -> Option<usize> {
         self.plugins.iter().position(|p| p.id == id)
@@ -127,9 +236,19 @@ impl Registry {
                 "state {name} must start with `{id}.`"
             );
         }
-        assert!(self.owners.insert(name, plugin).is_none(), "state {name} is declared twice");
+        assert!(
+            self.owners.insert(name, plugin).is_none(),
+            "state {name} is declared twice"
+        );
     }
     pub(crate) fn finish(&mut self) {
+        for (i, (table, state)) in self.tables.iter().enumerate() {
+            if let Some((_, other)) = self.tables[..i].iter().find(|(t, _)| t == table) {
+                panic!(
+                    "lists {other} and {state} both store rows in table `{table}`: give one its own with `p.list(..).table(\"…\")`"
+                );
+            }
+        }
         for edit in std::mem::take(&mut self.slot_edits) {
             edit(self);
         }
@@ -160,24 +279,68 @@ impl<'a> Setup<'a> {
 
     // ---- state ----------------------------------------------------------
     /// An ordered, persisted list with ready-made Add/Save/Move/Remove ops.
-    pub fn list<T: Record + DeserializeOwned>(&mut self, s: &'static State<Vec<T>>) -> list::ListSpec<'_, 'a, T> {
+    pub fn list<T: Record + DeserializeOwned>(
+        &mut self,
+        s: &'static State<Vec<T>>,
+    ) -> list::ListSpec<'_, 'a, T> {
         self.reg.declare(s.name, self.plugin);
-        self.reg.persist.push((s.name, self.plugin, state::list::<T>(s.name, true)));
+        self.reg
+            .persist
+            .push((s.name, self.plugin, state::list::<T>(s.name, true, T::NAME)));
+        self.reg.tables.push((T::NAME, s.name));
         list::register(self, s)
+    }
+    /// See [`list::ListSpec::table`].
+    pub(crate) fn list_table<T: Record + DeserializeOwned>(
+        &mut self,
+        s: &'static State<Vec<T>>,
+        table: &'static str,
+    ) {
+        for (name, _, persist) in self
+            .reg
+            .persist
+            .iter_mut()
+            .filter(|(name, ..)| *name == s.name)
+        {
+            *persist = state::list::<T>(name, true, table);
+        }
+        for entry in self
+            .reg
+            .tables
+            .iter_mut()
+            .filter(|(_, state)| *state == s.name)
+        {
+            entry.0 = table;
+        }
     }
     /// A persisted collection in insertion order (no position, no default ops).
     pub fn collection<T: Record + DeserializeOwned>(&mut self, s: &'static State<Vec<T>>) {
         self.reg.declare(s.name, self.plugin);
-        self.reg.persist.push((s.name, self.plugin, state::list::<T>(s.name, false)));
+        self.reg.persist.push((
+            s.name,
+            self.plugin,
+            state::list::<T>(s.name, false, T::NAME),
+        ));
+        self.reg.tables.push((T::NAME, s.name));
     }
     /// A persisted value (stored as JSON), `Default` on first start.
-    pub fn setting<T: Serialize + DeserializeOwned + Clone + Default + Send + Sync + 'static>(&mut self, s: &'static State<T>) {
+    pub fn setting<T: Serialize + DeserializeOwned + Clone + Default + Send + Sync + 'static>(
+        &mut self,
+        s: &'static State<T>,
+    ) {
         self.reg.declare(s.name, self.plugin);
-        self.reg.persist.push((s.name, self.plugin, state::setting::<T>(s.name)));
+        self.reg
+            .persist
+            .push((s.name, self.plugin, state::setting::<T>(s.name)));
     }
     /// A persisted setting the UI may change directly with
     /// [`UiCx::update`] (or the [`Set`](crate::Set) / [`Update`](crate::Update) ops).
-    pub fn editable_setting<T: Serialize + DeserializeOwned + Clone + Default + Send + Sync + 'static>(&mut self, s: &'static State<T>) {
+    pub fn editable_setting<
+        T: Serialize + DeserializeOwned + Clone + Default + Send + Sync + 'static,
+    >(
+        &mut self,
+        s: &'static State<T>,
+    ) {
         self.setting(s);
         self.handle(|cx: Cx, op: crate::Set<T>| async move {
             cx.write(|w| {
@@ -200,9 +363,16 @@ impl<'a> Setup<'a> {
     /// what is being checked right now). No transaction and no core config:
     /// `cx.set_live` / `cx.update_live` replace it and repaint the UI; read it
     /// with `cx.live(&S)` (or `snap.live`). Not available to `p.core`.
-    pub fn live<T: Send + Sync + 'static>(&mut self, s: &'static State<T>, init: impl Fn() -> T + Send + Sync + 'static) {
+    pub fn live<T: Send + Sync + 'static>(
+        &mut self,
+        s: &'static State<T>,
+        init: impl Fn() -> T + Send + Sync + 'static,
+    ) {
         self.reg.declare(s.name, self.plugin);
-        self.reg.live.push((s.name, Box::new(move || Arc::new(crate::state::Live::new(init())) as Value)));
+        self.reg.live.push((
+            s.name,
+            Box::new(move || Arc::new(crate::state::Live::new(init())) as Value),
+        ));
     }
     /// Custom persistence for data that does not fit one table.
     pub fn persist<T: Send + Sync + 'static>(
@@ -217,21 +387,46 @@ impl<'a> Setup<'a> {
             s.name,
             self.plugin,
             Persist {
-                register: Box::new(register),
+                register: Box::new(move |store, _| register(store)),
                 load: Box::new(move |tx| load(tx).map(|v| Arc::new(v) as Value)),
-                save: Box::new(move |tx, a, b| save(tx, a.downcast_ref().unwrap(), b.downcast_ref().unwrap())),
+                save: Box::new(move |tx, a, b| {
+                    save(tx, a.downcast_ref().unwrap(), b.downcast_ref().unwrap())
+                }),
+                fallback: None,
             },
         ));
     }
-    /// Run raw SQL once at startup before state is loaded (schema fixes).
-    pub fn migrate(&mut self, f: impl Fn(&crate::store::rusqlite::Connection) -> Result<()> + Send + Sync + 'static) {
+    /// A schema step that runs once, before state loads, in its own
+    /// transaction: `p.migrate(1, |sql| …)`, then 2, 3… for later changes.
+    /// Not needed for new nullable columns or `#[column(default = "…")]`.
+    pub fn migrate(
+        &mut self,
+        version: u32,
+        f: impl Fn(&crate::store::rusqlite::Connection) -> Result<()> + Send + Sync + 'static,
+    ) {
         let me = self.me();
-        self.reg.migrations.push((me, Box::new(f)));
+        assert!(
+            !self
+                .reg
+                .migrations
+                .iter()
+                .any(|(p, v, _)| *p == me && *v == version),
+            "migration {version} of {} is registered twice",
+            self.plugin_id()
+        );
+        self.reg.migrations.push((me, version, Box::new(f)));
     }
     /// Delete child rows whose parent row disappeared, in the same transaction.
-    pub fn cascade<P: Record, C: Record>(&mut self, parent: &'static State<Vec<P>>, child: &'static State<Vec<C>>, key: fn(&C) -> Id) {
+    pub fn cascade<P: Record, C: Record>(
+        &mut self,
+        parent: &'static State<Vec<P>>,
+        child: &'static State<Vec<C>>,
+        key: fn(&C) -> Id,
+    ) {
         self.reg.cascades.push(Arc::new(move |base, w| {
-            let (Some(before), true) = (base.try_get(parent), base.try_get(child).is_some()) else { return };
+            let (Some(before), true) = (base.try_get(parent), base.try_get(child).is_some()) else {
+                return;
+            };
             if !w.changed.contains_key(parent.name) {
                 return;
             }
@@ -254,7 +449,10 @@ impl<'a> Setup<'a> {
         F: Fn(Cx, O) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<O::Reply>> + Send + 'static,
     {
-        self.chain(Rank::Default, Arc::new(move |cx, op, _next| Box::pin(f(cx, op))))
+        self.chain(
+            Rank::Default,
+            Arc::new(move |cx, op, _next| Box::pin(f(cx, op))),
+        )
     }
     /// Put a handler in front of the existing ones. Call `next.run(&cx, op)` to continue.
     pub fn wrap<O: Op, F, Fut>(&mut self, f: F) -> HandlerSpec<'_, O>
@@ -262,7 +460,10 @@ impl<'a> Setup<'a> {
         F: Fn(Cx, O, Next<O>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<O::Reply>> + Send + 'static,
     {
-        self.chain(Rank::Specific, Arc::new(move |cx, op, next| Box::pin(f(cx, op, next))))
+        self.chain(
+            Rank::Specific,
+            Arc::new(move |cx, op, next| Box::pin(f(cx, op, next))),
+        )
     }
     fn chain<O: Op>(&mut self, rank: Rank, f: crate::op::HandlerFn<O>) -> HandlerSpec<'_, O> {
         let plugin = self.me();
@@ -275,44 +476,80 @@ impl<'a> Setup<'a> {
             .or_insert_with(|| Box::new(Handlers::<O>(Vec::new())))
             .downcast_mut::<Handlers<O>>()
             .unwrap();
-        list.0.push(Handler { f, claim: None, rank, plugin, seq });
+        list.0.push(Handler {
+            f,
+            claim: None,
+            rank,
+            plugin,
+            seq,
+        });
         let index = list.0.len() - 1;
-        HandlerSpec { list: &mut list.0, index }
+        HandlerSpec {
+            list: &mut list.0,
+            index,
+        }
     }
-    /// Observe an event (after commit). Errors are shown as notifications.
-    pub fn on<E: Clone + Send + Sync + 'static, F, Fut>(&mut self, f: F)
+    /// Observe an event (after commit). Every event runs the handler at once
+    /// (see [`ObserverSpec`] for other policies). Errors are shown as
+    /// notifications; runs still going are cancelled when the plugin stops.
+    pub fn on<E: Clone + Send + Sync + 'static, F, Fut>(&mut self, f: F) -> ObserverSpec<'_>
     where
         F: Fn(Cx, E) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
         let plugin = self.plugin.unwrap_or(usize::MAX);
-        self.reg.observers.entry(TypeId::of::<E>()).or_default().push(Observer {
+        let list = self.reg.observers.entry(TypeId::of::<E>()).or_default();
+        list.push(Observer {
             plugin,
-            f: Arc::new(move |cx, e| e.downcast_ref::<E>().map(|e| Box::pin(f(cx, e.clone())) as BoxFut<()>)),
+            f: Arc::new(move |cx, e| {
+                e.downcast_ref::<E>()
+                    .map(|e| Box::pin(f(cx, e.clone())) as BoxFut<()>)
+            }),
+            policy: Policy::Parallel,
         });
+        ObserverSpec {
+            observer: list.last_mut().expect("just pushed"),
+        }
     }
     /// Observe commits that touched any of the given states, e.g. `[RULES.name]`.
-    pub fn on_change<F, Fut>(&mut self, states: impl IntoIterator<Item = &'static str>, f: F)
+    pub fn on_change<F, Fut>(
+        &mut self,
+        states: impl IntoIterator<Item = &'static str>,
+        f: F,
+    ) -> ObserverSpec<'_>
     where
         F: Fn(Cx) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
-        let states: Arc<Vec<&'static str>> = Arc::new(states.into_iter().collect());
-        let f = Arc::new(f);
-        self.on(move |cx, e: crate::Changed| {
-            let hit = e.states.iter().any(|s| states.contains(s));
-            let f = f.clone();
-            async move {
-                if hit {
-                    f(cx).await
-                } else {
-                    Ok(())
-                }
-            }
+        let states: Vec<&'static str> = states.into_iter().collect();
+        let plugin = self.plugin.unwrap_or(usize::MAX);
+        let list = self
+            .reg
+            .observers
+            .entry(TypeId::of::<crate::Changed>())
+            .or_default();
+        // Commits that touch none of `states` start nothing (and cancel nothing).
+        list.push(Observer {
+            plugin,
+            f: Arc::new(move |cx, e| {
+                let e = e.downcast_ref::<crate::Changed>()?;
+                e.states
+                    .iter()
+                    .any(|s| states.contains(s))
+                    .then(|| Box::pin(f(cx)) as BoxFut<()>)
+            }),
+            policy: Policy::Parallel,
         });
+        ObserverSpec {
+            observer: list.last_mut().expect("just pushed"),
+        }
     }
     /// Answer a hook.
-    pub fn hook<I: ?Sized + 'static, O: 'static>(&mut self, hook: &'static Hook<I, O>, f: impl Fn(&Snapshot, &I) -> O + Send + Sync + 'static) {
+    pub fn hook<I: ?Sized + 'static, O: 'static>(
+        &mut self,
+        hook: &'static Hook<I, O>,
+        f: impl Fn(&Snapshot, &I) -> O + Send + Sync + 'static,
+    ) {
         self.reg
             .hooks
             .entry(hook.id)
@@ -328,7 +565,12 @@ impl<'a> Setup<'a> {
         self.reg.fragments.push((me, Arc::new(f)));
     }
     /// Start `op` periodically. `every` is re-read after each commit; `None` pauses it.
-    pub fn every<O: Op>(&mut self, name: &str, every: impl Fn(&Snapshot) -> Option<Duration> + Send + Sync + 'static, make: impl Fn() -> O + Send + Sync + 'static) {
+    pub fn every<O: Op>(
+        &mut self,
+        name: &str,
+        every: impl Fn(&Snapshot) -> Option<Duration> + Send + Sync + 'static,
+        make: impl Fn() -> O + Send + Sync + 'static,
+    ) {
         let plugin = self.me();
         let name = format!("{}/{name}", self.plugin_id());
         let make = Arc::new(make);
@@ -340,7 +582,16 @@ impl<'a> Setup<'a> {
             every: Arc::new(every),
             task: Arc::new(move |cx| {
                 let make = make.clone();
-                cx.task_with(make().job().unwrap_or_else(|| crate::JobSpec::new(fallback.clone())), Some(last_error.clone()), move || make())
+                let op = make();
+                let spec = op
+                    .job()
+                    .unwrap_or_else(|| crate::JobSpec::new(fallback.clone()));
+                cx.task_with(
+                    cx.job_key(&op, &spec.key),
+                    spec,
+                    Some(last_error.clone()),
+                    move || make(),
+                )
             }),
         });
     }
@@ -349,7 +600,12 @@ impl<'a> Setup<'a> {
     /// After each commit the spec is recomputed; when it changes the task is
     /// stopped and started again with the new spec. Kernel shutdown stops it.
     /// An error ends the task and is shown as a notice.
-    pub fn service<S, F, Fut>(&mut self, name: &str, spec: impl Fn(&Snapshot) -> Option<S> + Send + Sync + 'static, run: F) -> ServiceSetup<'_, S>
+    pub fn service<S, F, Fut>(
+        &mut self,
+        name: &str,
+        spec: impl Fn(&Snapshot) -> Option<S> + Send + Sync + 'static,
+        run: F,
+    ) -> ServiceSetup<'_, S>
     where
         S: Clone + PartialEq + Send + Sync + 'static,
         F: Fn(Cx, S) -> Fut + Send + Sync + 'static,
@@ -360,41 +616,74 @@ impl<'a> Setup<'a> {
         self.reg.services.push(Service {
             plugin,
             name,
-            spec: Arc::new(move |snap| spec(snap).map(|s| Arc::new(s) as Arc<dyn Any + Send + Sync>)),
-            same: Arc::new(|a, b| a.downcast_ref::<S>().is_some_and(|a| b.downcast_ref::<S>() == Some(a))),
+            spec: Arc::new(move |snap| {
+                spec(snap).map(|s| Arc::new(s) as Arc<dyn Any + Send + Sync>)
+            }),
+            same: Arc::new(|a, b| {
+                a.downcast_ref::<S>()
+                    .is_some_and(|a| b.downcast_ref::<S>() == Some(a))
+            }),
             run: Arc::new(move |cx, s| {
                 let s = s.downcast_ref::<S>().expect("service spec type").clone();
                 Box::pin(run(cx, s))
             }),
             stop: None,
+            restart: false,
         });
-        ServiceSetup { service: self.reg.services.last_mut().expect("just pushed"), _spec: std::marker::PhantomData }
+        ServiceSetup {
+            service: self.reg.services.last_mut().expect("just pushed"),
+            _spec: std::marker::PhantomData,
+        }
     }
 
     // ---- UI ---------------------------------------------------------------
     /// Add a contribution to a zone. `order` sorts contributions (lower first).
-    pub fn fill<P: 'static>(&mut self, slot: &'static Slot<P>, id: &str, order: i32, f: impl Fn(&mut egui::Ui, &mut UiCx, &P) + Send + Sync + 'static) {
+    pub fn fill<P: 'static>(
+        &mut self,
+        slot: &'static Slot<P>,
+        id: &str,
+        order: i32,
+        f: impl Fn(&mut egui::Ui, &mut UiCx, &P) + Send + Sync + 'static,
+    ) {
         let plugin = self.me();
         let id = format!("{}/{id}", self.plugin_id());
         self.reg.fills.push((slot.id, plugin));
         let list = self.reg.contributions_mut(slot);
-        list.push(Contribution { id, plugin, order, view: Arc::new(f) });
+        list.push(Contribution {
+            id,
+            plugin,
+            order,
+            view: Arc::new(f),
+        });
         list.sort_by_key(|c| (c.order, c.plugin));
     }
     /// Replace another plugin's contribution (`"plugin/id"`).
-    pub fn replace<P: 'static>(&mut self, slot: &'static Slot<P>, contribution: &'static str, f: impl Fn(&mut egui::Ui, &mut UiCx, &P) + Send + Sync + 'static) {
+    pub fn replace<P: 'static>(
+        &mut self,
+        slot: &'static Slot<P>,
+        contribution: &'static str,
+        f: impl Fn(&mut egui::Ui, &mut UiCx, &P) + Send + Sync + 'static,
+    ) {
         let view: ViewFn<P> = Arc::new(f);
         self.reg.slot_edits.push(Box::new(move |reg| {
-            for c in reg.contributions_mut(slot).iter_mut().filter(|c| c.id == contribution) {
+            for c in reg.target(slot, contribution) {
                 c.view = view.clone();
             }
         }));
     }
     /// Wrap another plugin's contribution: `f(inner, ui, cx, props)`.
-    pub fn wrap_view<P: 'static>(&mut self, slot: &'static Slot<P>, contribution: &'static str, f: impl Fn(&dyn Fn(&mut egui::Ui, &mut UiCx, &P), &mut egui::Ui, &mut UiCx, &P) + Send + Sync + 'static) {
+    pub fn wrap_view<P: 'static>(
+        &mut self,
+        slot: &'static Slot<P>,
+        contribution: &'static str,
+        f: impl Fn(&dyn Fn(&mut egui::Ui, &mut UiCx, &P), &mut egui::Ui, &mut UiCx, &P)
+        + Send
+        + Sync
+        + 'static,
+    ) {
         let f = Arc::new(f);
         self.reg.slot_edits.push(Box::new(move |reg| {
-            for c in reg.contributions_mut(slot).iter_mut().filter(|c| c.id == contribution) {
+            for c in reg.target(slot, contribution) {
                 let inner = c.view.clone();
                 let f = f.clone();
                 c.view = Arc::new(move |ui, cx, p| f(&|ui, cx, p| inner(ui, cx, p), ui, cx, p));
@@ -404,16 +693,71 @@ impl<'a> Setup<'a> {
     /// Hide another plugin's contribution.
     pub fn hide<P: 'static>(&mut self, slot: &'static Slot<P>, contribution: &'static str) {
         self.reg.slot_edits.push(Box::new(move |reg| {
+            let _ = reg.target(slot, contribution).count();
             reg.contributions_mut(slot).retain(|c| c.id != contribution);
         }));
+    }
+    /// A tool opened from a toolbar: a button (icon, label, count) in
+    /// `toolbar` and, while open, a panel with a title and a close button in
+    /// `panel` above the page content. The kernel keeps the open state per
+    /// window and fits the button to narrow screens.
+    pub fn tool(
+        &mut self,
+        toolbar: &'static Slot<()>,
+        panel: &'static Slot<()>,
+        tool: Tool,
+        count: impl Fn(&Snapshot) -> usize + Send + Sync + 'static,
+        body: impl Fn(&mut egui::Ui, &mut UiCx) + Send + Sync + 'static,
+    ) {
+        let open = egui::Id::unique(("kernel-tool", self.plugin_id(), tool.id));
+        let is_open = move |ui: &egui::Ui| ui.data(|d| d.get_temp::<bool>(open).unwrap_or(false));
+        self.fill(toolbar, tool.id, tool.order, move |ui, cx, _| {
+            let n = count(cx.snapshot());
+            let on = is_open(ui);
+            if crate::kit::tool_button(ui, tool.icon, tool.label, n, on).clicked() {
+                ui.data_mut(|d| d.insert_temp(open, !on));
+            }
+        });
+        self.fill(panel, tool.id, tool.order, move |ui, cx, _| {
+            if !is_open(ui) {
+                return;
+            }
+            let pal = crate::kit::colors(ui);
+            crate::kit::row_line(ui, 24., |ui| {
+                ui.label(
+                    crate::kit::bold(tool.label, crate::kit::theme::BODY).color(pal.foreground),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if crate::kit::icon_button(
+                        ui,
+                        crate::kit::Icon::Close,
+                        &format!("Close {}", tool.label.to_lowercase()),
+                        true,
+                    )
+                    .clicked()
+                    {
+                        ui.data_mut(|d| d.insert_temp(open, false));
+                    }
+                });
+            });
+            body(ui, cx);
+        });
     }
     /// A page in the bottom navigation with its own per-session state.
     pub fn page<T: Page + Default + 'static>(&mut self, spec: PageSpec) {
         let plugin = self.me();
-        self.reg.pages.push(PageEntry { plugin, spec, make: Arc::new(|| Box::new(T::default())) });
+        self.reg.pages.push(PageEntry {
+            plugin,
+            spec,
+            make: Arc::new(|| Box::new(T::default())),
+        });
     }
     /// A stateless page.
-    pub fn page_fn(&mut self, spec: PageSpec, f: impl Fn(&mut egui::Ui, &mut UiCx) + Send + Sync + 'static) {
+    pub fn page_fn(
+        &mut self,
+        spec: PageSpec,
+        f: impl Fn(&mut egui::Ui, &mut UiCx) + Send + Sync + 'static,
+    ) {
         let plugin = self.me();
         let f = Arc::new(f);
         self.reg.pages.push(PageEntry {
@@ -425,6 +769,17 @@ impl<'a> Setup<'a> {
             }),
         });
     }
+}
+
+/// A toolbar tool, see [`Setup::tool`].
+#[derive(Clone, Copy)]
+pub struct Tool {
+    /// Unique within the plugin.
+    pub id: &'static str,
+    pub label: &'static str,
+    pub icon: crate::kit::Icon,
+    /// Lower comes first in the toolbar.
+    pub order: i32,
 }
 
 /// Fine-tune a just-registered handler.

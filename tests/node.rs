@@ -2,17 +2,17 @@
 //! VLESS + REALITY + XHTTP end to end, the camouflage site for probes without a
 //! key, and the exit-server chain (client → entry → node → internet).
 use plugin_exit_server as exit;
-use plugin_inbounds::{Inbound, INBOUNDS};
+use plugin_inbounds::{INBOUNDS, Inbound};
 use plugin_routing::{Route, Rule};
-use plugin_servers::{Select, SERVERS};
+use plugin_servers::{SERVERS, Select};
 use plugin_subscriptions::Source;
 use plugin_vless_server as vless;
-use rproxy_kernel::{list::Add, list::Save, Host, Id, Kernel, Update};
+use rproxy_kernel::{Host, Id, Kernel, Update, list::Add, list::Save};
 use std::{
     net::SocketAddr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -119,7 +119,7 @@ async fn start(dir: &std::path::Path, enable: &[&str]) -> (Arc<Host>, Inbound) {
     inbound.port = free_port().await;
     inbound.enabled = true;
     k.cx_for("inbounds")
-        .call(Save(inbound.clone()))
+        .call(Save::new(&INBOUNDS, inbound.clone()))
         .await
         .unwrap();
     (host, inbound)
@@ -143,11 +143,14 @@ async fn node(dir: &std::path::Path) -> (Arc<Host>, String, u16) {
     .unwrap();
     cx.call(vless::SetEnabled(true)).await.unwrap();
     k.cx_for("routing")
-        .call(Add::new(Rule {
-            id: Id::random(),
-            pattern: "*".into(),
-            action: Route::Direct,
-        }))
+        .call(Add::new(
+            &plugin_routing::RULES,
+            Rule {
+                id: Id::random(),
+                pattern: "*".into(),
+                action: Route::Direct,
+            },
+        ))
         .await
         .unwrap();
     until(&k, "camouflage site", |k| {
@@ -170,7 +173,7 @@ async fn node(dir: &std::path::Path) -> (Arc<Host>, String, u16) {
 }
 
 fn via(listener: u16) -> reqwest::Client {
-    reqwest::Client::builder()
+    rproxy_kernel::mihomo::http()
         .no_proxy()
         .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{listener}")).unwrap())
         .timeout(Duration::from_secs(8))
@@ -189,7 +192,7 @@ async fn vless_node_serves_clients_and_disguises_itself() {
     );
 
     // Without a client key the node is an ordinary HTTPS website.
-    let probe = reqwest::Client::builder()
+    let probe = rproxy_kernel::mihomo::http()
         .no_proxy()
         .tls_danger_accept_invalid_certs(true)
         .resolve("node.test", SocketAddr::from(([127, 0, 0, 1], node_port)))
@@ -208,7 +211,7 @@ async fn vless_node_serves_clients_and_disguises_itself() {
     let (client, inbound) = start(client_dir.path(), &[]).await;
     let k = client.kernel();
     k.cx_for("subscriptions")
-        .call(Add::new(Source::new(link)))
+        .call(Add::new(&plugin_subscriptions::SOURCES, Source::new(link)))
         .await
         .unwrap();
     until(&k, "server from link", |k| {
@@ -255,7 +258,10 @@ async fn exit_server_chains_after_the_selected_server_and_fails_closed() {
                 tokio::spawn(async move {
                     let mut buf = vec![0; 4096];
                     if s.read(&mut buf).await.unwrap_or(0) > 0 {
-                        let msg = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                        let msg = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
                         let _ = s.write_all(msg.as_bytes()).await;
                     }
                 });
@@ -264,9 +270,10 @@ async fn exit_server_chains_after_the_selected_server_and_fails_closed() {
         port
     };
     k.cx_for("subscriptions")
-        .call(Add::new(Source::new(format!(
-            "http://127.0.0.1:{provider}/sub"
-        ))))
+        .call(Add::new(
+            &plugin_subscriptions::SOURCES,
+            Source::new(format!("http://127.0.0.1:{provider}/sub")),
+        ))
         .await
         .unwrap();
     until(&k, "entry server", |k| {
@@ -281,11 +288,14 @@ async fn exit_server_chains_after_the_selected_server_and_fails_closed() {
 
     // The exit: the node's link, added on the Exit server page.
     k.cx_for("exit-server")
-        .call(Add::new(exit::Exit {
-            id: Id::random(),
-            name: String::new(),
-            link,
-        }))
+        .call(Add::new(
+            &exit::EXITS,
+            exit::Exit {
+                id: Id::random(),
+                name: String::new(),
+                link,
+            },
+        ))
         .await
         .unwrap();
     until(&k, "exit in use", |k| exit::active(&k.snapshot()).is_some()).await;
@@ -312,11 +322,13 @@ async fn exit_server_chains_after_the_selected_server_and_fails_closed() {
         .call(Select::manual(None))
         .await
         .unwrap();
-    assert!(via(inbound.port)
-        .get(format!("http://127.0.0.1:{target}/"))
-        .send()
-        .await
-        .is_err_or_not_ok());
+    assert!(
+        via(inbound.port)
+            .get(format!("http://127.0.0.1:{target}/"))
+            .send()
+            .await
+            .is_err_or_not_ok()
+    );
 
     // Exit off: one hop again.
     k.cx_for("servers")

@@ -28,13 +28,10 @@ pub static PLUGIN: Plugin = Plugin {
     id: "exit-server",
     name: "Exit server",
     description: "Send all traffic through one stable exit server after the selected server.",
-    category: categories::NETWORK,
     // Links are parsed with format-uri's parser; the plugin itself may be off (a node).
     requires: &["servers"],
-    required: false,
-    default_enabled: true,
-    platforms: Platform::ALL,
     setup,
+    ..Plugin::DEFAULT
 };
 
 pub mod warp;
@@ -100,7 +97,7 @@ pub struct SetUpWarp;
 impl Op for SetUpWarp {
     type Reply = ();
     fn job(&self) -> Option<JobSpec> {
-        Some(JobSpec::keyed("exit-server/warp", "Set up WARP").page("exit-server"))
+        Some(JobSpec::new("Set up WARP").page("exit-server"))
     }
 }
 /// Forget the WARP device.
@@ -160,7 +157,7 @@ impl Op for CheckExit {
     type Reply = u32;
     fn job(&self) -> Option<JobSpec> {
         Some(
-            JobSpec::keyed("exit-server/check", "Check exit server")
+            JobSpec::new("Check exit server")
                 .quiet()
                 .page("exit-server"),
         )
@@ -221,7 +218,11 @@ fn setup(p: &mut Setup) -> Result<()> {
     p.every(
         "check",
         // Only while there is something to check: no entry is shown on the page, not as an error.
-        |s| plan(s).filter(|_| !through_entry(s) || s.get(&servers::SELECTED).is_some()).map(|_| Duration::from_secs(120)),
+        |s| {
+            plan(s)
+                .filter(|_| !through_entry(s) || s.get(&servers::SELECTED).is_some())
+                .map(|_| Duration::from_secs(120))
+        },
         || CheckExit,
     );
     p.wrap(redial_on_new_entry);
@@ -236,7 +237,11 @@ async fn set_up_warp(cx: Cx, _: SetUpWarp) -> Result<()> {
     cx.write(move |w| {
         w.set(&WARP_ACCOUNT, Some(account));
         if w.get(&SETTINGS).warp == WarpUse::Off {
-            let warp = if active(w.base()).is_some() { WarpUse::Backup } else { WarpUse::Only };
+            let warp = if active(w.base()).is_some() {
+                WarpUse::Backup
+            } else {
+                WarpUse::Only
+            };
             w.update(&SETTINGS, |s| s.warp = warp);
         }
         Ok(())
@@ -283,7 +288,11 @@ async fn check_exit(cx: Cx, _: CheckExit) -> Result<u32> {
     if through_entry(&snap) && snap.get(&servers::SELECTED).is_none() {
         bail!("Connect to a server first: it is the entry to the exit server.");
     }
-    let result = cx.core().delay(plan.target(), PROBE_URL, 6000).await.map_err(|e| e.message);
+    let result = cx
+        .core()
+        .delay(plan.target(), PROBE_URL, 6000)
+        .await
+        .map_err(|e| e.message);
     cx.set_live(&PROBE, Some((result.clone(), now())));
     result.map_err(|_| Error::msg("The exit did not answer."))
 }
@@ -291,7 +300,11 @@ async fn check_exit(cx: Cx, _: CheckExit) -> Result<u32> {
 /// The exit keeps its transport connections (XHTTP reuse) open for a long
 /// time. A new entry or a disconnect must take effect now: rebuild the exit
 /// so new connections are dialed through the current entry, or not at all.
-async fn redial_on_new_entry(cx: Cx, op: servers::Select, next: Next<servers::Select>) -> Result<()> {
+async fn redial_on_new_entry(
+    cx: Cx,
+    op: servers::Select,
+    next: Next<servers::Select>,
+) -> Result<()> {
     let before = *cx.get(&servers::SELECTED);
     next.run(&cx, op).await?;
     let snap = cx.snapshot();
@@ -321,13 +334,17 @@ fn fragment(snap: &Snapshot) -> Fragment {
             options,
         });
     }
-    if let (Plan::Warp | Plan::ExitThenWarp(_), Some(account)) = (&plan, &*snap.get(&WARP_ACCOUNT)) {
+    if let (Plan::Warp | Plan::ExitThenWarp(_), Some(account)) = (&plan, &*snap.get(&WARP_ACCOUNT))
+    {
         f.proxies.push(warp::proxy(WARP, account, dial));
     }
     if matches!(plan, Plan::ExitThenWarp(_)) {
         f.groups.push(mihomo::Group {
             name: EXIT_ROUTE.into(),
-            kind: mihomo::GroupKind::Fallback { url: PROBE_URL.into(), interval_secs: 60 },
+            kind: mihomo::GroupKind::Fallback {
+                url: PROBE_URL.into(),
+                interval_secs: 60,
+            },
             members: vec![Target::Proxy(EXIT.into()), Target::Proxy(WARP.into())],
             selected: None,
         });
@@ -399,23 +416,39 @@ fn route_line(ui: &mut egui::Ui, snap: &Snapshot, plan: &Plan) {
 }
 
 fn ui(p: &mut Setup) {
-    p.page_fn(PageSpec { id: "exit-server", title: "Exit server", icon: Icon::Exit, order: 45 }, |ui, cx| {
-        let snap = cx.snapshot().clone();
-        let exits = snap.get(&EXITS);
-        let current = plan(&snap);
-        let counter = match &current {
-            Some(p) => format!("Using {}", p.name()),
-            None if exits.is_empty() && snap.get(&WARP_ACCOUNT).is_none() => String::new(),
-            None => "Off".into(),
-        };
-        kit::page_header(ui, "Exit server", &counter, |ui| {
-            if current.is_some() {
-                cx.job_button(ui, Icon::Checks, "Check", 80., cx.core_status().running(), || CheckExit);
-            }
-        });
+    p.page_fn(
+        PageSpec {
+            id: "exit-server",
+            title: "Exit server",
+            icon: Icon::Exit,
+            order: 45,
+        },
+        |ui, cx| {
+            let snap = cx.snapshot().clone();
+            let exits = snap.get(&EXITS);
+            let current = plan(&snap);
+            let counter = match &current {
+                Some(p) => format!("Using {}", p.name()),
+                None if exits.is_empty() && snap.get(&WARP_ACCOUNT).is_none() => String::new(),
+                None => "Off".into(),
+            };
+            kit::page_header(ui, "Exit server", &counter, |ui| {
+                if current.is_some() {
+                    cx.job_button(
+                        ui,
+                        Icon::Checks,
+                        "Check",
+                        cx.core_status().running(),
+                        || CheckExit,
+                    );
+                }
+            });
 
-        kit::page_scroll(ui, "exit-server", |ui| body(ui, cx, &snap, current.as_ref()));
-    });
+            kit::page_scroll(ui, "exit-server", |ui| {
+                body(ui, cx, &snap, current.as_ref())
+            });
+        },
+    );
     status(p);
 }
 
@@ -454,7 +487,7 @@ fn body(ui: &mut egui::Ui, cx: &mut UiCx, snap: &Snapshot, current: Option<&Plan
                 "Cloudflare WARP",
                 "A free exit on a Cloudflare address, or a backup when the exit server is down",
                 |ui| {
-                    cx.job_button(ui, Icon::Add, "Set up WARP", 120., true, || SetUpWarp);
+                    cx.job_button(ui, Icon::Add, "Set up WARP", true, || SetUpWarp);
                 },
             ),
             Some(_) => {
@@ -464,10 +497,7 @@ fn body(ui: &mut egui::Ui, cx: &mut UiCx, snap: &Snapshot, current: Option<&Plan
                     "Cloudflare WARP",
                     "Backup: used when the exit server does not answer. Exit: WARP is the exit",
                     |ui| {
-                        if kit::Button::ghost("Remove")
-                            .show(ui)
-                            .clicked()
-                        {
+                        if kit::Button::ghost("Remove").show(ui).clicked() {
                             cx.submit("remove-warp", RemoveWarp);
                         }
                         if kit::segmented(
@@ -488,30 +518,56 @@ fn body(ui: &mut egui::Ui, cx: &mut UiCx, snap: &Snapshot, current: Option<&Plan
     });
     ui.add_space(theme::SECTION_GAP);
     ListEditor::new(&EXITS)
-            .unordered()
-            .add_form("Add exit server", || Exit { id: Id::random(), name: String::new(), link: String::new() }, |ui, e, width| {
-                let r = kit::input(ui, "link", &mut e.link, "Exit server link (vless://…)", width, false);
+        .unordered()
+        .add_form(
+            "Add exit server",
+            || Exit {
+                id: Id::random(),
+                name: String::new(),
+                link: String::new(),
+            },
+            |ui, e, width| {
+                let r = kit::input(
+                    ui,
+                    "link",
+                    &mut e.link,
+                    "Exit server link (vless://…)",
+                    width,
+                    false,
+                );
                 kit::submitted(ui, &r) && !e.link.trim().is_empty()
-            })
-            .leading(16., |ui, cx, e: &Exit| {
-                let pal = kit::colors(ui);
+            },
+        )
+        .leading(16., |ui, cx, e: &Exit| {
+            let pal = kit::colors(ui);
+            let on = *cx.get(&ACTIVE) == Some(e.id);
+            kit::icon(
+                ui,
+                if on { Icon::Connected } else { Icon::Circle },
+                16.,
+                if on { pal.success } else { pal.faint },
+            );
+        })
+        .column(Column::edit("Name", "Exit server name", |e: &mut Exit| {
+            &mut e.name
+        }))
+        .column(Column::text("Address", Exit::address).width(150.))
+        .column(
+            Column::custom("", 84., |ui, cx, e: &Exit| {
                 let on = *cx.get(&ACTIVE) == Some(e.id);
-                kit::icon(ui, if on { Icon::Connected } else { Icon::Circle }, 16., if on { pal.success } else { pal.faint });
+                let (label, next) = if on {
+                    ("Turn off", None)
+                } else {
+                    ("Use", Some(e.id))
+                };
+                if kit::Button::ghost(label).show(ui).clicked() {
+                    cx.submit("use", Use(next));
+                }
             })
-            .column(Column::edit("Name", "Exit server name", |e: &mut Exit| &mut e.name))
-            .column(Column::text("Address", Exit::address).width(150.))
-            .column(
-                Column::custom("", 84., |ui, cx, e: &Exit| {
-                    let on = *cx.get(&ACTIVE) == Some(e.id);
-                    let (label, next) = if on { ("Turn off", None) } else { ("Use", Some(e.id)) };
-                    if kit::Button::ghost(label).show(ui).clicked() {
-                        cx.submit("use", Use(next));
-                    }
-                })
-                .right(),
-            )
-            .empty(Icon::Exit, "No exit server")
-            .show(ui, cx);
+            .right(),
+        )
+        .empty(Icon::Exit, "No exit server")
+        .show(ui, cx);
 }
 
 fn status(p: &mut Setup) {
@@ -522,16 +578,13 @@ fn status(p: &mut Setup) {
         let pal = kit::colors(ui);
         let failed = matches!(&*cx.live(&PROBE), Some((Err(_), _)));
         let color = if failed { pal.danger } else { pal.accent };
-        if kit::chip(
+        let text = format!("Exit · {}", e.name());
+        cx.status_chip(
             ui,
-            Some(kit::Lead::Icon(Icon::Exit, color)),
-            &format!("Exit · {}", e.name()),
+            kit::Lead::Icon(Icon::Exit, color),
+            &text,
             "Traffic leaves through the exit server",
-        )
-        .clicked()
-        {
-            cx.toggle_panels();
-        }
+        );
     });
     p.fill(&PANELS, "exit", 15, |ui, cx, _| {
         let snap = cx.snapshot().clone();

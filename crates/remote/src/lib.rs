@@ -5,12 +5,12 @@
 //! [`ToHost::Input`] with the raw egui input of a frame. The protocol never
 //! depends on the application: new screens and plugins need no client update.
 use egui::{
-    epaint::{
-        textures::TextureOptions, BandShape, CircleShape, ClippedShape, CubicBezierShape, EllipseShape,
-        Galley, Mesh, PathShape, QuadraticBezierShape, RectShape, Shape, TextShape,
-    },
-    emath::TSTransform,
     Color32, ImageData, Pos2, Rect, Stroke, TextureId,
+    emath::TSTransform,
+    epaint::{
+        BandShape, CircleShape, ClippedShape, CubicBezierShape, EllipseShape, Galley, Mesh,
+        PathShape, QuadraticBezierShape, RectShape, Shape, TextShape, textures::TextureOptions,
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -77,7 +77,10 @@ pub struct Texture {
 pub enum WireShape {
     Circle(CircleShape),
     Ellipse(EllipseShape),
-    Line { points: [Pos2; 2], stroke: Stroke },
+    Line {
+        points: [Pos2; 2],
+        stroke: Stroke,
+    },
     Path(PathShape),
     Rect(RectShape),
     Band(BandShape),
@@ -105,7 +108,10 @@ pub struct Item {
 #[derive(Serialize, Deserialize)]
 pub enum ShapeOp {
     /// Reuse `len` items of the previous frame starting at `from`.
-    Keep { from: u32, len: u32 },
+    Keep {
+        from: u32,
+        len: u32,
+    },
     New(Vec<Item>),
 }
 
@@ -126,17 +132,28 @@ pub fn pack<T: Serialize>(value: &T) -> Vec<u8> {
     miniz_oxide::deflate::compress_to_vec(&bytes, 1)
 }
 pub fn unpack<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, String> {
-    let raw = miniz_oxide::inflate::decompress_to_vec_with_limit(bytes, 256 << 20).map_err(|e| format!("{e:?}"))?;
+    let raw = miniz_oxide::inflate::decompress_to_vec_with_limit(bytes, 256 << 20)
+        .map_err(|e| format!("{e:?}"))?;
     postcard::from_bytes(&raw).map_err(|e| e.to_string())
 }
 
 #[allow(dead_code)]
 pub(crate) fn image(data: &ImageData) -> Image {
     match data {
-        ImageData::Color(c) if c.pixels.iter().all(|p| p.r() == p.a() && p.g() == p.a() && p.b() == p.a()) => {
-            Image::Font { size: c.size, coverage: c.pixels.iter().map(|p| p.a()).collect() }
+        ImageData::Color(c)
+            if c.pixels
+                .iter()
+                .all(|p| p.r() == p.a() && p.g() == p.a() && p.b() == p.a()) =>
+        {
+            Image::Font {
+                size: c.size,
+                coverage: c.pixels.iter().map(|p| p.a()).collect(),
+            }
         }
-        ImageData::Color(c) => Image::Color { size: c.size, rgba: c.pixels.iter().flat_map(|p| p.to_array()).collect() },
+        ImageData::Color(c) => Image::Color {
+            size: c.size,
+            rgba: c.pixels.iter().flat_map(|p| p.to_array()).collect(),
+        },
     }
 }
 #[allow(dead_code)]
@@ -144,18 +161,31 @@ pub(crate) fn image_data(i: Image) -> ImageData {
     match i {
         Image::Color { size, rgba } => ImageData::Color(Arc::new(egui::ColorImage::new(
             size,
-            rgba.as_chunks::<4>().0.iter().map(|[r, g, b, a]| Color32::from_rgba_premultiplied(*r, *g, *b, *a)).collect(),
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|[r, g, b, a]| Color32::from_rgba_premultiplied(*r, *g, *b, *a))
+                .collect(),
         ))),
         Image::Font { size, coverage } => ImageData::Color(Arc::new(egui::ColorImage::new(
             size,
-            coverage.into_iter().map(|v| Color32::from_rgba_premultiplied(v, v, v, v)).collect(),
+            coverage
+                .into_iter()
+                .map(|v| Color32::from_rgba_premultiplied(v, v, v, v))
+                .collect(),
         ))),
     }
 }
 
 /// Convert an epaint shape; galleys are replaced by ids from `galley`.
 #[allow(dead_code)]
-pub(crate) fn wire(shape: Shape, clip: Rect, transform: TSTransform, galley: &mut impl FnMut(&Arc<Galley>) -> u64, out: &mut Vec<Item>) {
+pub(crate) fn wire(
+    shape: Shape,
+    clip: Rect,
+    transform: TSTransform,
+    galley: &mut impl FnMut(&Arc<Galley>) -> u64,
+    out: &mut Vec<Item>,
+) {
     let s = match shape {
         Shape::Noop | Shape::Callback(_) => return,
         Shape::Vec(list) => {
@@ -183,20 +213,38 @@ pub(crate) fn wire(shape: Shape, clip: Rect, transform: TSTransform, galley: &mu
         Shape::QuadraticBezier(q) => WireShape::Quadratic(q),
         Shape::CubicBezier(c) => WireShape::Cubic(c),
     };
-    out.push(Item { clip, shape: s, transform });
+    out.push(Item {
+        clip,
+        shape: s,
+        transform,
+    });
 }
 
 /// Back to an epaint shape (text needs the cached galley).
 #[allow(dead_code)]
-pub(crate) fn unwire(item: &Item, galley: impl Fn(u64) -> Option<Arc<Galley>>) -> Option<ClippedShape> {
+pub(crate) fn unwire(
+    item: &Item,
+    galley: impl Fn(u64) -> Option<Arc<Galley>>,
+) -> Option<ClippedShape> {
     let shape = match &item.shape {
         WireShape::Circle(c) => Shape::Circle(*c),
         WireShape::Ellipse(e) => Shape::Ellipse(*e),
-        WireShape::Line { points, stroke } => Shape::LineSegment { points: *points, stroke: *stroke },
+        WireShape::Line { points, stroke } => Shape::LineSegment {
+            points: *points,
+            stroke: *stroke,
+        },
         WireShape::Path(p) => Shape::Path(p.clone()),
         WireShape::Rect(r) => Shape::Rect(r.clone()),
         WireShape::Band(b) => Shape::Band(b.clone()),
-        WireShape::Text { pos, galley: id, underline, fallback_color, override_text_color, opacity_factor, angle } => {
+        WireShape::Text {
+            pos,
+            galley: id,
+            underline,
+            fallback_color,
+            override_text_color,
+            opacity_factor,
+            angle,
+        } => {
             let mut t = TextShape::new(*pos, galley(*id)?, *fallback_color);
             t.underline = *underline;
             t.override_text_color = *override_text_color;
@@ -208,7 +256,11 @@ pub(crate) fn unwire(item: &Item, galley: impl Fn(u64) -> Option<Arc<Galley>>) -
         WireShape::Quadratic(q) => Shape::QuadraticBezier(q.clone()),
         WireShape::Cubic(c) => Shape::CubicBezier(c.clone()),
     };
-    Some(ClippedShape { clip_rect: item.clip, shape, transform_after_tessellation: item.transform })
+    Some(ClippedShape {
+        clip_rect: item.clip,
+        shape,
+        transform_after_tessellation: item.transform,
+    })
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -236,8 +288,18 @@ mod tests {
             let bytes = enc.encode(out);
             let frame: Frame = unpack(&bytes).unwrap();
             let _ = scene.apply(&client, frame);
-            let verts: usize = scene.primitives.iter().map(|p| match &p.primitive { Primitive::Mesh(m) => m.vertices.len(), _ => 0 }).sum();
-            assert!(shapes == 0 || verts > 0, "frame {i}: {shapes} shapes but nothing to paint");
+            let verts: usize = scene
+                .primitives
+                .iter()
+                .map(|p| match &p.primitive {
+                    Primitive::Mesh(m) => m.vertices.len(),
+                    _ => 0,
+                })
+                .sum();
+            assert!(
+                shapes == 0 || verts > 0,
+                "frame {i}: {shapes} shapes but nothing to paint"
+            );
         }
     }
 }

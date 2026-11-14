@@ -2,8 +2,8 @@
 //! and timer generation checks share a lock. No user code runs under it.
 use crate::changes::Changes;
 use crate::{
-    board::{Board, Phase, Run, RunId, Schedule},
     Error, Result,
+    board::{Board, Phase, Run, RunId, Schedule},
 };
 use futures_util::FutureExt;
 use std::{
@@ -17,7 +17,7 @@ use std::{
 use tokio::{
     runtime::Handle,
     sync::watch,
-    time::{sleep_until, Instant},
+    time::{Instant, sleep_until},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -61,9 +61,6 @@ pub struct Timing {
     pub every: Option<Duration>,
 }
 impl Timing {
-    pub fn once(after: Duration) -> Self {
-        Self { after, every: None }
-    }
     pub fn repeating(after: Duration, every: Duration) -> Self {
         Self {
             after,
@@ -178,19 +175,11 @@ impl JobContext {
     }
     /// The run as the board shows it now.
     pub fn run(&self) -> Option<Run> {
-        self.jobs.lock().runs.get(&self.id).map(|slot| slot.run.clone())
-    }
-    /// Call immediately before the first irreversible operation.
-    pub fn begin_commit(&self) -> Result<()> {
-        let mut s = self.jobs.lock();
-        let slot = s.runs.get_mut(&self.id).ok_or_else(missing)?;
-        self.checkpoint()?;
-        if !slot.run.phase.active() {
-            return Err(busy());
-        }
-        slot.run.phase = Phase::Committing;
-        self.jobs.changed();
-        Ok(())
+        self.jobs
+            .lock()
+            .runs
+            .get(&self.id)
+            .map(|slot| slot.run.clone())
     }
 }
 fn cancelled() -> Error {
@@ -248,7 +237,10 @@ impl Jobs {
     /// Wait handle of a run that is still tracked.
     pub fn handle(&self, id: RunId) -> Option<JobHandle> {
         let s = self.lock();
-        s.runs.get(&id).map(|slot| JobHandle { id, finished: slot.finished.subscribe() })
+        s.runs.get(&id).map(|slot| JobHandle {
+            id,
+            finished: slot.finished.subscribe(),
+        })
     }
     pub fn start(&self, task: Task) -> Result<JobHandle> {
         let mut s = self.lock();
@@ -300,7 +292,9 @@ impl Jobs {
             let result = AssertUnwindSafe(async move { (task.body)(cx).await })
                 .catch_unwind()
                 .await
-                .unwrap_or_else(|_| Err(Error::new("panic", "Job panicked")));
+                .unwrap_or_else(|panic| {
+                    Err(Error::new("panic", crate::kernel::panic_text(&*panic)))
+                });
             let mut s = jobs.lock();
             let slot = s.runs.get_mut(&id).expect("active worker registered");
             slot.run.phase = match (slot.run.phase, result) {
@@ -346,23 +340,6 @@ impl Jobs {
             _ => Err(busy()),
         }
     }
-    /// Stop this exact run and queue a fresh one. It may start only after cleanup.
-    pub fn postpone(&self, id: RunId, delay: Duration) -> Result<String> {
-        let timing = Timing::once(delay);
-        let due = timing.deadline()?;
-        let mut s = self.lock();
-        ensure_open(&s)?;
-        let slot = s.runs.get_mut(&id).ok_or_else(missing)?;
-        let name = format!("@defer/{id}");
-        if !matches!(slot.run.phase, Phase::Running | Phase::Cancelling) {
-            return Err(busy());
-        }
-        slot.run.phase = Phase::Cancelling;
-        slot.stop.cancel();
-        let task = slot.task.clone().ok_or_else(busy)?;
-        self.set_plan(&mut s, name.clone(), task, timing, due);
-        Ok(name)
-    }
     pub fn schedule(&self, name: impl Into<String>, task: Task, timing: Timing) -> Result<()> {
         let name = name.into();
         if name.trim().is_empty() || name.starts_with('@') {
@@ -375,14 +352,6 @@ impl Jobs {
         let mut s = self.lock();
         ensure_open(&s)?;
         self.set_plan(&mut s, name, task, timing, due);
-        Ok(())
-    }
-    pub fn reschedule(&self, name: &str, timing: Timing) -> Result<()> {
-        let due = timing.deadline()?;
-        let mut s = self.lock();
-        ensure_open(&s)?;
-        let task = s.plans.get(name).ok_or_else(missing)?.task.clone();
-        self.set_plan(&mut s, name.into(), task, timing, due);
         Ok(())
     }
     fn set_plan(&self, s: &mut State, name: String, task: Task, timing: Timing, due: Instant) {
@@ -480,7 +449,9 @@ impl Jobs {
     }
 }
 fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 fn ensure_open(s: &State) -> Result<()> {
     if s.closed {

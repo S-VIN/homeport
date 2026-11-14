@@ -1,9 +1,9 @@
 //! Kernel mechanics with small test plugins: state, list ops, op chains,
 //! claims, cascades, ownership, events and queued jobs.
-use rproxy_kernel::{prelude::*, Host};
+use rproxy_kernel::{Host, prelude::*};
 use std::sync::{
+    Mutex,
     atomic::{AtomicUsize, Ordering},
-    Arc, Mutex,
 };
 use std::time::Duration;
 
@@ -20,6 +20,8 @@ struct Child {
     parent: Id,
 }
 static PARENTS: State<Vec<Parent>> = State::new("a.parents");
+/// A second list of the same record type, in its own table.
+static ARCHIVE: State<Vec<Parent>> = State::new("a.archive");
 static CHILDREN: State<Vec<Child>> = State::new("b.children");
 static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static RUNS: AtomicUsize = AtomicUsize::new(0);
@@ -49,12 +51,8 @@ impl Op for Trespass {
 static A: Plugin = Plugin {
     id: "a",
     name: "A",
-    description: "",
     category: categories::SERVERS,
-    requires: &[],
     required: true,
-    default_enabled: true,
-    platforms: Platform::ALL,
     setup: |p| {
         p.list(&PARENTS).validate(|_, item, _, others| {
             item.name = item.name.trim().to_owned();
@@ -63,6 +61,7 @@ static A: Plugin = Plugin {
             }
             Ok(())
         });
+        p.list(&ARCHIVE).table("test_parents_archive");
         p.handle(|_, Echo(s): Echo| async move { Ok(format!("a({s})")) });
         p.handle(|_, Slow(ms): Slow| async move {
             tokio::time::sleep(Duration::from_millis(ms)).await;
@@ -72,29 +71,35 @@ static A: Plugin = Plugin {
         p.on(|cx: Cx, e: Added<Parent>| async move {
             // Observers run after commit and see the new state.
             let visible = cx.get(&PARENTS).iter().any(|x| x.id == e.item.id);
-            SEEN.lock().unwrap().push(format!("added {} visible={visible}", e.item.name));
+            SEEN.lock()
+                .unwrap()
+                .push(format!("added {} visible={visible}", e.item.name));
             Ok(())
         });
         Ok(())
     },
+    ..Plugin::DEFAULT
 };
 static B: Plugin = Plugin {
     id: "b",
     name: "B",
-    description: "",
     category: categories::SERVERS,
     requires: &["a"],
-    required: false,
-    default_enabled: true,
-    platforms: Platform::ALL,
     setup: |p| {
         p.collection(&CHILDREN);
         p.cascade(&PARENTS, &CHILDREN, |c| c.parent);
-        p.wrap(|cx: Cx, op: Echo, next: Next<Echo>| async move { Ok(format!("b[{}]", next.run(&cx, op).await?)) })
-            .claim(|_, op| op.0.starts_with("b:").then_some(Claim::content(1)));
+        p.wrap(|cx: Cx, op: Echo, next: Next<Echo>| async move {
+            Ok(format!("b[{}]", next.run(&cx, op).await?))
+        })
+        .claim(|_, op| op.0.starts_with("b:").then_some(Claim::content(1)));
         p.handle(|cx: Cx, AddChild(parent): AddChild| async move {
             cx.write(|w| {
-                w.update(&CHILDREN, |c| c.push(Child { id: Id::random(), parent }));
+                w.update(&CHILDREN, |c| {
+                    c.push(Child {
+                        id: Id::random(),
+                        parent,
+                    })
+                });
                 Ok(())
             })
             .await
@@ -108,6 +113,7 @@ static B: Plugin = Plugin {
         });
         Ok(())
     },
+    ..Plugin::DEFAULT
 };
 
 #[tokio::test(flavor = "multi_thread")]
@@ -118,14 +124,64 @@ async fn kernel_mechanics() {
     let a = k.cx_for("a");
 
     // List ops with validation and normalization.
-    let first = a.call(Add::new(Parent { id: Id::random(), name: "  one ".into() })).await.unwrap();
-    assert!(a.call(Add::new(Parent { id: Id::random(), name: "one".into() })).await.is_err());
-    let second = a.call(Add::new(Parent { id: Id::random(), name: "two".into() })).await.unwrap();
-    a.call(Move::<Parent>::new(second, true)).await.unwrap();
-    let names: Vec<_> = k.snapshot().get(&PARENTS).iter().map(|p| p.name.clone()).collect();
+    let first = a
+        .call(Add::new(
+            &PARENTS,
+            Parent {
+                id: Id::random(),
+                name: "  one ".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(
+        a.call(Add::new(
+            &PARENTS,
+            Parent {
+                id: Id::random(),
+                name: "one".into()
+            }
+        ))
+        .await
+        .is_err()
+    );
+    let second = a
+        .call(Add::new(
+            &PARENTS,
+            Parent {
+                id: Id::random(),
+                name: "two".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    a.call(Move::new(&PARENTS, second, true)).await.unwrap();
+    let names: Vec<_> = k
+        .snapshot()
+        .get(&PARENTS)
+        .iter()
+        .map(|p| p.name.clone())
+        .collect();
     assert_eq!(names, ["two", "one"]);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(SEEN.lock().unwrap().contains(&"added one visible=true".to_string()));
+    k.idle().await;
+    assert!(
+        SEEN.lock()
+            .unwrap()
+            .contains(&"added one visible=true".to_string())
+    );
+
+    // Two lists of one record type stay apart: ops name their list.
+    a.call(Add::new(
+        &ARCHIVE,
+        Parent {
+            id: Id::random(),
+            name: "old".into(),
+        },
+    ))
+    .await
+    .unwrap();
+    assert_eq!(k.snapshot().get(&ARCHIVE).len(), 1);
+    assert_eq!(k.snapshot().get(&PARENTS).len(), 2);
 
     // Op chains: the wrapper only runs for inputs it claims.
     assert_eq!(a.call(Echo("x".into())).await.unwrap(), "a(x)");
@@ -140,7 +196,7 @@ async fn kernel_mechanics() {
     let b = k.cx_for("b");
     b.call(AddChild(first)).await.unwrap();
     b.call(AddChild(second)).await.unwrap();
-    a.call(Remove::<Parent>::new(first)).await.unwrap();
+    a.call(Remove::new(&PARENTS, first)).await.unwrap();
     let children = k.snapshot().get(&CHILDREN);
     assert_eq!(children.len(), 1);
     assert_eq!(children[0].parent, second);
@@ -150,15 +206,20 @@ async fn kernel_mechanics() {
     a.spawn(Slow(150)).unwrap();
     a.spawn(Slow(10)).unwrap();
     a.spawn(Slow(10)).unwrap();
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    k.idle().await;
     assert_eq!(RUNS.load(Ordering::SeqCst), 2);
 
     // Persistence: order and cascades survive a restart.
     host.restart().await;
     let k = host.kernel();
-    let names: Vec<_> = k.snapshot().get(&PARENTS).iter().map(|p| p.name.clone()).collect();
+    let names: Vec<_> = k
+        .snapshot()
+        .get(&PARENTS)
+        .iter()
+        .map(|p| p.name.clone())
+        .collect();
     assert_eq!(names, ["two"]);
+    assert_eq!(k.snapshot().get(&ARCHIVE)[0].name, "old");
     assert_eq!(k.snapshot().get(&CHILDREN).len(), 1);
-    let _ = Arc::strong_count(&k);
     host.shutdown().await;
 }

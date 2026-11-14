@@ -1,13 +1,14 @@
 use crate::*;
 use rproxy_kernel::{
-    kit::{self, emoji, theme, Button, Lead, Tone},
-    shell::{panel_title, PANELS, STATUS},
     Page, PageSpec, UiCx,
+    kit::{self, Button, Lead, Tone, emoji, theme},
+    shell::{PANELS, STATUS, panel_title},
 };
 use std::collections::{HashMap, HashSet};
 
 /// Width of the connect / connected cell at the end of a row.
-const ACTION: f32 = 96.;
+/// Fits "Disconnect" with its icon, so Connect and Disconnect rows align.
+const ACTION: f32 = 116.;
 /// Chevron column before the name.
 const CHEVRON: f32 = 16.;
 
@@ -21,20 +22,10 @@ pub(crate) fn register(p: &mut Setup) {
     p.fill(&STATUS, "connection", 0, |ui, cx, _| {
         let pal = theme::palette(ui);
         let (color, text, tip) = match selected(cx.snapshot()) {
-            Some(s) => (
-                pal.success,
-                short(&s.name, 28),
-                s.name.clone(),
-            ),
-            None => (
-                pal.faint,
-                "Not connected".to_owned(),
-                String::new(),
-            ),
+            Some(s) => (pal.success, short(&s.name, 28), s.name.clone()),
+            None => (pal.faint, "Not connected".to_owned(), String::new()),
         };
-        if kit::chip(ui, Some(Lead::Dot(color)), &text, &tip).clicked() {
-            cx.toggle_panels();
-        }
+        cx.status_chip(ui, Lead::Dot(color), &text, &tip);
     });
     p.fill(&PANELS, "connection", 0, connection_card);
 }
@@ -96,10 +87,7 @@ fn connection_card(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
         .show(ui)
         .clicked()
     {
-        cx.submit(
-            "disconnect",
-            Select::manual(None),
-        );
+        cx.submit("disconnect", Select::manual(None));
     }
 }
 
@@ -132,11 +120,7 @@ impl Page for ServersPage {
         cx.slot(ui, &TOOLS, &());
         if servers.is_empty() {
             kit::list_card(ui, |ui| {
-                kit::empty(
-                    ui,
-                    Icon::Servers,
-                    "No servers yet",
-                );
+                kit::empty(ui, Icon::Servers, "No servers yet");
                 ui.vertical_centered(|ui| {
                     if Button::primary("Add subscription")
                         .icon(Icon::Add)
@@ -184,11 +168,7 @@ impl Page for ServersPage {
         }
         if rows.is_empty() {
             kit::list_card(ui, |ui| {
-                kit::empty(
-                    ui,
-                    Icon::Filter,
-                    "No matching servers",
-                );
+                kit::empty(ui, Icon::Filter, "No matching servers");
                 ui.vertical_centered(|ui| {
                     if Button::secondary("Reset filters").show(ui).clicked() {
                         self.source = None;
@@ -268,8 +248,7 @@ impl ServersPage {
                         ui.selectable_value(&mut self.source, Some(*id), source_label(snap, *id));
                     }
                 },
-            )
-            ;
+            );
             kit::select(
                 ui,
                 "protocol",
@@ -287,8 +266,7 @@ impl ServersPage {
                         ui.selectable_value(&mut self.protocol, Some(*p), p.to_string());
                     }
                 },
-            )
-            ;
+            );
             kit::select(
                 ui,
                 "sort",
@@ -299,8 +277,7 @@ impl ServersPage {
                         ui.selectable_value(&mut self.sort, i, *label);
                     }
                 },
-            )
-            ;
+            );
         });
         ui.add_space(theme::SPACE_M);
     }
@@ -316,7 +293,6 @@ impl ServersPage {
         core_ok: bool,
         wide: bool,
     ) {
-        let pal = theme::palette(ui);
         let excluded = exclusion(snap, s);
         let mut expanded = self.expanded.contains(&s.id);
         let mut connect = None;
@@ -325,17 +301,7 @@ impl ServersPage {
             kit::row_line(ui, if two_lines { 44. } else { theme::ROW }, |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     kit::action_cell(ui, ACTION, |ui| {
-                        if selected {
-                            if Button::ghost("Disconnect").icon(Icon::Disconnect).tone(Tone::Danger).width(ACTION).show(ui).clicked() {
-                                connect = Some(None);
-                            }
-                        } else if excluded.is_none() && core_ok {
-                            if Button::secondary("Connect").icon(Icon::Link).width(ACTION).show(ui).clicked() {
-                                connect = Some(Some(s.id));
-                            }
-                        } else if excluded.is_none() {
-                            kit::icon(ui, Icon::Warning, 14., pal.warning).on_hover_text("Core offline");
-                        }
+                        connect = connect_button(ui, s, selected, excluded.is_none(), core_ok);
                     });
                     cx.slot_rev(
                         ui,
@@ -346,107 +312,28 @@ impl ServersPage {
                         },
                     );
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        // Chevron, name and source tag share one click target that expands the row.
-                        let avail = ui.available_width();
-                        let label = source_label(snap, s.source);
-                        let tag_w = kit::tag_width(ui, &label, if wide { 130. } else { 84. });
-                        let name_w =
-                            (avail - CHEVRON - tag_w - 2. * theme::HORIZONTAL_GAP - 4.).max(40.);
-                        let (rect, click) = ui.allocate_exact_size(
-                            egui::vec2(CHEVRON, theme::CONTROL),
-                            egui::Sense::click(),
-                        );
-                        let ink = if click.hovered() || row.hovered {
-                            pal.muted
-                        } else {
-                            pal.faint
+                        let title = Title {
+                            server: s,
+                            excluded: excluded.as_ref(),
+                            expanded,
+                            two_lines,
+                            hovered: row.hovered,
+                            wide,
                         };
-                        kit::icons::paint_sized(
-                            ui.painter(),
-                            rect.center(),
-                            if expanded {
-                                Icon::ChevronDown
-                            } else {
-                                Icon::ChevronRight
-                            },
-                            13.,
-                            ink,
-                        );
-                        // Name and source tag; an excluded server says why on a second line.
-                        let name_line = |ui: &mut egui::Ui| {
-                            let name = ui
-                                .allocate_ui_with_layout(
-                                    egui::vec2(name_w, theme::CONTROL),
-                                    egui::Layout::left_to_right(egui::Align::Center),
-                                    |ui| {
-                                        ui.set_max_width(name_w);
-                                        if excluded.is_some() {
-                                            ui.visuals_mut().override_text_color = Some(pal.muted);
-                                        }
-                                        emoji::label(
-                                            ui,
-                                            &s.name,
-                                            egui::FontId::proportional(theme::BODY),
-                                            true,
-                                        )
-                                    },
-                                )
-                                .inner;
-                            source_tag(ui, snap, s.source, tag_w);
-                            name
-                        };
-                        let name = if let Some(e) = excluded.as_ref().filter(|_| two_lines) {
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(ui.available_width(), 40.),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| {
-                                    ui.spacing_mut().item_spacing.y = 0.;
-                                    let name = ui.horizontal(name_line).inner;
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(&e.reason)
-                                                .size(theme::SMALL)
-                                                .color(pal.warning),
-                                        )
-                                        .truncate(),
-                                    );
-                                    name
-                                },
-                            )
-                            .inner
-                        } else {
-                            name_line(ui)
-                        };
-                        if name.double_clicked() && !selected && excluded.is_none() && core_ok {
-                            connect = Some(Some(s.id));
-                        } else if click.clicked() || name.clicked() {
-                            expanded = !expanded;
+                        match title.show(ui, snap) {
+                            Some(TitleClick::Toggle) => expanded = !expanded,
+                            Some(TitleClick::Connect)
+                                if !selected && excluded.is_none() && core_ok =>
+                            {
+                                connect = Some(Some(s.id))
+                            }
+                            _ => {}
                         }
-                        click.widget_info(|| {
-                            egui::WidgetInfo::selected(
-                                egui::Role::Button,
-                                true,
-                                expanded,
-                                "Details",
-                            )
-                        });
                     });
                 });
             });
             if expanded {
-                ui.horizontal(|ui| {
-                    ui.add_space(CHEVRON + theme::HORIZONTAL_GAP);
-                    egui::Frame::NONE
-                        .fill(if pal.dark { pal.background } else { pal.hover })
-                        .stroke(egui::Stroke::new(1_f32, pal.border))
-                        .corner_radius(theme::RADIUS_CONTROL)
-                        .inner_margin(egui::Margin::symmetric(10, 6))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width() - 4.);
-                            ui.vertical(|ui| self::details_body(ui, cx, snap, s, &excluded));
-                        });
-                });
-                ui.add_space(6.);
+                details_frame(ui, cx, snap, s, &excluded);
             }
         });
         if let Some(id) = connect {
@@ -494,4 +381,136 @@ fn details_body(
             }
         });
     }
+}
+
+/// Connect, or Disconnect for the connected server: `Some(choice)` when clicked.
+fn connect_button(
+    ui: &mut egui::Ui,
+    s: &Server,
+    selected: bool,
+    usable: bool,
+    core_ok: bool,
+) -> Option<Option<Id>> {
+    if selected {
+        let r = Button::ghost("Disconnect")
+            .icon(Icon::Disconnect)
+            .tone(Tone::Danger)
+            .width(ACTION)
+            .show(ui);
+        return r.clicked().then_some(None);
+    }
+    // Unusable rows keep a disabled button, so the column stays even.
+    let r = Button::secondary("Connect")
+        .icon(Icon::Link)
+        .width(ACTION)
+        .enabled(usable && core_ok)
+        .show(ui);
+    let r = if usable && !core_ok {
+        r.on_disabled_hover_text("Core offline")
+    } else {
+        r
+    };
+    r.clicked().then_some(Some(s.id))
+}
+
+enum TitleClick {
+    /// Chevron or name: show or hide the details.
+    Toggle,
+    /// Double click on the name.
+    Connect,
+}
+/// Chevron, name and source tag of a row; an excluded server says why on a
+/// second line. One click target expands the row.
+struct Title<'a> {
+    server: &'a Server,
+    excluded: Option<&'a Exclusion>,
+    expanded: bool,
+    two_lines: bool,
+    hovered: bool,
+    wide: bool,
+}
+impl Title<'_> {
+    fn show(&self, ui: &mut egui::Ui, snap: &Snapshot) -> Option<TitleClick> {
+        let (s, pal) = (self.server, theme::palette(ui));
+        let label = source_label(snap, s.source);
+        let tag_w = kit::tag_width(ui, &label, if self.wide { 130. } else { 84. });
+        let name_w =
+            (ui.available_width() - CHEVRON - tag_w - 2. * theme::HORIZONTAL_GAP - 4.).max(40.);
+        let (rect, chevron) =
+            ui.allocate_exact_size(egui::vec2(CHEVRON, theme::CONTROL), egui::Sense::click());
+        let ink = if chevron.hovered() || self.hovered {
+            pal.muted
+        } else {
+            pal.faint
+        };
+        let icon = if self.expanded {
+            Icon::ChevronDown
+        } else {
+            Icon::ChevronRight
+        };
+        kit::icons::paint_sized(ui.painter(), rect.center(), icon, 13., ink);
+        chevron.widget_info(|| {
+            egui::WidgetInfo::selected(egui::Role::Button, true, self.expanded, "Details")
+        });
+        let name_line = |ui: &mut egui::Ui| {
+            let layout = egui::Layout::left_to_right(egui::Align::Center);
+            let name =
+                ui.allocate_ui_with_layout(egui::vec2(name_w, theme::CONTROL), layout, |ui| {
+                    ui.set_max_width(name_w);
+                    if self.excluded.is_some() {
+                        ui.visuals_mut().override_text_color = Some(pal.muted);
+                    }
+                    emoji::label(ui, &s.name, egui::FontId::proportional(theme::BODY), true)
+                });
+            source_tag(ui, snap, s.source, tag_w);
+            name.inner
+        };
+        let name = match self.excluded.filter(|_| self.two_lines) {
+            Some(e) => {
+                let layout = egui::Layout::top_down(egui::Align::Min);
+                ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 40.), layout, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.;
+                    let name = ui.horizontal(name_line).inner;
+                    let why = egui::RichText::new(&e.reason)
+                        .size(theme::SMALL)
+                        .color(pal.warning);
+                    ui.add(egui::Label::new(why).truncate());
+                    name
+                })
+                .inner
+            }
+            None => name_line(ui),
+        };
+        if name.double_clicked() {
+            Some(TitleClick::Connect)
+        } else if chevron.clicked() || name.clicked() {
+            Some(TitleClick::Toggle)
+        } else {
+            None
+        }
+    }
+}
+
+/// The expanded part of a row.
+fn details_frame(
+    ui: &mut egui::Ui,
+    cx: &mut UiCx,
+    snap: &Snapshot,
+    s: &Server,
+    excluded: &Option<Exclusion>,
+) {
+    let pal = theme::palette(ui);
+    ui.horizontal(|ui| {
+        ui.add_space(CHEVRON + theme::HORIZONTAL_GAP);
+        egui::Frame::NONE
+            .fill(if pal.dark { pal.background } else { pal.hover })
+            .stroke(egui::Stroke::new(1_f32, pal.border))
+            .corner_radius(theme::RADIUS_CONTROL)
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width() - 4.);
+                ui.vertical(|ui| details_body(ui, cx, snap, s, excluded));
+            });
+    });
+    ui.add_space(6.);
 }

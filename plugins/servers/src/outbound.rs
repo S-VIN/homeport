@@ -1,14 +1,14 @@
 //! Common protocol fields are ordinary columns. Open-ended Mihomo maps/lists use
 //! typed child rows so new transport options round-trip without serialized blobs.
 use rproxy_kernel::{
-    store::{Store, Tx},
     Error, Id, Result, Table,
+    store::{Store, Tx},
 };
 fn invalid(m: &str) -> Error {
     Error::msg(m)
 }
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::{collections::HashMap, sync::Arc};
 
 macro_rules! fields {

@@ -10,10 +10,8 @@ pub static PLUGIN: Plugin = Plugin {
     description: "Hide and never use servers whose names match a pattern, e.g. *test* or RU*.",
     category: categories::SERVERS,
     requires: &["servers"],
-    required: false,
-    default_enabled: true,
-    platforms: Platform::ALL,
     setup,
+    ..Plugin::DEFAULT
 };
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Table)]
@@ -31,10 +29,16 @@ pub fn wildcard(pattern: &str, text: &str) -> bool {
     if parts.len() == 1 {
         return text == pattern;
     }
-    let Some(rest) = text.strip_prefix(parts[0]) else { return false };
-    let Some(mut rest) = rest.strip_suffix(parts[parts.len() - 1]) else { return false };
+    let Some(rest) = text.strip_prefix(parts[0]) else {
+        return false;
+    };
+    let Some(mut rest) = rest.strip_suffix(parts[parts.len() - 1]) else {
+        return false;
+    };
     for part in &parts[1..parts.len() - 1] {
-        let Some((_, tail)) = rest.split_once(part) else { return false };
+        let Some((_, tail)) = rest.split_once(part) else {
+            return false;
+        };
         rest = tail;
     }
     true
@@ -46,67 +50,113 @@ fn setup(p: &mut Setup) -> Result<()> {
         if f.pattern.is_empty() || f.pattern.len() > 512 {
             bail!("Enter a name pattern of 1–512 bytes.");
         }
-        if others.iter().any(|o| o.pattern.to_lowercase() == f.pattern.to_lowercase()) {
+        if others
+            .iter()
+            .any(|o| o.pattern.to_lowercase() == f.pattern.to_lowercase())
+        {
             bail!("Name filter already exists.");
         }
         Ok(())
     });
     p.hook(&servers::EXCLUDE, |snap, s| {
-        snap.get(&FILTERS).iter().find(|f| wildcard(&f.pattern, &s.name)).map(|f| Exclusion {
-            reason: format!("Name filtered by {}", f.pattern),
-            disconnect: true,
-        })
-    });
-    let open = || egui::Id::unique("name-filters-open");
-    p.fill(&servers::TOOLBAR, "filters", 50, move |ui, cx, _| {
-        let n = cx.get(&FILTERS).len();
-        let mut is_open = ui.data(|d| d.get_temp::<bool>(open()).unwrap_or(false));
-        // The page header gives the toolbar its room; drop the label in a narrow window.
-        let label = if ui.ctx().content_rect().width() >= 560. { "Name filters" } else { "" };
-        let r = kit::Button::secondary(label).icon(Icon::Filter).count((n > 0).then_some(n)).selected(is_open).show(ui);
-        r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Name filters"));
-        let r = if label.is_empty() { r.on_hover_text("Name filters") } else { r };
-        if r.clicked() {
-            is_open = !is_open;
-            ui.data_mut(|d| d.insert_temp(open(), is_open));
-        }
-    });
-    p.fill(&servers::TOOLS, "filters", 50, move |ui, cx, _| {
-        if !ui.data(|d| d.get_temp::<bool>(open()).unwrap_or(false)) {
-            return;
-        }
-        let snap = cx.snapshot().clone();
-        let hidden = snap.get(&servers::SERVERS).iter().filter(|s| snap.get(&FILTERS).iter().any(|f| wildcard(&f.pattern, &s.name))).count();
-        let pal = kit::colors(ui);
-        kit::row_line(ui, 24., |ui| {
-            ui.label(kit::bold("Name filters", kit::theme::BODY).color(pal.foreground));
-            if hidden > 0 {
-                kit::hint(ui, format!("{} excluded", kit::plural(hidden, "server", "servers")));
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if kit::icon_button(ui, Icon::Close, "Close name filters", true).clicked() {
-                    ui.data_mut(|d| d.insert_temp(open(), false));
-                }
-            });
-        });
-
-        ListEditor::new(&FILTERS)
-            .unordered()
-            .no_headers()
-            .add_form("Add name filter", || Filter { id: Id::random(), pattern: String::new() }, |ui, f, width| {
-                let r = kit::input(ui, "pattern", &mut f.pattern, "Name pattern, e.g. *test*", width, false)
-                    .on_hover_text("Excludes matching names. Matches the whole name; * matches any text.");
-                kit::submitted(ui, &r) && !f.pattern.trim().is_empty()
+        snap.get(&FILTERS)
+            .iter()
+            .find(|f| wildcard(&f.pattern, &s.name))
+            .map(|f| Exclusion {
+                reason: format!("Name filtered by {}", f.pattern),
+                disconnect: true,
             })
-            .column(Column::edit("Pattern", "Name pattern", |f: &mut Filter| &mut f.pattern))
-            .column(Column::custom("Matches", 90., |ui, cx, f: &Filter| {
-                let n = cx.get(&servers::SERVERS).iter().filter(|s| wildcard(&f.pattern, &s.name)).count();
-                kit::hint(ui, kit::plural(n, "server", "servers"));
-            }).right())
-            .empty(Icon::Filter, "No name filters")
-            .show(ui, cx);
     });
+    let tool = Tool {
+        id: "filters",
+        label: "Name filters",
+        icon: Icon::Filter,
+        order: 50,
+    };
+    p.tool(
+        &servers::TOOLBAR,
+        &servers::TOOLS,
+        tool,
+        |snap| snap.get(&FILTERS).len(),
+        |ui, cx| {
+            let snap = cx.snapshot().clone();
+            let hidden = snap
+                .get(&servers::SERVERS)
+                .iter()
+                .filter(|s| {
+                    snap.get(&FILTERS)
+                        .iter()
+                        .any(|f| wildcard(&f.pattern, &s.name))
+                })
+                .count();
+            if hidden > 0 {
+                kit::hint(
+                    ui,
+                    format!("{} excluded", kit::plural(hidden, "server", "servers")),
+                );
+            }
+            let names: Vec<String> = cx
+                .get(&servers::SERVERS)
+                .iter()
+                .map(|s| s.name.clone())
+                .collect();
+            ListEditor::new(&FILTERS)
+                .unordered()
+                .no_headers()
+                .subtitle(move |rows, i| hint(&rows[i].pattern, &names))
+                .add_form(
+                    "Add name filter",
+                    || Filter {
+                        id: Id::random(),
+                        pattern: String::new(),
+                    },
+                    |ui, f, width| {
+                        let r = kit::input(
+                            ui,
+                            "pattern",
+                            &mut f.pattern,
+                            "Name pattern, e.g. *test*",
+                            width,
+                            false,
+                        )
+                        .on_hover_text(
+                            "Excludes matching names. Matches the whole name; * matches any text.",
+                        );
+                        kit::submitted(ui, &r) && !f.pattern.trim().is_empty()
+                    },
+                )
+                .column(Column::edit("Pattern", "Name pattern", |f: &mut Filter| {
+                    &mut f.pattern
+                }))
+                .column(
+                    Column::custom("Matches", 90., |ui, cx, f: &Filter| {
+                        let n = cx
+                            .get(&servers::SERVERS)
+                            .iter()
+                            .filter(|s| wildcard(&f.pattern, &s.name))
+                            .count();
+                        kit::hint(ui, kit::plural(n, "server", "servers"));
+                    })
+                    .right(),
+                )
+                .empty(Icon::Filter, "No name filters")
+                .show(ui, cx);
+        },
+    );
     Ok(())
+}
+
+/// A pattern without `*` matches whole names only: when it finds nothing but
+/// `*pattern*` would, say so.
+fn hint(pattern: &str, names: &[String]) -> Option<(String, kit::Tone)> {
+    let wider = format!("*{}*", pattern.trim());
+    let count = |p: &str| names.iter().filter(|n| wildcard(p, n)).count();
+    (!pattern.contains('*') && count(pattern) == 0 && count(&wider) > 0).then(|| {
+        (
+            format!("Matches nothing: names must match whole. Did you mean {wider}?"),
+            kit::Tone::Warning,
+        )
+    })
 }
 
 #[cfg(test)]

@@ -40,7 +40,8 @@ crates/derive   #[derive(Table)] для SQLite
 
 ```sh
 cargo test --workspace
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
 ```
 
 `crates/kernel/tests/kernel.rs` — механика ядра на тестовых плагинах. `tests/e2e.rs` — настоящий mihomo: форматы, загрузка, выбор, маршруты, слушатели с авторизацией, проверки через изолированный маршрут, автовыбор, перезапуск. `crates/remote/tests` — кадры оболочки по проводу, в том числе декодирование под wasm32 (`wasm-bindgen-test-runner`).

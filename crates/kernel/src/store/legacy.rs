@@ -1,7 +1,7 @@
 //! One-time import from the former document store, inside the schema transaction.
-use super::{db, insert_sql, Table};
+use super::{Table, db, insert_sql};
 use crate::{Error, Result};
-use rusqlite::{params_from_iter, Connection};
+use rusqlite::{Connection, params_from_iter};
 use serde::de::DeserializeOwned;
 
 pub(super) fn import<T: Table + DeserializeOwned>(conn: &Connection) -> Result<()> {
@@ -17,7 +17,7 @@ pub(super) fn import<T: Table + DeserializeOwned>(conn: &Connection) -> Result<(
             .prepare("SELECT id, body FROM hk_documents WHERE collection = ? ORDER BY rowid")
             .map_err(db)?;
         let mut rows = source.query([T::NAME]).map_err(db)?;
-        let mut insert = conn.prepare(&insert_sql::<T>()).map_err(db)?;
+        let mut insert = conn.prepare(&insert_sql::<T>(T::NAME)).map_err(db)?;
         while let Some(row) = rows.next().map_err(db)? {
             let id: String = row.get(0).map_err(db)?;
             let body: String = row.get(1).map_err(db)?;

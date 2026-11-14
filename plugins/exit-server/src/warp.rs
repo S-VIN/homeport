@@ -1,8 +1,8 @@
 //! Cloudflare WARP as an exit: a free WireGuard account registered by the app.
 //! Traffic leaves from a Cloudflare address, like the 1.1.1.1 app's users.
-use base64::{engine::general_purpose::STANDARD, Engine};
-use rproxy_kernel::{mihomo, random_bytes, Cx, Error, Result};
-use serde_json::{json, Value};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use rproxy_kernel::{Cx, Error, Result, mihomo, random_bytes};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 const REGISTER: &str = "https://api.cloudflareclient.com/v0a2158/reg";
@@ -21,7 +21,6 @@ pub struct Account {
     /// Client id bytes WARP expects in every packet.
     pub reserved: [u8; 3],
 }
-
 
 /// Register a new device: direct first, then through the ordinary route.
 pub async fn register(cx: &Cx) -> Result<Account> {

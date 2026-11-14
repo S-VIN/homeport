@@ -1,6 +1,6 @@
 //! The one shape every subscription format produces. Format plugins turn their
 //! documents into [`Proxy`] values; `servers` gives them stable identities.
-use crate::{outbound::Definition, Protocol, Server};
+use crate::{Protocol, Server, outbound::Definition};
 use rproxy_kernel::{Error, Id, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};

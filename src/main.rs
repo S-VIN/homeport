@@ -5,11 +5,11 @@
 mod desktop;
 #[cfg(feature = "desktop")]
 mod icon;
-#[cfg(all(feature = "desktop", any(target_os = "windows", target_os = "macos")))]
-mod native_tray;
 mod instance;
 #[cfg(all(feature = "desktop", target_os = "macos"))]
 mod macos;
+#[cfg(all(feature = "desktop", any(target_os = "windows", target_os = "macos")))]
+mod native_tray;
 
 #[cfg(all(feature = "desktop", target_os = "linux"))]
 use desktop::{Link, Tray, WindowControl, WindowEvent};
@@ -25,9 +25,21 @@ use std::{sync::atomic::Ordering, time::Duration};
 type LaunchResult = Result<(), Box<dyn std::error::Error>>;
 
 const ASSETS: &[Asset] = &[
-    Asset { path: "/", mime: "text/html; charset=utf-8", bytes: include_bytes!("../web/index.html") },
-    Asset { path: "/rproxy_remote.js", mime: "text/javascript", bytes: include_bytes!("../web/pkg/rproxy_remote.js") },
-    Asset { path: "/rproxy_remote_bg.wasm", mime: "application/wasm", bytes: include_bytes!("../web/pkg/rproxy_remote_bg.wasm") },
+    Asset {
+        path: "/",
+        mime: "text/html; charset=utf-8",
+        bytes: include_bytes!("../web/index.html"),
+    },
+    Asset {
+        path: "/rproxy_remote.js",
+        mime: "text/javascript",
+        bytes: include_bytes!("../web/pkg/rproxy_remote.js"),
+    },
+    Asset {
+        path: "/rproxy_remote_bg.wasm",
+        mime: "application/wasm",
+        bytes: include_bytes!("../web/pkg/rproxy_remote_bg.wasm"),
+    },
 ];
 
 struct Web(Arc<Host>);
@@ -42,12 +54,18 @@ impl FrontendSession for WebSession {
         self.0.ui(ui)
     }
     fn file_dialog(&mut self) -> Option<rproxy_remote::FileDialog> {
-        use rproxy_kernel::configuration::{FileAction, FILE_NAME};
+        use rproxy_kernel::configuration::{FILE_NAME, FileAction};
         match self.0.take_file_action()? {
             FileAction::Import => Some(rproxy_remote::FileDialog::Open),
             FileAction::Export => match self.0.host().export_configuration() {
-                Ok(bytes) => Some(rproxy_remote::FileDialog::Save { name: FILE_NAME.into(), bytes }),
-                Err(e) => { self.0.file_finished(Err(e)); None }
+                Ok(bytes) => Some(rproxy_remote::FileDialog::Save {
+                    name: FILE_NAME.into(),
+                    bytes,
+                }),
+                Err(e) => {
+                    self.0.file_finished(Err(e));
+                    None
+                }
             },
         }
     }
@@ -64,25 +82,32 @@ impl FrontendSession for WebSession {
 fn data_dir() -> std::io::Result<PathBuf> {
     // A portable package opts in by carrying this marker next to the executable.
     let exe = std::env::current_exe()?;
-    let parent = exe.parent().ok_or_else(|| std::io::Error::other("Missing executable directory"))?;
+    let parent = exe
+        .parent()
+        .ok_or_else(|| std::io::Error::other("Missing executable directory"))?;
     if parent.join("portable.txt").is_file() {
         return Ok(parent.join("data"));
     }
     #[cfg(target_os = "windows")]
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
     #[cfg(target_os = "macos")]
-    let base = std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"));
+    let base =
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"));
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
-    base.map(|p| p.join("rproxy")).ok_or_else(|| std::io::Error::other("Missing user data directory"))
+    base.map(|p| p.join("rproxy"))
+        .ok_or_else(|| std::io::Error::other("Missing user data directory"))
 }
 
 fn main() -> LaunchResult {
     let mut internal = std::env::args_os().skip(1);
-    if internal.next().is_some_and(|arg| arg == rproxy_kernel::mihomo::supervisor::ARG) {
+    if internal
+        .next()
+        .is_some_and(|arg| arg == rproxy_kernel::mihomo::supervisor::ARG)
+    {
         return rproxy_kernel::mihomo::supervisor::run(internal).map_err(Into::into);
     }
     rproxy_kernel::mihomo::supervisor::configure(std::env::current_exe()?);
@@ -98,7 +123,12 @@ fn main() -> LaunchResult {
                 return Err("Choose desktop or web.".into());
             }
         } else if arg == "--listen" {
-            let addr = args.next().ok_or("Missing --listen IP:PORT")?.into_string().map_err(|_| "Invalid listen address")?.parse()?;
+            let addr = args
+                .next()
+                .ok_or("Missing --listen IP:PORT")?
+                .into_string()
+                .map_err(|_| "Invalid listen address")?
+                .parse()?;
             if listen.replace(addr).is_some() {
                 return Err("--listen given more than once.".into());
             }
@@ -107,13 +137,18 @@ fn main() -> LaunchResult {
         } else if arg == "--background" {
             background = true;
         } else if arg == "--data-dir" {
-            let path = args.next().filter(|p| !p.is_empty()).ok_or("Missing --data-dir path")?;
+            let path = args
+                .next()
+                .filter(|p| !p.is_empty())
+                .ok_or("Missing --data-dir path")?;
             if dir.replace(PathBuf::from(path)).is_some() {
                 return Err("--data-dir given more than once.".into());
             }
         } else if arg == "--help" {
             attach_console();
-            println!("rproxy [desktop|web] [--listen IP:PORT] [--background] [--data-dir PATH]\nDesktop opens a window; web serves the same UI at http://127.0.0.1:8080.");
+            println!(
+                "rproxy [desktop|web] [--listen IP:PORT] [--background] [--data-dir PATH]\nDesktop opens a window; web serves the same UI at http://127.0.0.1:8080."
+            );
             return Ok(());
         } else {
             return Err("Unknown option. Use --help.".into());
@@ -136,33 +171,61 @@ fn main() -> LaunchResult {
     if web && listen.is_none() && !smoke_test {
         listen = Some(([127, 0, 0, 1], 8080).into());
     }
-    let instance_dir = if web || smoke_test { dir.clone() } else { instance::desktop_directory()? };
-    let Some(_instance) = instance::Instance::acquire(&instance_dir)? else { return Ok(()) };
+    let instance_dir = if web || smoke_test {
+        dir.clone()
+    } else {
+        instance::desktop_directory()?
+    };
+    let Some(_instance) = instance::Instance::acquire(&instance_dir)? else {
+        return Ok(());
+    };
     let rt = Runtime::new()?;
-    let listener = listen.map(|addr| rt.block_on(tokio::net::TcpListener::bind(addr))).transpose()?;
+    let listener = listen
+        .map(|addr| rt.block_on(tokio::net::TcpListener::bind(addr)))
+        .transpose()?;
     // A login item starts the desktop app; the web UI does not offer one.
-    let catalog = rproxy::catalog().into_iter().filter(|p| !web || p.id != "autostart").collect();
+    let catalog = rproxy::catalog()
+        .into_iter()
+        .filter(|p| !web || p.id != "autostart")
+        .collect();
     let host = rt.block_on(Host::start(catalog, &dir))?;
     if smoke_test {
         let running = host.kernel().core_status().running();
         rt.block_on(host.shutdown());
-        return if running { Ok(()) } else { Err("Mihomo failed to start.".into()) };
+        return if running {
+            Ok(())
+        } else {
+            Err("Mihomo failed to start.".into())
+        };
     }
     let server = listener
         .map(|l| -> std::io::Result<_> {
             let addr = l.local_addr()?;
             println!("Web interface: http://{addr}");
             let mut app = rproxy_remote::host::router(Arc::new(Web(host.clone())), ASSETS);
-            let configured_origin = std::env::var("RPROXY_PUBLIC_ORIGIN").ok().map(|v| public_origin(&v)).transpose()?;
-            app = app.layer(axum::middleware::from_fn(move |request: axum::extract::Request, next: axum::middleware::Next| {
-                let configured_origin = configured_origin.clone();
-                async move {
-                    if request.uri().path() == "/ws" && !allowed_origin(request.headers(), configured_origin.as_deref(), addr) {
-                        return axum::response::IntoResponse::into_response(axum::http::StatusCode::FORBIDDEN);
+            let configured_origin = std::env::var("RPROXY_PUBLIC_ORIGIN")
+                .ok()
+                .map(|v| public_origin(&v))
+                .transpose()?;
+            app = app.layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let configured_origin = configured_origin.clone();
+                    async move {
+                        if request.uri().path() == "/ws"
+                            && !allowed_origin(
+                                request.headers(),
+                                configured_origin.as_deref(),
+                                addr,
+                            )
+                        {
+                            return axum::response::IntoResponse::into_response(
+                                axum::http::StatusCode::FORBIDDEN,
+                            );
+                        }
+                        next.run(request).await
                     }
-                    next.run(request).await
-                }
-            }));
+                },
+            ));
             Ok(rt.spawn(async move { axum::serve(l, app).await }))
         })
         .transpose()?;
@@ -195,7 +258,9 @@ fn attach_console() {
     #[cfg(windows)]
     // SAFETY: no arguments to validate; failing (no parent console) is harmless.
     unsafe {
-        windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS);
+        windows_sys::Win32::System::Console::AttachConsole(
+            windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+        );
     }
 }
 
@@ -203,7 +268,7 @@ fn attach_console() {
 async fn signal() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
         let mut hangup = signal(SignalKind::hangup()).expect("SIGHUP handler");
         tokio::select! { _ = term.recv() => {}, _ = hangup.recv() => {}, _ = tokio::signal::ctrl_c() => {} }
@@ -217,10 +282,20 @@ type FileSelection = rproxy_kernel::Result<Option<(String, Vec<u8>)>>;
 #[cfg(feature = "desktop")]
 type SharedWindowState = std::rc::Rc<std::cell::RefCell<WindowState>>;
 #[cfg(feature = "desktop")]
-struct WindowState { session: Session, files: Option<std::sync::mpsc::Receiver<FileSelection>>, started: std::time::Instant }
+struct WindowState {
+    session: Session,
+    files: Option<std::sync::mpsc::Receiver<FileSelection>>,
+    started: std::time::Instant,
+}
 #[cfg(feature = "desktop")]
 impl WindowState {
-    fn new(session: Session) -> SharedWindowState { std::rc::Rc::new(std::cell::RefCell::new(Self { session, files: None, started: std::time::Instant::now() })) }
+    fn new(session: Session) -> SharedWindowState {
+        std::rc::Rc::new(std::cell::RefCell::new(Self {
+            session,
+            files: None,
+            started: std::time::Instant::now(),
+        }))
+    }
 }
 #[cfg(feature = "desktop")]
 struct Window {
@@ -242,57 +317,100 @@ struct Window {
 #[cfg(feature = "desktop")]
 impl Window {
     fn new(state: SharedWindowState, _ctx: &egui::Context, _background: bool) -> Self {
-        Self { state, quitting: false,
-            #[cfg(target_os = "linux")] system_theme: desktop::SystemTheme::start(_ctx.clone()),
-            #[cfg(target_os = "linux")] control: None,
-            #[cfg(any(target_os = "windows", target_os = "macos"))] tray: None,
-            #[cfg(any(target_os = "windows", target_os = "macos"))] tray_attempted: false,
-            #[cfg(any(target_os = "windows", target_os = "macos"))] background: _background,
-            #[cfg(any(target_os = "windows", target_os = "macos"))] activation: None,
+        Self {
+            state,
+            quitting: false,
+            #[cfg(target_os = "linux")]
+            system_theme: desktop::SystemTheme::start(_ctx.clone()),
+            #[cfg(target_os = "linux")]
+            control: None,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            tray: None,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            tray_attempted: false,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            background: _background,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            activation: None,
         }
     }
     fn file_dialogs(&mut self, ctx: &egui::Context) {
         let mut state = self.state.borrow_mut();
-        if state.files.is_some() { ctx.request_repaint_after(std::time::Duration::from_millis(250)); }
+        if state.files.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
         if let Some(result) = state.files.as_ref().and_then(|rx| rx.try_recv().ok()) {
             state.files = None;
             state.session.file_finished(result);
         }
-        let Some(action) = state.session.take_file_action() else { return };
+        let Some(action) = state.session.take_file_action() else {
+            return;
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         state.files = Some(rx);
         let host = state.session.host().clone();
         let ctx = ctx.clone();
         tokio::spawn(async move {
-            use rproxy_kernel::configuration::{FileAction, FILE_NAME, MAX_BYTES};
+            use rproxy_kernel::configuration::{FILE_NAME, FileAction, MAX_BYTES};
             let started = std::time::Instant::now();
             // Without a portal (or zenity) rfd returns at once, as if cancelled.
             let closed = move || -> FileSelection {
-                if cfg!(target_os = "linux") && started.elapsed() < std::time::Duration::from_millis(300) {
-                    return Err(rproxy_kernel::Error::msg("No dialog? Install xdg-desktop-portal-gtk or zenity."));
+                if cfg!(target_os = "linux")
+                    && started.elapsed() < std::time::Duration::from_millis(300)
+                {
+                    return Err(rproxy_kernel::Error::msg(
+                        "No dialog? Install xdg-desktop-portal-gtk or zenity.",
+                    ));
                 }
                 Ok(None)
             };
             let result = async {
-                let dialog = rfd::AsyncFileDialog::new().add_filter("rproxy configuration", &["sqlite3"]);
+                let dialog =
+                    rfd::AsyncFileDialog::new().add_filter("rproxy configuration", &["sqlite3"]);
                 match action {
                     FileAction::Export => {
-                        let Some(file) = dialog.set_title("Export configuration").set_file_name(FILE_NAME).save_file().await else { return closed() };
+                        let Some(file) = dialog
+                            .set_title("Export configuration")
+                            .set_file_name(FILE_NAME)
+                            .save_file()
+                            .await
+                        else {
+                            return closed();
+                        };
                         host.export_configuration_to(file.path())?;
-                        if let Some(k) = host.try_kernel() { k.notify("Configuration exported", "The file was saved to the selected location."); }
+                        if let Some(k) = host.try_kernel() {
+                            k.notify(
+                                "Configuration exported",
+                                "The file was saved to the selected location.",
+                            );
+                        }
                         Ok(None)
                     }
                     FileAction::Import => {
-                        let Some(file) = dialog.set_title("Import configuration").pick_file().await else { return closed() };
+                        let Some(file) = dialog.set_title("Import configuration").pick_file().await
+                        else {
+                            return closed();
+                        };
                         use tokio::io::AsyncReadExt;
-                        let input = tokio::fs::File::open(file.path()).await.map_err(|e| rproxy_kernel::Error::msg(e.to_string()))?;
+                        let input = tokio::fs::File::open(file.path())
+                            .await
+                            .map_err(|e| rproxy_kernel::Error::msg(e.to_string()))?;
                         let mut bytes = Vec::new();
-                        input.take(MAX_BYTES as u64 + 1).read_to_end(&mut bytes).await.map_err(|e| rproxy_kernel::Error::msg(e.to_string()))?;
-                        if bytes.len() > MAX_BYTES { return Err(rproxy_kernel::Error::msg("Configuration exceeds the 32 MiB file limit.")); }
+                        input
+                            .take(MAX_BYTES as u64 + 1)
+                            .read_to_end(&mut bytes)
+                            .await
+                            .map_err(|e| rproxy_kernel::Error::msg(e.to_string()))?;
+                        if bytes.len() > MAX_BYTES {
+                            return Err(rproxy_kernel::Error::msg(
+                                "Configuration exceeds the 32 MiB file limit.",
+                            ));
+                        }
                         Ok(Some((file.file_name(), bytes)))
                     }
                 }
-            }.await;
+            }
+            .await;
             let _ = tx.send(result);
             ctx.request_repaint();
         });
@@ -302,20 +420,35 @@ impl Window {
 impl eframe::App for Window {
     fn logic(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         #[cfg(target_os = "linux")]
-        if let Some(control) = &self.control { control.handle_open(ctx); }
+        if let Some(control) = &self.control {
+            control.handle_open(ctx);
+        }
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             if !self.tray_attempted {
                 self.tray_attempted = true;
                 match native_tray::NativeTray::new(ctx) {
                     Ok(tray) => self.tray = Some(tray),
-                    Err(_) => { if let Some(k) = self.state.borrow().session.host().try_kernel() { k.notify_error("Tray unavailable", "Closing the window will minimize it while routing continues."); } }
+                    Err(_) => {
+                        if let Some(k) = self.state.borrow().session.host().try_kernel() {
+                            k.notify_error(
+                                "Tray unavailable",
+                                "Closing the window will minimize it while routing continues.",
+                            );
+                        }
+                    }
                 }
             }
             if let Some(tray) = &mut self.tray {
                 tray.update(icon::status(self.state.borrow().session.host()));
-                if self.background { self.background = false; ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false)); }
-                if ctx.input(|i| i.viewport().close_requested()) && !self.quitting && !tray.quitting.load(std::sync::atomic::Ordering::Acquire) {
+                if self.background {
+                    self.background = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                }
+                if ctx.input(|i| i.viewport().close_requested())
+                    && !self.quitting
+                    && !tray.quitting.load(std::sync::atomic::Ordering::Acquire)
+                {
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 }
@@ -323,7 +456,11 @@ impl eframe::App for Window {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             }
-            if self.activation.as_ref().is_some_and(|flag| flag.swap(false, std::sync::atomic::Ordering::AcqRel)) {
+            if self
+                .activation
+                .as_ref()
+                .is_some_and(|flag| flag.swap(false, std::sync::atomic::Ordering::AcqRel))
+            {
                 native_tray::show(ctx);
             }
             // App::logic is also called on repaint while the window is hidden.
@@ -344,11 +481,16 @@ impl eframe::App for Window {
         // Recreated windows share the same clock as retained toasts and jobs.
         input.time = Some(self.state.borrow().started.elapsed().as_secs_f64());
         #[cfg(target_os = "linux")]
-        if let Some(theme) = self.system_theme.get() { input.system_theme = Some(theme); }
+        if let Some(theme) = self.system_theme.get() {
+            input.system_theme = Some(theme);
+        }
     }
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         #[cfg(target_os = "linux")]
-        let no_tray = self.control.as_ref().is_some_and(|c| !c.online.load(Ordering::Acquire));
+        let no_tray = self
+            .control
+            .as_ref()
+            .is_some_and(|c| !c.online.load(Ordering::Acquire));
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let no_tray = self.tray_attempted && self.tray.is_none();
         {
@@ -358,7 +500,9 @@ impl eframe::App for Window {
             if state.session.take_exit_request() {
                 self.quitting = true;
                 #[cfg(target_os = "linux")]
-                if let Some(control) = &self.control { control.send(WindowEvent::Quit); }
+                if let Some(control) = &self.control {
+                    control.send(WindowEvent::Quit);
+                }
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
@@ -367,7 +511,12 @@ impl eframe::App for Window {
 }
 
 #[cfg(all(feature = "desktop", target_os = "linux"))]
-fn windows(rt: &Runtime, host: &Arc<Host>, background: bool, instance: &instance::Instance) -> LaunchResult {
+fn windows(
+    rt: &Runtime,
+    host: &Arc<Host>,
+    background: bool,
+    instance: &instance::Instance,
+) -> LaunchResult {
     let _guard = rt.enter();
     let (control, events) = WindowControl::new();
     let activation = control.clone();
@@ -414,8 +563,12 @@ fn windows(rt: &Runtime, host: &Arc<Host>, background: bool, instance: &instance
                 loop {
                     match events.recv()? {
                         desktop::Wake::Quit => return Ok(()),
-                        desktop::Wake::Open(sequence) if sequence > control.handled_open.load(Ordering::Acquire) => break,
-                        _ => {},
+                        desktop::Wake::Open(sequence)
+                            if sequence > control.handled_open.load(Ordering::Acquire) =>
+                        {
+                            break;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -440,14 +593,24 @@ fn windows(rt: &Runtime, host: &Arc<Host>, background: bool, instance: &instance
                     {
                         use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
                         let mut context = window.context.lock().unwrap();
-                        window.wayland.store(cc.display_handle().is_ok_and(|d| matches!(d.as_raw(), RawDisplayHandle::Wayland(_))), Ordering::Release);
-                        window.handled_open.store(window.open_sequence.load(Ordering::Acquire), Ordering::Release);
+                        window.wayland.store(
+                            cc.display_handle()
+                                .is_ok_and(|d| matches!(d.as_raw(), RawDisplayHandle::Wayland(_))),
+                            Ordering::Release,
+                        );
+                        window.handled_open.store(
+                            window.open_sequence.load(Ordering::Acquire),
+                            Ordering::Release,
+                        );
                         *context = Some(cc.egui_ctx.clone());
                     }
                     if window.quitting.load(Ordering::Acquire) {
                         cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
-                    let state = retained.borrow().clone().unwrap_or_else(|| WindowState::new(host.session(&cc.egui_ctx)));
+                    let state = retained
+                        .borrow()
+                        .clone()
+                        .unwrap_or_else(|| WindowState::new(host.session(&cc.egui_ctx)));
                     state.borrow_mut().session.rebind(&cc.egui_ctx);
                     *retained.borrow_mut() = Some(state.clone());
                     let mut app = Window::new(state, &cc.egui_ctx, false);
@@ -469,7 +632,12 @@ fn windows(rt: &Runtime, host: &Arc<Host>, background: bool, instance: &instance
 }
 
 #[cfg(all(feature = "desktop", not(target_os = "linux")))]
-fn windows(rt: &Runtime, host: &Arc<Host>, background: bool, instance: &instance::Instance) -> LaunchResult {
+fn windows(
+    rt: &Runtime,
+    host: &Arc<Host>,
+    background: bool,
+    instance: &instance::Instance,
+) -> LaunchResult {
     let _guard = rt.enter();
     let host = host.clone();
     let opts = eframe::NativeOptions {
@@ -482,39 +650,74 @@ fn windows(rt: &Runtime, host: &Arc<Host>, background: bool, instance: &instance
             .with_icon(icon::icon(icon::Link::Idle)),
         ..Default::default()
     };
-    eframe::run_native("rproxy", opts, Box::new(move |cc| {
-        let context = cc.egui_ctx.clone();
-        instance.on_open(move || context.request_repaint());
-        let mut window = Window::new(WindowState::new(host.session(&cc.egui_ctx)), &cc.egui_ctx, background);
-        window.activation = Some(instance.activation_flag());
-        Ok(Box::new(window))
-    }))?;
+    eframe::run_native(
+        "rproxy",
+        opts,
+        Box::new(move |cc| {
+            let context = cc.egui_ctx.clone();
+            instance.on_open(move || context.request_repaint());
+            let mut window = Window::new(
+                WindowState::new(host.session(&cc.egui_ctx)),
+                &cc.egui_ctx,
+                background,
+            );
+            window.activation = Some(instance.activation_flag());
+            Ok(Box::new(window))
+        }),
+    )?;
     Ok(())
 }
 
 // Local web mode is same-origin too. Hostname/DNS based deployments must set
 // their explicit HTTPS origin; arbitrary DNS names cannot rebind to loopback.
-fn allowed_origin(headers: &axum::http::HeaderMap, configured: Option<&str>, listen: std::net::SocketAddr) -> bool {
-    let Some(raw) = headers.get("origin").and_then(|v| v.to_str().ok()) else { return false };
-    if let Some(expected) = configured { return raw == expected; }
-    let Ok(origin) = url::Url::parse(raw) else { return false };
-    let Some(host) = headers.get("host").and_then(|v| v.to_str().ok()) else { return false };
-    let Ok(request) = url::Url::parse(&format!("http://{host}")) else { return false };
+fn allowed_origin(
+    headers: &axum::http::HeaderMap,
+    configured: Option<&str>,
+    listen: std::net::SocketAddr,
+) -> bool {
+    let Some(raw) = headers.get("origin").and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    if let Some(expected) = configured {
+        return raw == expected;
+    }
+    let Ok(origin) = url::Url::parse(raw) else {
+        return false;
+    };
+    let Some(host) = headers.get("host").and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let Ok(request) = url::Url::parse(&format!("http://{host}")) else {
+        return false;
+    };
     let address_ok = match origin.host() {
-        Some(url::Host::Ipv4(ip)) => listen.ip().is_unspecified() || listen.ip() == std::net::IpAddr::V4(ip),
-        Some(url::Host::Ipv6(ip)) => listen.ip().is_unspecified() || listen.ip() == std::net::IpAddr::V6(ip),
+        Some(url::Host::Ipv4(ip)) => {
+            listen.ip().is_unspecified() || listen.ip() == std::net::IpAddr::V4(ip)
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            listen.ip().is_unspecified() || listen.ip() == std::net::IpAddr::V6(ip)
+        }
         Some(url::Host::Domain("localhost")) => listen.ip().is_loopback(),
         _ => false,
     };
-    address_ok && origin.scheme() == "http" && origin.origin() == request.origin()
+    address_ok
+        && origin.scheme() == "http"
+        && origin.origin() == request.origin()
         && origin.port_or_known_default() == Some(listen.port())
-        && origin.username().is_empty() && origin.password().is_none()
-        && origin.path() == "/" && origin.query().is_none() && origin.fragment().is_none()
+        && origin.username().is_empty()
+        && origin.password().is_none()
+        && origin.path() == "/"
+        && origin.query().is_none()
+        && origin.fragment().is_none()
 }
 
 // Browsers omit :443 from Origin even when the configured URL includes it.
 fn public_origin(value: &str) -> std::io::Result<String> {
-    let invalid = || std::io::Error::other("RPROXY_PUBLIC_ORIGIN must be an HTTPS origin without credentials, query or fragment");
+    let invalid = || {
+        std::io::Error::other(
+            "RPROXY_PUBLIC_ORIGIN must be an HTTPS origin without credentials, query or fragment",
+        )
+    };
     let url = url::Url::parse(value).map_err(|_| invalid())?;
     if url.scheme() != "https"
         || url.host_str().is_none()
@@ -539,7 +742,12 @@ mod tests {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("host", "127.0.0.1:8080".parse().unwrap());
         assert!(!super::allowed_origin(&headers, None, listen));
-        for value in ["https://evil.example", "null", "http://127.0.0.1:8081", "http://u:p@127.0.0.1:8080"] {
+        for value in [
+            "https://evil.example",
+            "null",
+            "http://127.0.0.1:8081",
+            "http://u:p@127.0.0.1:8080",
+        ] {
             headers.insert("origin", value.parse().unwrap());
             assert!(!super::allowed_origin(&headers, None, listen));
         }
@@ -552,19 +760,33 @@ mod tests {
         headers.insert("origin", "http://evil.example:8080".parse().unwrap());
         assert!(!super::allowed_origin(&headers, None, listen));
         headers.insert("origin", "https://panel.example".parse().unwrap());
-        assert!(super::allowed_origin(&headers, Some("https://panel.example"), listen));
+        assert!(super::allowed_origin(
+            &headers,
+            Some("https://panel.example"),
+            listen
+        ));
     }
 
     #[test]
     fn public_origin_matches_browser_default_port() {
-        assert_eq!(public_origin("https://panel.example.com:443").unwrap(), "https://panel.example.com");
-        assert_eq!(public_origin("https://panel.example.com:9443").unwrap(), "https://panel.example.com:9443");
+        assert_eq!(
+            public_origin("https://panel.example.com:443").unwrap(),
+            "https://panel.example.com"
+        );
+        assert_eq!(
+            public_origin("https://panel.example.com:9443").unwrap(),
+            "https://panel.example.com:9443"
+        );
     }
 
     #[test]
     fn public_origin_rejects_non_origins() {
-        for value in ["http://panel.example.com", "https://u:p@panel.example.com", "https://panel.example.com/path", "https://panel.example.com/?q=1"]
-        {
+        for value in [
+            "http://panel.example.com",
+            "https://u:p@panel.example.com",
+            "https://panel.example.com/path",
+            "https://panel.example.com/?q=1",
+        ] {
             assert!(public_origin(value).is_err(), "{value}");
         }
     }

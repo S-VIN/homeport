@@ -6,11 +6,11 @@ async fn finished(k: &Kernel) {
     tokio::time::timeout(Duration::from_secs(600), async {
         loop {
             let board = k.board();
-            if let Some(r) = board.runs.iter().find(|r| r.key == "kernel/core-update") {
-                if !r.phase.active() {
-                    assert!(r.error.is_none(), "{:?}", r.error);
-                    return;
-                }
+            if let Some(r) = board.runs.iter().find(|r| r.key == "kernel/core-update")
+                && !r.phase.active()
+            {
+                assert!(r.error.is_none(), "{:?}", r.error);
+                return;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }

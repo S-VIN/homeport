@@ -3,8 +3,8 @@
 pub use crate::palette;
 
 use egui::{
-    epaint::Shadow, Context, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke,
-    Style, TextStyle, Ui, Vec2, Visuals,
+    Context, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, Style, TextStyle,
+    Ui, Vec2, Visuals, epaint::Shadow,
 };
 use std::sync::Arc;
 
@@ -62,14 +62,34 @@ pub const BOLD: &str = "Ubuntu Bold";
 pub fn install_fonts(ctx: &Context) {
     let mut fonts = FontDefinitions::default();
     for (name, data) in [
-        ("Ubuntu", include_bytes!("../../../assets/fonts/Ubuntu-R.ttf").as_slice()),
-        (BOLD, include_bytes!("../../../assets/fonts/Ubuntu-B.ttf").as_slice()),
-        ("Ubuntu Mono", include_bytes!("../../../assets/fonts/UbuntuMono-R.ttf").as_slice()),
-        ("Symbols", include_bytes!("../../../assets/fonts/SourceCodePro-Regular.otf").as_slice()),
-        (crate::icons::REGULAR, include_bytes!("../../../assets/fonts/Phosphor.ttf").as_slice()),
-        (crate::icons::FILL, include_bytes!("../../../assets/fonts/Phosphor-Fill.ttf").as_slice()),
+        (
+            "Ubuntu",
+            include_bytes!("../../../assets/fonts/Ubuntu-R.ttf").as_slice(),
+        ),
+        (
+            BOLD,
+            include_bytes!("../../../assets/fonts/Ubuntu-B.ttf").as_slice(),
+        ),
+        (
+            "Ubuntu Mono",
+            include_bytes!("../../../assets/fonts/UbuntuMono-R.ttf").as_slice(),
+        ),
+        (
+            "Symbols",
+            include_bytes!("../../../assets/fonts/SourceCodePro-Regular.otf").as_slice(),
+        ),
+        (
+            crate::icons::REGULAR,
+            include_bytes!("../../../assets/fonts/Phosphor.ttf").as_slice(),
+        ),
+        (
+            crate::icons::FILL,
+            include_bytes!("../../../assets/fonts/Phosphor-Fill.ttf").as_slice(),
+        ),
     ] {
-        fonts.font_data.insert(name.into(), Arc::new(FontData::from_static(data)));
+        fonts
+            .font_data
+            .insert(name.into(), Arc::new(FontData::from_static(data)));
     }
     let proportional = fonts.families.entry(FontFamily::Proportional).or_default();
     proportional.insert(0, "Ubuntu".into());
@@ -82,7 +102,9 @@ pub fn install_fonts(ctx: &Context) {
     fonts.families.insert(FontFamily::Name(BOLD.into()), bold);
     // Icon fonts are separate families: their ASCII glyphs are ligature blanks.
     for name in [crate::icons::REGULAR, crate::icons::FILL] {
-        fonts.families.insert(FontFamily::Name(name.into()), vec![name.into()]);
+        fonts
+            .families
+            .insert(FontFamily::Name(name.into()), vec![name.into()]);
     }
     ctx.set_fonts(fonts);
 }
@@ -90,12 +112,26 @@ pub fn install_fonts(ctx: &Context) {
 /// Apply on initialization or theme change. Keep application state outside this function.
 pub fn style(dark: bool, reduced_motion: bool) -> Style {
     let p = if dark { palette::DARK } else { palette::LIGHT };
-    let mut s = Style { visuals: if dark { Visuals::dark() } else { Visuals::light() }, ..Style::default() };
-    s.text_styles.insert(TextStyle::Body, FontId::proportional(BODY));
-    s.text_styles.insert(TextStyle::Button, FontId::proportional(BODY));
-    s.text_styles.insert(TextStyle::Small, FontId::proportional(SMALL));
-    s.text_styles.insert(TextStyle::Heading, FontId::new(TITLE, FontFamily::Name(BOLD.into())));
-    s.text_styles.insert(TextStyle::Monospace, FontId::monospace(BODY));
+    let mut s = Style {
+        visuals: if dark {
+            Visuals::dark()
+        } else {
+            Visuals::light()
+        },
+        ..Style::default()
+    };
+    s.text_styles
+        .insert(TextStyle::Body, FontId::proportional(BODY));
+    s.text_styles
+        .insert(TextStyle::Button, FontId::proportional(BODY));
+    s.text_styles
+        .insert(TextStyle::Small, FontId::proportional(SMALL));
+    s.text_styles.insert(
+        TextStyle::Heading,
+        FontId::new(TITLE, FontFamily::Name(BOLD.into())),
+    );
+    s.text_styles
+        .insert(TextStyle::Monospace, FontId::monospace(BODY));
     s.spacing.item_spacing = Vec2::new(HORIZONTAL_GAP, GAP);
     s.spacing.button_padding = Vec2::new(10.0, 4.0);
     s.spacing.interact_size = Vec2::new(CONTROL, CONTROL);
@@ -138,13 +174,24 @@ pub fn style(dark: bool, reduced_motion: bool) -> Style {
     v.selection.stroke = Stroke::new(1.0_f32, p.accent);
     v.window_corner_radius = CornerRadius::same(RADIUS);
     v.menu_corner_radius = CornerRadius::same(RADIUS);
-    let shadow = Shadow { offset: [0, 6], blur: 20, spread: 0, color: p.shadow };
+    let shadow = Shadow {
+        offset: [0, 6],
+        blur: 20,
+        spread: 0,
+        color: p.shadow,
+    };
     v.window_shadow = shadow;
     v.popup_shadow = shadow;
     v.window_stroke = Stroke::new(1_f32, p.border);
     v.striped = false;
     v.indent_has_left_vline = false;
-    for w in [&mut v.widgets.noninteractive, &mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
+    for w in [
+        &mut v.widgets.noninteractive,
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
         w.bg_fill = p.surface;
         w.weak_bg_fill = p.surface;
         w.fg_stroke = Stroke::new(1.0_f32, p.foreground);

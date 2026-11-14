@@ -1,9 +1,11 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{ext::IdentExt, parse_macro_input, Data, DeriveInput, Error, Fields, LitStr, Result};
+use syn::{Data, DeriveInput, Error, Fields, LitStr, Result, ext::IdentExt, parse_macro_input};
 
 /// Map the named fields of a struct to SQLite columns. The default key is `id`.
-#[proc_macro_derive(Table, attributes(table))]
+/// `#[column(default = "0")]` on a field lets an existing table gain it as a
+/// required column (the SQL default fills old rows).
+#[proc_macro_derive(Table, attributes(table, column))]
 pub fn derive_table(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     expand(input).unwrap_or_else(|e| e.into_compile_error().into())
@@ -52,6 +54,24 @@ fn expand(input: DeriveInput) -> Result<TokenStream> {
         .map(|f| f.ident.as_ref().unwrap())
         .collect();
     let types: Vec<_> = fields.named.iter().map(|f| &f.ty).collect();
+    let mut defaults = Vec::new();
+    for f in &fields.named {
+        let mut default = None;
+        for attr in f.attrs.iter().filter(|a| a.path().is_ident("column")) {
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("default") {
+                    default = Some(meta.value()?.parse::<LitStr>()?.value());
+                    Ok(())
+                } else {
+                    Err(meta.error("expected default"))
+                }
+            })?;
+        }
+        defaults.push(match default {
+            Some(d) => quote!(.with_default(#d)),
+            None => quote!(),
+        });
+    }
     let names: Vec<_> = ids.iter().map(|id| id.unraw().to_string()).collect();
     if names.iter().any(|n| n.eq_ignore_ascii_case("_rowid_")) {
         return Err(Error::new_spanned(
@@ -74,7 +94,7 @@ fn expand(input: DeriveInput) -> Result<TokenStream> {
             const NAME: &'static str = #name;
             const KEY: &'static str = #key;
             const COLUMNS: &'static [#store::Column] = &[
-                #(#store::Column::of::<#types>(#names)),*
+                #(#store::Column::of::<#types>(#names)#defaults),*
             ];
             fn values(&self) -> Vec<&dyn #sql::ToSql> {
                 vec![#(&self.#ids),*]

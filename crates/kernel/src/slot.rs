@@ -1,5 +1,5 @@
 //! UI zones and synchronous questions that several plugins can answer.
-use crate::{ui::UiCx, Snapshot};
+use crate::{Snapshot, ui::UiCx};
 use std::{marker::PhantomData, sync::Arc};
 
 /// A place in the UI that plugins fill. `P` is what the zone passes to each
@@ -13,7 +13,11 @@ pub struct Slot<P: 'static> {
 }
 impl<P> Slot<P> {
     pub const fn new(id: &'static str, about: &'static str) -> Self {
-        Self { id, about, _p: PhantomData }
+        Self {
+            id,
+            about,
+            _p: PhantomData,
+        }
     }
 }
 
@@ -28,7 +32,12 @@ pub(crate) struct Contribution<P> {
 }
 impl<P> Clone for Contribution<P> {
     fn clone(&self) -> Self {
-        Self { id: self.id.clone(), plugin: self.plugin, order: self.order, view: self.view.clone() }
+        Self {
+            id: self.id.clone(),
+            plugin: self.plugin,
+            order: self.order,
+            view: self.view.clone(),
+        }
     }
 }
 pub(crate) struct Contributions<P>(pub Vec<Contribution<P>>);
@@ -41,7 +50,10 @@ pub struct Hook<I: ?Sized + 'static, O: 'static> {
 }
 impl<I: ?Sized, O> Hook<I, O> {
     pub const fn new(id: &'static str) -> Self {
-        Self { id, _p: PhantomData }
+        Self {
+            id,
+            _p: PhantomData,
+        }
     }
 }
 pub(crate) type HookFn<I, O> = Arc<dyn Fn(&Snapshot, &I) -> O + Send + Sync>;

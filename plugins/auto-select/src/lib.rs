@@ -12,9 +12,9 @@
 //!
 //! Integration: wraps `servers::Select` (a manual choice turns Auto off), reacts
 //! to `ServersChanged`, `health::Checked` and subscription order changes.
-use plugin_health_checks::{self as health, QuickCheck};
 use plugin_servers::{self as servers, Select, Server};
 use plugin_subscriptions as subscriptions;
+use rproxy_contracts::health::{self, QuickCheck, Report};
 use rproxy_kernel::{kit, prelude::*};
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -24,11 +24,9 @@ pub static PLUGIN: Plugin = Plugin {
     name: "Auto select",
     description: "Connect to the best healthy server and switch when it fails or a clearly better one appears.",
     category: categories::SERVER_SELECTION,
-    requires: &["servers", "health-checks", "subscriptions"],
-    required: false,
-    default_enabled: true,
-    platforms: Platform::ALL,
+    requires: &["servers", health::CAPABILITY, "subscriptions"],
     setup,
+    ..Plugin::DEFAULT
 };
 
 /// How often the connected server is probed.
@@ -92,22 +90,49 @@ pub struct SetAuto(pub bool);
 impl Op for SetAuto {
     type Reply = ();
 }
-#[derive(Clone, Debug)]
+/// Why a decision is due, least important first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Trigger {
-    Enabled,
-    Priorities,
-    Servers,
-    Checked(Vec<Id>),
     Watch,
+    Servers,
+    /// Servers were checked (their ids wait in [`PENDING`]).
+    Checked,
+    Priorities,
+    Enabled,
 }
-/// Re-evaluate the connection.
-pub struct Decide(pub Trigger);
+/// What waits for the next decision. Queued decisions merge into one, so the
+/// requests collect here and that decision handles the most important trigger.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Pending {
+    pub triggers: Vec<Trigger>,
+    pub checked: Vec<Id>,
+}
+pub static PENDING: State<Pending> = State::new("auto-select.pending");
+
+/// Ask for a decision (see [`PENDING`]).
+fn request(cx: &Cx, trigger: Trigger, checked: Vec<Id>) -> Result<()> {
+    cx.update_live(&PENDING, |p| {
+        p.triggers.push(trigger);
+        p.checked.extend(checked);
+    });
+    cx.spawn(Decide { watch: false }).map(drop)
+}
+/// Re-evaluate the connection for the triggers in [`PENDING`]; `watch` is the
+/// periodic look at the connected server.
+pub struct Decide {
+    pub watch: bool,
+}
 impl Op for Decide {
     type Reply = ();
     fn job(&self) -> Option<JobSpec> {
-        // Every trigger except the periodic watch must be evaluated: queue it behind a running decision.
-        let spec = JobSpec::keyed("auto-select", "Automatic selection");
-        Some(if matches!(self.0, Trigger::Watch) { spec.quiet() } else { spec.queued() })
+        // Requests must be evaluated: queue them behind a running decision.
+        // The periodic watch just joins it.
+        let spec = JobSpec::new("Automatic selection");
+        Some(if self.watch {
+            spec.quiet()
+        } else {
+            spec.queued()
+        })
     }
 }
 
@@ -160,10 +185,14 @@ struct World {
 }
 impl World {
     fn new(snap: Snapshot) -> Self {
-        Self { servers: snap.get(&servers::SERVERS).to_vec(), selected: *snap.get(&servers::SELECTED), snap }
+        Self {
+            servers: snap.get(&servers::SERVERS).to_vec(),
+            selected: *snap.get(&servers::SELECTED),
+            snap,
+        }
     }
-    fn health(&self, id: Id) -> Option<health::Health> {
-        health::health(&self.snap, id)
+    fn health(&self, id: Id) -> Option<Report> {
+        health::report(&self.snap, id)
     }
     fn rating(&self, id: Id) -> Option<u8> {
         self.health(id).and_then(|h| h.rating)
@@ -174,12 +203,14 @@ impl World {
     /// Higher for earlier subscriptions.
     fn level(&self, s: &Server) -> usize {
         let sources = self.snap.get(&subscriptions::SOURCES);
-        sources.iter().position(|x| x.id == s.source).map_or(0, |i| sources.len() - i)
+        sources
+            .iter()
+            .position(|x| x.id == s.source)
+            .map_or(0, |i| sources.len() - i)
     }
     fn ideal(&self, s: &Server) -> bool {
-        let h = self.health(s.id);
-        h.as_ref().is_some_and(|h| h.checked.is_some() && h.bytes_per_sec.unwrap_or(0) >= health::FULL_SPEED)
-            && self.snap.get(&health::RESULTS).iter().filter(|r| r.server == s.id).all(|r| r.passed)
+        self.health(s.id)
+            .is_some_and(|h| h.checked.is_some() && h.ideal())
     }
     fn current(&self) -> Option<&Server> {
         self.servers.iter().find(|s| Some(s.id) == self.selected)
@@ -211,21 +242,43 @@ struct Policy {
 }
 impl Policy {
     fn load(snap: &Snapshot) -> Self {
-        Self { auto: (*snap.get(&AUTO)).clone(), memory: snap.get(&MEMORY).to_vec(), strikes: snap.get(&STRIKES).to_vec() }
+        Self {
+            auto: (*snap.get(&AUTO)).clone(),
+            memory: snap.get(&MEMORY).to_vec(),
+            strikes: snap.get(&STRIKES).to_vec(),
+        }
     }
     fn prune(&mut self, w: &World, now: u64) {
-        self.memory.retain(|m| w.servers.iter().any(|s| s.id == m.id));
-        self.strikes.retain(|e| now.saturating_sub(e.at) < DAY && e.server.is_none_or(|id| w.servers.iter().any(|s| s.id == id)));
+        self.memory
+            .retain(|m| w.servers.iter().any(|s| s.id == m.id));
+        self.strikes.retain(|e| {
+            now.saturating_sub(e.at) < DAY
+                && e.server
+                    .is_none_or(|id| w.servers.iter().any(|s| s.id == id))
+        });
     }
     fn memory(&mut self, id: Id) -> &mut Memory {
-        let i = self.memory.iter().position(|m| m.id == id).unwrap_or_else(|| {
-            self.memory.push(Memory { id, score: None, quarantine_until: 0, better_runs: 0 });
-            self.memory.len() - 1
-        });
+        let i = self
+            .memory
+            .iter()
+            .position(|m| m.id == id)
+            .unwrap_or_else(|| {
+                self.memory.push(Memory {
+                    id,
+                    score: None,
+                    quarantine_until: 0,
+                    better_runs: 0,
+                });
+                self.memory.len() - 1
+            });
         &mut self.memory[i]
     }
     fn score(&self, w: &World, s: &Server) -> f64 {
-        self.memory.iter().find(|m| m.id == s.id).and_then(|m| m.score).unwrap_or(f64::from(w.rating(s.id).unwrap_or(0)))
+        self.memory
+            .iter()
+            .find(|m| m.id == s.id)
+            .and_then(|m| m.score)
+            .unwrap_or(f64::from(w.rating(s.id).unwrap_or(0)))
     }
     fn record(&mut self, w: &World, id: Id) {
         if let Some(r) = w.rating(id) {
@@ -235,14 +288,29 @@ impl Policy {
         }
     }
     fn value(&self, w: &World, s: &Server) -> f64 {
-        self.score(w, s) + if w.ideal(s) { 1000. * (w.level(s) + 1) as f64 } else { 0. }
+        self.score(w, s)
+            + if w.ideal(s) {
+                1000. * (w.level(s) + 1) as f64
+            } else {
+                0.
+            }
     }
     fn quarantined(&self, id: Id, now: u64) -> bool {
-        self.memory.iter().find(|m| m.id == id).is_some_and(|m| m.quarantine_until > now)
+        self.memory
+            .iter()
+            .find(|m| m.id == id)
+            .is_some_and(|m| m.quarantine_until > now)
     }
     /// Servers to switch to, best first. Rated ones need a value of at least
     /// `above`; `unrated` also admits servers that were never checked.
-    fn candidates(&self, w: &World, now: u64, above: f64, unrated: bool, except: Option<Id>) -> Vec<Id> {
+    fn candidates(
+        &self,
+        w: &World,
+        now: u64,
+        above: f64,
+        unrated: bool,
+        except: Option<Id>,
+    ) -> Vec<Id> {
         let c = w
             .servers
             .iter()
@@ -253,9 +321,17 @@ impl Policy {
                     Some(0) => None,
                     Some(_) => {
                         let v = self.value(w, s);
-                        (v >= above).then_some(Candidate { id: s.id, value: Some(v), level })
+                        (v >= above).then_some(Candidate {
+                            id: s.id,
+                            value: Some(v),
+                            level,
+                        })
                     }
-                    None => unrated.then_some(Candidate { id: s.id, value: None, level }),
+                    None => unrated.then_some(Candidate {
+                        id: s.id,
+                        value: None,
+                        level,
+                    }),
                 }
             })
             .collect();
@@ -264,11 +340,21 @@ impl Policy {
     /// The fallback group's backups for `selected`.
     fn backups(&self, w: &World, now: u64, selected: Option<Id>) -> Vec<Id> {
         let Some(id) = selected else { return vec![] };
-        self.candidates(w, now, 0., true, Some(id)).into_iter().take(BACKUPS).collect()
+        self.candidates(w, now, 0., true, Some(id))
+            .into_iter()
+            .take(BACKUPS)
+            .collect()
     }
     fn may_switch(&self, now: u64, min_stay: u64) -> bool {
-        self.auto.last_switch.is_none_or(|at| now.saturating_sub(at) >= min_stay)
-            && self.strikes.iter().filter(|e| e.server.is_none() && now.saturating_sub(e.at) < DAY).count() < 4
+        self.auto
+            .last_switch
+            .is_none_or(|at| now.saturating_sub(at) >= min_stay)
+            && self
+                .strikes
+                .iter()
+                .filter(|e| e.server.is_none() && now.saturating_sub(e.at) < DAY)
+                .count()
+                < 4
     }
     fn reset_watch(&mut self, id: Option<Id>, next_check: u64) {
         self.auto.watched = id;
@@ -276,20 +362,39 @@ impl Policy {
         self.auto.degradations = 0;
         self.auto.next_check = next_check;
     }
-    fn switched(&mut self, previous: Option<Id>, next: Id, reason: Reason, failed: &[Id], now: u64) {
+    fn switched(
+        &mut self,
+        previous: Option<Id>,
+        next: Id,
+        reason: Reason,
+        failed: &[Id],
+        now: u64,
+    ) {
         for id in failed {
             let m = self.memory(*id);
             m.quarantine_until = m.quarantine_until.max(now + 600);
         }
         if let Some(id) = previous.filter(|_| reason.punished()) {
-            let strikes = self.strikes.iter().filter(|e| e.server == Some(id) && now.saturating_sub(e.at) < DAY).count();
+            let strikes = self
+                .strikes
+                .iter()
+                .filter(|e| e.server == Some(id) && now.saturating_sub(e.at) < DAY)
+                .count();
             let duration = (1800u64 << strikes.min(3)).min(14_400);
             let m = self.memory(id);
             m.quarantine_until = m.quarantine_until.max(now + duration);
-            self.strikes.push(Strike { id: Id::random(), server: Some(id), at: now });
+            self.strikes.push(Strike {
+                id: Id::random(),
+                server: Some(id),
+                at: now,
+            });
         }
         if reason.limited() {
-            self.strikes.push(Strike { id: Id::random(), server: None, at: now });
+            self.strikes.push(Strike {
+                id: Id::random(),
+                server: None,
+                at: now,
+            });
         }
         self.auto.last_switch = Some(now);
         self.auto.last_reason = Some(reason.label().into());
@@ -326,7 +431,7 @@ async fn save(cx: &Cx, before: &World, mut p: Policy) -> Result<()> {
     .await
 }
 
-async fn quick(cx: &Cx, id: Id) -> Option<health::Quick> {
+async fn quick(cx: &Cx, id: Id) -> Option<Report> {
     cx.call(QuickCheck { id }).await.ok().flatten()
 }
 /// Quick checks of a batch of candidates running in parallel.
@@ -339,9 +444,12 @@ impl Probes {
         let mut set = JoinSet::new();
         for (i, id) in ids.iter().copied().enumerate() {
             let cx = cx.clone();
-            set.spawn(async move { (i, quick(&cx, id).await.is_some_and(|q| q.passed())) });
+            set.spawn(async move { (i, quick(&cx, id).await.is_some_and(|q| q.works())) });
         }
-        Self { set, done: vec![None; ids.len()] }
+        Self {
+            set,
+            done: vec![None; ids.len()],
+        }
     }
     /// The first candidate at or after `from` that passed, as soon as every one
     /// before it has failed: the best candidate wins without waiting for slower ones.
@@ -384,7 +492,26 @@ enum Verdict {
     Adopt(Id, Id),
 }
 
-async fn decide(cx: Cx, trigger: Trigger) -> Result<()> {
+async fn decide(cx: Cx, op: Decide) -> Result<()> {
+    let pending = cx.update_live(&PENDING, std::mem::take);
+    let watch = if op.watch {
+        Trigger::Watch
+    } else {
+        Trigger::Servers
+    };
+    let result = decide_now(&cx, watch, &pending).await;
+    if result.is_err() {
+        // Not handled: the next decision takes it again.
+        cx.update_live(&PENDING, |p| {
+            p.triggers.extend(&pending.triggers);
+            p.checked.extend(&pending.checked);
+        });
+    }
+    result
+}
+
+async fn decide_now(cx: &Cx, trigger: Trigger, pending: &Pending) -> Result<()> {
+    let trigger = pending.triggers.iter().copied().fold(trigger, Ord::max);
     let w = World::new(cx.snapshot());
     let time = now();
     let watch = matches!(trigger, Trigger::Watch);
@@ -394,13 +521,12 @@ async fn decide(cx: Cx, trigger: Trigger) -> Result<()> {
         return Ok(());
     }
     p.prune(&w, time);
-    if let Trigger::Checked(ids) = &trigger {
-        for id in ids {
-            p.record(&w, *id);
-        }
+    // Every checked batch counts, even when several decisions merged into one.
+    for id in &pending.checked {
+        p.record(&w, *id);
     }
     if !p.auto.enabled || !running {
-        return save(&cx, &w, p).await;
+        return save(cx, &w, p).await;
     }
     if matches!(trigger, Trigger::Enabled) {
         p.reset_watch(w.selected, time);
@@ -412,11 +538,11 @@ async fn decide(cx: Cx, trigger: Trigger) -> Result<()> {
             m.better_runs = 0;
         }
     }
-    match verdict(&cx, &w, &mut p, &trigger, time).await? {
+    match verdict(cx, &w, &mut p, &trigger, time).await? {
         Verdict::Stay => {}
-        Verdict::Adopt(from, backup) => return adopt(&cx, &w, p, from, backup).await,
+        Verdict::Adopt(from, backup) => return adopt(cx, &w, p, from, backup).await,
         Verdict::Search(reason, above) => {
-            if search(&cx, &w, &mut p, reason, above).await? {
+            if search(cx, &w, &mut p, reason, above).await? {
                 return Ok(());
             }
         }
@@ -425,34 +551,56 @@ async fn decide(cx: Cx, trigger: Trigger) -> Result<()> {
     // only on events, or when a backup is no longer usable.
     let time = now();
     let stale = p.auto.backups.iter().any(|id| {
-        p.quarantined(*id, time) || w.servers.iter().find(|s| s.id == *id).is_none_or(|s| w.excluded(s) || w.rating(s.id) == Some(0))
+        p.quarantined(*id, time)
+            || w.servers
+                .iter()
+                .find(|s| s.id == *id)
+                .is_none_or(|s| w.excluded(s) || w.rating(s.id) == Some(0))
     });
     if !watch || stale || (p.auto.backups.is_empty() && w.selected.is_some()) {
         p.auto.backups = p.backups(&w, time, w.selected);
     }
-    save(&cx, &w, p).await
+    save(cx, &w, p).await
 }
 
 /// Whether the trigger is a reason to look for another server.
-async fn verdict(cx: &Cx, w: &World, p: &mut Policy, trigger: &Trigger, time: u64) -> Result<Verdict> {
+async fn verdict(
+    cx: &Cx,
+    w: &World,
+    p: &mut Policy,
+    trigger: &Trigger,
+    time: u64,
+) -> Result<Verdict> {
     let watch = matches!(trigger, Trigger::Watch);
     let Some(c) = w.current().cloned() else {
         // Retry an empty connection with backoff; events (new servers, a check) retry at once.
-        return Ok(if !watch || time >= p.auto.retry_at { Verdict::Search(Reason::Empty, 0.) } else { Verdict::Stay });
+        return Ok(if !watch || time >= p.auto.retry_at {
+            Verdict::Search(Reason::Empty, 0.)
+        } else {
+            Verdict::Stay
+        });
     };
     if w.excluded(&c) {
         p.auto.next_check = time + CHECK_INTERVAL;
-        return Ok(if !watch || time >= p.auto.retry_at { Verdict::Search(Reason::Failure, 0.) } else { Verdict::Stay });
+        return Ok(if !watch || time >= p.auto.retry_at {
+            Verdict::Search(Reason::Failure, 0.)
+        } else {
+            Verdict::Stay
+        });
     }
     let above = p.value(w, &c) + MARGIN;
     Ok(match trigger {
         Trigger::Enabled => Verdict::Search(Reason::Enabled, above),
         Trigger::Priorities => Verdict::Search(Reason::Priorities, above),
-        Trigger::Checked(_) => {
+        Trigger::Checked => {
             let ahead = p.candidates(w, time, above, false, w.selected);
             for s in &w.servers {
                 let m = p.memory(s.id);
-                m.better_runs = if ahead.contains(&s.id) { m.better_runs.saturating_add(1) } else { 0 };
+                m.better_runs = if ahead.contains(&s.id) {
+                    m.better_runs.saturating_add(1)
+                } else {
+                    0
+                };
             }
             if std::mem::take(&mut p.auto.provisional) {
                 Verdict::Search(Reason::Refined, above)
@@ -468,7 +616,13 @@ async fn verdict(cx: &Cx, w: &World, p: &mut Policy, trigger: &Trigger, time: u6
 }
 
 /// The periodic check of the connected server: is it alive, and still good?
-async fn watch_current(cx: &Cx, w: &World, p: &mut Policy, c: &Server, time: u64) -> Result<Verdict> {
+async fn watch_current(
+    cx: &Cx,
+    w: &World,
+    p: &mut Policy,
+    c: &Server,
+    time: u64,
+) -> Result<Verdict> {
     if p.auto.watched != Some(c.id) {
         p.reset_watch(Some(c.id), time);
     }
@@ -476,30 +630,47 @@ async fn watch_current(cx: &Cx, w: &World, p: &mut Policy, c: &Server, time: u64
     // so only a failed one confirms a failover that mihomo made.
     let q = quick(cx, c.id).await;
     cx.checkpoint()?;
-    if !q.as_ref().is_some_and(|q| q.passed()) {
-        if let Some(backup) = failed_over(cx, w, p, c.id).await {
-            return Ok(Verdict::Adopt(c.id, backup));
-        }
+    if !q.as_ref().is_some_and(|q| q.works())
+        && let Some(backup) = failed_over(cx, w, p, c.id).await
+    {
+        return Ok(Verdict::Adopt(c.id, backup));
     }
     let time = now();
-    let Some(q) = q.filter(|q| q.passed()) else {
+    let Some(q) = q.filter(|q| q.works()) else {
         p.auto.failures = p.auto.failures.saturating_add(1);
         p.auto.degradations = 0;
         let failed = p.auto.failures >= FAILURES && time >= p.auto.retry_at;
-        return Ok(if failed { Verdict::Search(Reason::Failure, 0.) } else { Verdict::Stay });
+        return Ok(if failed {
+            Verdict::Search(Reason::Failure, 0.)
+        } else {
+            Verdict::Stay
+        });
     };
     p.auto.failures = 0;
     if time < p.auto.next_check {
         return Ok(Verdict::Stay);
     }
     p.auto.next_check = time + CHECK_INTERVAL;
-    let rating = f64::from(q.health.rating.unwrap_or(0));
-    p.auto.degradations = if rating < p.score(w, c) - 20. { p.auto.degradations.saturating_add(1) } else { 0 };
+    let rating = f64::from(q.rating.unwrap_or(0));
+    p.auto.degradations = if rating < p.score(w, c) - 20. {
+        p.auto.degradations.saturating_add(1)
+    } else {
+        0
+    };
     if p.auto.degradations < 2 || !p.may_switch(time, 900) {
         return Ok(Verdict::Stay);
     }
-    let ideal = q.results.iter().all(|r| r.passed) && q.health.bytes_per_sec.unwrap_or(0) >= health::FULL_SPEED;
-    Ok(Verdict::Search(Reason::Degradation, rating + if ideal { 1000. * (w.level(c) + 1) as f64 } else { 0. } + MARGIN))
+    let ideal = q.ideal();
+    Ok(Verdict::Search(
+        Reason::Degradation,
+        rating
+            + if ideal {
+                1000. * (w.level(c) + 1) as f64
+            } else {
+                0.
+            }
+            + MARGIN,
+    ))
 }
 
 /// Probe candidates above `above` and switch to the first that answers.
@@ -510,7 +681,11 @@ async fn search(cx: &Cx, w: &World, p: &mut Policy, reason: Reason, above: f64) 
         candidates.retain(|id| p.memory.iter().any(|m| m.id == *id && m.better_runs >= 2));
     }
     // Urgent searches go through every candidate, a batch at a time; others try the best batch.
-    let limit = if reason.urgent() { candidates.len() } else { candidates.len().min(BATCH) };
+    let limit = if reason.urgent() {
+        candidates.len()
+    } else {
+        candidates.len().min(BATCH)
+    };
     let mut failed = Vec::new();
     for batch in candidates[..limit].chunks(BATCH) {
         let mut probes = Probes::start(cx, batch);
@@ -531,7 +706,10 @@ async fn search(cx: &Cx, w: &World, p: &mut Policy, reason: Reason, above: f64) 
             announce(cx, id, reason);
             let mut next = p.clone();
             next.switched(w.selected, id, reason, &failed, now());
-            let after = World { selected: Some(id), ..World::new(cx.snapshot()) };
+            let after = World {
+                selected: Some(id),
+                ..World::new(cx.snapshot())
+            };
             next.auto.backups = next.backups(&after, now(), Some(id));
             next.auto.provisional = after.rating(id).is_none();
             if next.auto.provisional {
@@ -549,10 +727,16 @@ async fn search(cx: &Cx, w: &World, p: &mut Policy, reason: Reason, above: f64) 
         p.auto.misses = p.auto.misses.saturating_add(1);
         let wait = backoff(p.auto.misses);
         p.auto.retry_at = now() + wait;
+        // No countdown in the text: it would stand still on screen.
         p.auto.last_reason = Some(if candidates.is_empty() {
             "No eligible server: check subscriptions and filters".into()
         } else {
-            format!("No server answers; retrying in {wait} s")
+            "No server answers yet; it tries again after each check and every few minutes".into()
+        });
+        cx.summary(if candidates.is_empty() {
+            "No eligible server"
+        } else {
+            "No server answers"
         });
     }
     if matches!(reason, Reason::Degradation) {
@@ -564,18 +748,28 @@ async fn search(cx: &Cx, w: &World, p: &mut Policy, reason: Reason, above: f64) 
 /// Say why the connection moved, so a switch is never silent.
 fn announce(cx: &Cx, to: Id, reason: Reason) {
     let servers = cx.get(&servers::SERVERS);
-    let name = servers.iter().find(|s| s.id == to).map_or("another server", |s| s.name.as_str());
+    let name = servers
+        .iter()
+        .find(|s| s.id == to)
+        .map_or("another server", |s| s.name.as_str());
     cx.notify(&format!("Switched to {name}. {}.", reason.label()));
 }
 
 /// mihomo already moved traffic to `backup`: make it the selection.
 async fn adopt(cx: &Cx, w: &World, mut p: Policy, from: Id, backup: Id) -> Result<()> {
-    if cx.call(Select::auto(Some(backup), Some(from))).await.is_err() {
+    if cx
+        .call(Select::auto(Some(backup), Some(from)))
+        .await
+        .is_err()
+    {
         return save(cx, w, p).await;
     }
     announce(cx, backup, Reason::Failover);
     p.switched(Some(from), backup, Reason::Failover, &[], now());
-    let after = World { selected: Some(backup), ..World::new(cx.snapshot()) };
+    let after = World {
+        selected: Some(backup),
+        ..World::new(cx.snapshot())
+    };
     p.auto.backups = p.backups(&after, now(), Some(backup));
     p.auto.provisional = false;
     save(cx, &after, p).await
@@ -593,7 +787,7 @@ async fn set_auto(cx: Cx, SetAuto(on): SetAuto) -> Result<()> {
     })
     .await?;
     if on {
-        cx.spawn(Decide(Trigger::Enabled))?;
+        request(&cx, Trigger::Enabled, vec![])?;
     }
     Ok(())
 }
@@ -604,6 +798,7 @@ async fn manual_choice_turns_auto_off(cx: Cx, op: Select, next: Next<Select>) ->
     next.run(&cx, op).await?;
     if manual && cx.get(&AUTO).enabled {
         cx.call(SetAuto(false)).await?;
+        cx.notify("Auto select is off: you chose the server yourself. Turn it on again on the Servers page.");
     }
     Ok(())
 }
@@ -625,11 +820,11 @@ fn ui(p: &mut Setup) {
         let auto = cx.get(&AUTO);
         if auto.enabled {
             let pal = kit::colors(ui);
-            let tip = auto.last_reason.clone().map_or_else(String::new, |r| format!("Last decision: {r}"));
-            let r = kit::chip(ui, Some(kit::Lead::Icon(Icon::Auto, pal.accent)), "Auto", &tip);
-            if r.clicked() {
-                cx.toggle_panels_from(&r);
-            }
+            let tip = auto
+                .last_reason
+                .clone()
+                .map_or_else(String::new, |r| format!("Last decision: {r}"));
+            cx.status_chip(ui, kit::Lead::Icon(Icon::Auto, pal.accent), "Auto", &tip);
         }
     });
     p.fill(&servers::CONNECTION, "auto", 50, |ui, cx, _| {
@@ -639,8 +834,18 @@ fn ui(p: &mut Setup) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.;
                 kit::icon(ui, Icon::Auto, 14., pal.accent);
-                let text = auto.last_reason.clone().map_or_else(String::new, |r| format!("Last decision: {r}"));
-                ui.add(egui::Label::new(egui::RichText::new(text).size(kit::theme::SMALL).color(pal.muted)).wrap());
+                let text = auto
+                    .last_reason
+                    .clone()
+                    .map_or_else(String::new, |r| format!("Last decision: {r}"));
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(text)
+                            .size(kit::theme::SMALL)
+                            .color(pal.muted),
+                    )
+                    .wrap(),
+                );
             });
             ui.add_space(4.);
         }
@@ -649,12 +854,13 @@ fn ui(p: &mut Setup) {
 
 fn setup(p: &mut Setup) -> Result<()> {
     p.setting(&AUTO);
+    p.live(&PENDING, Pending::default);
     p.collection(&MEMORY);
     p.collection(&STRIKES);
     p.cascade(&servers::SERVERS, &MEMORY, |m| m.id);
 
     p.handle(set_auto);
-    p.handle(|cx: Cx, Decide(t): Decide| decide(cx, t));
+    p.handle(decide);
     p.wrap(manual_choice_turns_auto_off);
     // A filter dropped the connected server: stay on and connect another one.
     p.on(|cx: Cx, e: servers::Excluded| async move {
@@ -662,31 +868,50 @@ fn setup(p: &mut Setup) -> Result<()> {
             return Ok(());
         }
         cx.write(move |w| {
-            w.update(&AUTO, |a| a.last_reason = Some(format!("{} ({})", e.reason, e.server.name)));
+            w.update(&AUTO, |a| {
+                a.last_reason = Some(format!("{} ({})", e.reason, e.server.name))
+            });
             Ok(())
         })
         .await?;
-        cx.spawn(Decide(Trigger::Servers)).map(drop)
+        request(&cx, Trigger::Servers, vec![])
     });
-    p.on(|cx: Cx, _: servers::ServersChanged| async move { cx.spawn(Decide(Trigger::Servers)).map(drop) });
-    p.on(|cx: Cx, e: health::Checked| async move { cx.spawn(Decide(Trigger::Checked(e.servers))).map(drop) });
+    p.on(
+        |cx: Cx, _: servers::ServersChanged| async move { request(&cx, Trigger::Servers, vec![]) },
+    );
+    p.on(|cx: Cx, e: health::Checked| async move { request(&cx, Trigger::Checked, e.servers) });
     p.on_change([subscriptions::SOURCES.name], |cx: Cx| async move {
         if cx.get(&AUTO).enabled {
-            cx.spawn(Decide(Trigger::Priorities))?;
+            request(&cx, Trigger::Priorities, vec![])?;
         }
         Ok(())
     });
-    p.every("watch", |s| s.get(&AUTO).enabled.then_some(Duration::from_secs(WATCH_SECS)), || Decide(Trigger::Watch));
+    p.every(
+        "watch",
+        |s| {
+            s.get(&AUTO)
+                .enabled
+                .then_some(Duration::from_secs(WATCH_SECS))
+        },
+        || Decide { watch: true },
+    );
     p.hook(&servers::IDLE, |snap, _| {
         let auto = snap.get(&AUTO);
-        auto.enabled.then(|| format!("Auto select · {}", auto.last_reason.as_deref().unwrap_or("Looking for a server that answers…")))
+        auto.enabled.then(|| {
+            format!(
+                "Auto select · {}",
+                auto.last_reason
+                    .as_deref()
+                    .unwrap_or("Looking for a server that answers…")
+            )
+        })
     });
     // While Auto is on, the main group fails over to the policy's backups by itself.
     p.hook(&servers::FAILOVER, |snap, _| {
         let auto = snap.get(&AUTO);
         (auto.enabled && !auto.backups.is_empty()).then(|| servers::Failover {
             backups: auto.backups.clone(),
-            url: health::probe_url(snap),
+            url: health::check_url(snap),
             interval_secs: FAILOVER_SECS,
         })
     });
@@ -699,17 +924,30 @@ fn setup(p: &mut Setup) -> Result<()> {
 mod tests {
     use super::*;
     fn policy() -> Policy {
-        Policy { auto: Auto::default(), memory: vec![], strikes: vec![] }
+        Policy {
+            auto: Auto::default(),
+            memory: vec![],
+            strikes: vec![],
+        }
     }
     #[test]
     fn strikes_escalate_but_expire_and_failures_bypass_switch_budget() {
         let mut p = policy();
         let (old, new) = (Id::random(), Id::random());
-        for (time, duration) in [(100, 1800), (200, 3600), (300, 7200), (400, 14400), (500, 14400)] {
+        for (time, duration) in [
+            (100, 1800),
+            (200, 3600),
+            (300, 7200),
+            (400, 14400),
+            (500, 14400),
+        ] {
             p.switched(Some(old), new, Reason::Failure, &[], time);
             assert_eq!(p.memory(old).quarantine_until, time + duration);
         }
-        assert!(p.strikes.iter().all(|e| e.server.is_some()), "failures do not use the switch budget");
+        assert!(
+            p.strikes.iter().all(|e| e.server.is_some()),
+            "failures do not use the switch budget"
+        );
         p.switched(Some(old), new, Reason::Failure, &[], DAY + 501);
         assert_eq!(p.memory(old).quarantine_until, DAY + 501 + 1800);
     }
@@ -737,13 +975,26 @@ mod tests {
     #[test]
     fn rated_candidates_come_first_then_unrated_by_source_priority() {
         let ids: Vec<Id> = (0..5).map(|_| Id::random()).collect();
-        let c = |i: usize, value: Option<f64>, level: usize| Candidate { id: ids[i], value, level };
-        let order = rank(vec![c(0, None, 1), c(1, Some(50.), 1), c(2, None, 3), c(3, Some(80.), 0), c(4, Some(50.), 2)]);
+        let c = |i: usize, value: Option<f64>, level: usize| Candidate {
+            id: ids[i],
+            value,
+            level,
+        };
+        let order = rank(vec![
+            c(0, None, 1),
+            c(1, Some(50.), 1),
+            c(2, None, 3),
+            c(3, Some(80.), 0),
+            c(4, Some(50.), 2),
+        ]);
         assert_eq!(order, vec![ids[3], ids[4], ids[1], ids[2], ids[0]]);
     }
     #[test]
     fn searches_without_answer_back_off_and_a_switch_resets_it() {
-        assert_eq!([1, 2, 3, 4, 5, 6, 9].map(backoff), [10, 20, 40, 80, 160, 300, 300]);
+        assert_eq!(
+            [1, 2, 3, 4, 5, 6, 9].map(backoff),
+            [10, 20, 40, 80, 160, 300, 300]
+        );
         let mut p = policy();
         p.auto.misses = 4;
         p.auto.retry_at = 1000;
@@ -756,7 +1007,10 @@ mod tests {
         let (old, new) = (Id::random(), Id::random());
         p.switched(Some(old), new, Reason::Failover, &[], 100);
         assert_eq!(p.memory(old).quarantine_until, 1900);
-        assert!(p.strikes.iter().all(|e| e.server == Some(old)), "a failover does not use the switch budget");
+        assert!(
+            p.strikes.iter().all(|e| e.server == Some(old)),
+            "a failover does not use the switch budget"
+        );
         assert!(!Reason::Refined.limited() && !Reason::Refined.punished());
     }
 }

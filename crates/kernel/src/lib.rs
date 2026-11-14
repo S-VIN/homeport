@@ -18,9 +18,9 @@
 #![allow(clippy::type_complexity)]
 extern crate self as rproxy_kernel;
 
-pub mod configuration;
 pub mod board;
 mod changes;
+pub mod configuration;
 pub mod core;
 mod host;
 mod id;
@@ -39,18 +39,18 @@ pub mod updates;
 
 pub use board::{Phase, Run, RunId};
 pub use host::{Host, Session};
-pub use id::{hex, now, random_bytes, Id};
-pub use kernel::{Cx, Kernel, LiveMark, Notice, Started};
+pub use id::{Id, hex, now, random_bytes};
+pub use kernel::{Cx, Input, Kernel, LiveMark, Notice, Started};
 pub use op::{Claim, JobSpec, Next, Op, Rank};
-pub use plugin::{categories, Category, Platform, Plugin, Policy};
+pub use plugin::{Category, Platform, Plugin, Policy, categories};
 pub use rproxy_derive::Table;
 pub use rproxy_kit as kit;
 pub use rproxy_kit::egui;
 pub use rproxy_mihomo as mihomo;
-pub use setup::Setup;
+pub use setup::{Setup, Tool};
 pub use slot::{Hook, Slot};
 pub use state::{Changed, Record, Snapshot, State, Write};
-pub use ui::{Page, PageSpec, UiCx};
+pub use ui::{Page, PageSpec, Request, UiCx};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -79,7 +79,10 @@ pub struct Error {
 }
 impl Error {
     pub fn new(code: &str, message: impl Into<String>) -> Self {
-        Self { code: code.into(), message: message.into() }
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
     }
     /// A user-facing failure.
     pub fn msg(message: impl Into<String>) -> Self {
@@ -105,6 +108,12 @@ impl From<&str> for Error {
         Self::msg(m)
     }
 }
+/// For `p.migrate` steps and custom persistence: `sql.execute(..)?`.
+impl From<store::rusqlite::Error> for Error {
+    fn from(e: store::rusqlite::Error) -> Self {
+        Self::new("storage", e.to_string())
+    }
+}
 
 /// `bail!("text {x}")` returns a user-facing error.
 #[macro_export]
@@ -114,13 +123,13 @@ macro_rules! bail {
 
 /// Everything a plugin usually needs.
 pub mod prelude {
-    pub use crate::kit::{self, egui, Icon};
-    pub use crate::list::{Add, Added, Move, Remove, Removed, Save, Saved};
+    pub use crate::kit::{self, Icon, egui};
+    pub use crate::list::{Add, Added, Edit, Move, Remove, Removed, Save, Saved};
     pub use crate::mihomo::{self, Fragment, Rule as CoreRule, Stage, Target};
-    pub use crate::{
-        bail, categories, choices, hex, now, random_bytes, Category, Changed, Claim, Cx, Error, Hook, Id, JobSpec, Next,
-        Op, Page, PageSpec, Platform, Plugin, Policy, Rank, Record, Result, Set, Setup, Slot, Snapshot, Started, Update,
-        State, Table, UiCx, Write,
-    };
     pub use crate::shell::{PANELS, SETTINGS_SECTIONS, STATUS};
+    pub use crate::{
+        Category, Changed, Claim, Cx, Error, Hook, Id, JobSpec, Next, Op, Page, PageSpec, Platform,
+        Plugin, Policy, Rank, Record, Request, Result, Set, Setup, Slot, Snapshot, Started, State,
+        Table, Tool, UiCx, Update, Write, bail, categories, choices, hex, now, random_bytes,
+    };
 }

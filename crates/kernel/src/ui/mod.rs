@@ -3,9 +3,7 @@
 mod list_editor;
 pub use list_editor::{Column, ListEditor};
 
-use crate::{
-    core::CoreStatus, kit::Icon, slot::Slot, Kernel, Op, Run, RunId, Snapshot, State,
-};
+use crate::{Kernel, Op, Run, RunId, Snapshot, State, core::CoreStatus, kit::Icon, slot::Slot};
 use std::{
     collections::HashMap,
     hash::Hash,
@@ -32,20 +30,26 @@ impl<F: FnMut(&mut egui::Ui, &mut UiCx) + Send> Page for F {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Ticket {
     /// Generation of the request; a newer submit under the same key wins.
     Pending(u64),
-    Done(Result<(), String>),
+    /// The op's reply (its `Op::Reply`) or error text.
+    Done(Result<Box<dyn std::any::Any + Send>, String>),
 }
 
-/// What a toast's button does in the session that shows it (e.g. Undo).
-pub(crate) type ToastAction = Box<dyn FnOnce(&mut UiCx) + Send>;
-/// A toast in one session: a kernel notice or a local message with an action.
+/// What became of an op started with [`UiCx::submit`] (see [`UiCx::request`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Request<R> {
+    /// Never submitted, or the result was taken.
+    Idle,
+    Pending,
+    Done(Result<R, String>),
+}
+
+/// A kernel notice shown as a toast in one session.
 pub(crate) struct Toast {
     pub notice: crate::Notice,
     pub at: f64,
-    pub action: Option<(String, ToastAction)>,
 }
 
 /// Which status chip opened the panels popover, and where it is.
@@ -64,7 +68,8 @@ pub(crate) struct SessionState {
     pub file_busy: bool,
     pub incoming: Option<Arc<crate::configuration::Import>>,
     /// An imported file being validated off the UI thread.
-    pub checking: Option<tokio::sync::oneshot::Receiver<crate::Result<Arc<crate::configuration::Import>>>>,
+    pub checking:
+        Option<tokio::sync::oneshot::Receiver<crate::Result<Arc<crate::configuration::Import>>>>,
     pub page: &'static str,
     pub pages: HashMap<&'static str, Box<dyn Page>>,
     pub tickets: Arc<Mutex<HashMap<egui::Id, (Ticket, f64)>>>,
@@ -129,7 +134,12 @@ pub struct UiCx<'a> {
 
 impl<'a> UiCx<'a> {
     pub(crate) fn new(k: &'a Arc<Kernel>, s: &'a mut SessionState) -> Self {
-        Self { snap: k.snapshot(), k, s, plugin: None }
+        Self {
+            snap: k.snapshot(),
+            k,
+            s,
+            plugin: None,
+        }
     }
     pub(crate) fn scoped<R>(&mut self, plugin: Option<usize>, f: impl FnOnce(&mut UiCx) -> R) -> R {
         let prev = std::mem::replace(&mut self.plugin, plugin);
@@ -154,7 +164,11 @@ impl<'a> UiCx<'a> {
         self.snap.try_get(s)
     }
     fn cx(&self) -> crate::Cx {
-        crate::Cx { k: self.k.clone(), plugin: self.plugin, job: None }
+        crate::Cx {
+            k: self.k.clone(),
+            plugin: self.plugin,
+            job: None,
+        }
     }
 
     /// Run an op in the background, fire and forget. Ops with a [`JobSpec`](crate::JobSpec)
@@ -167,79 +181,163 @@ impl<'a> UiCx<'a> {
             }
             return;
         }
-        let k = self.k.clone();
         let ctx = self.s.ctx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = cx.call(op).await {
-                k.notify_error(cx.plugin_name(), &e.message);
-            }
+        let call = cx.call(op);
+        drop(self.k.track(&cx, async move {
+            let r = call.await.map(drop);
             ctx.request_repaint();
-        });
+            r
+        }));
     }
     /// Run an op and remember its outcome under `key` (a widget, a row…).
     /// While it runs the status bar shows "Saving…"; read the outcome with [`Self::outcome`].
     pub fn submit<O: Op>(&mut self, key: impl Hash + std::fmt::Debug, op: O) {
         static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let id = egui::Id::unique(key);
+        let id = self.ticket(key);
         let tickets = self.s.tickets.clone();
-        tickets.lock().unwrap().insert(id, (Ticket::Pending(generation), self.s.now));
+        tickets
+            .lock()
+            .unwrap()
+            .insert(id, (Ticket::Pending(generation), self.s.now));
         let cx = self.cx();
         let ctx = self.s.ctx.clone();
-        tokio::spawn(async move {
-            let r = cx.call(op).await.map(drop).map_err(|e| e.message);
+        let call = cx.call(op);
+        drop(self.k.track(&cx, async move {
+            // A crash still ends the request (no endless "Saving…").
+            let r = crate::kernel::caught(call).await;
             let now = ctx.input(|i| i.time);
             let mut t = tickets.lock().unwrap();
             if matches!(t.get(&id), Some((Ticket::Pending(g), _)) if *g == generation) {
-                t.insert(id, (Ticket::Done(r), now));
+                match r {
+                    // Overtaken (a stale result, a newer request): nothing to show.
+                    Err(e) if e.cancelled() => drop(t.remove(&id)),
+                    r => drop(
+                        t.insert(
+                            id,
+                            (
+                                Ticket::Done(
+                                    r.map(|reply| Box::new(reply) as Box<dyn std::any::Any + Send>)
+                                        .map_err(|e| e.message),
+                                ),
+                                now,
+                            ),
+                        ),
+                    ),
+                }
             }
             drop(t);
             ctx.request_repaint();
-        });
+            Ok(())
+        }));
+    }
+    /// A settings row bound to one field of an editable setting: shows the
+    /// stored value in `control` and saves the change.
+    /// `cx.setting(ui, "Refresh subscriptions", &SETTINGS, |s| &mut s.refresh_secs, |ui, v| kit::interval(ui, "refresh", v))`
+    pub fn setting<S: Clone + Send + Sync + 'static, V: Clone + Send + 'static>(
+        &mut self,
+        ui: &mut egui::Ui,
+        label: &'static str,
+        state: &'static State<S>,
+        field: fn(&mut S) -> &mut V,
+        control: impl FnOnce(&mut egui::Ui, &mut V) -> bool,
+    ) {
+        let mut value = field(&mut (*self.get(state)).clone()).clone();
+        let mut changed = false;
+        crate::kit::settings_row(ui, label, "", |ui| changed = control(ui, &mut value));
+        if changed {
+            self.update(label, state, move |s| *field(s) = value);
+        }
     }
     /// Change some fields of a setting registered with `Setup::editable_setting`.
-    pub fn update<T: Send + Sync + 'static>(&mut self, key: impl Hash + std::fmt::Debug, state: &'static State<T>, f: impl FnOnce(&mut T) + Send + 'static) {
-        self.submit(key, crate::Update { state, change: Box::new(f) });
+    pub fn update<T: Send + Sync + 'static>(
+        &mut self,
+        key: impl Hash + std::fmt::Debug,
+        state: &'static State<T>,
+        f: impl FnOnce(&mut T) + Send + 'static,
+    ) {
+        self.submit(
+            key,
+            crate::Update {
+                state,
+                change: Box::new(f),
+            },
+        );
+    }
+    /// Keys are local to the plugin: two plugins may both use `"save"`.
+    fn ticket(&self, key: impl Hash + std::fmt::Debug) -> egui::Id {
+        egui::Id::unique((self.plugin, key))
     }
     /// True while a submitted op runs.
     pub fn pending(&self, key: impl Hash + std::fmt::Debug) -> bool {
-        matches!(self.s.tickets.lock().unwrap().get(&egui::Id::unique(key)), Some((Ticket::Pending(_), _)))
+        matches!(
+            self.s.tickets.lock().unwrap().get(&self.ticket(key)),
+            Some((Ticket::Pending(_), _))
+        )
     }
-    /// Take the finished outcome of a submitted op once.
-    pub fn outcome(&mut self, key: impl Hash + std::fmt::Debug) -> Option<Result<(), String>> {
-        let id = egui::Id::unique(key);
-        let mut t = self.s.tickets.lock().unwrap();
-        match t.get(&id) {
-            Some((Ticket::Done(_), _)) => match t.remove(&id) {
-                Some((Ticket::Done(r), _)) => {
-                    if r.is_ok() {
-                        self.s.saved_at = Some(self.s.now);
-                    }
-                    Some(r)
-                }
-                _ => None,
+    /// The state of the op submitted under `key`, with its typed reply
+    /// (`R` is the op's `Reply`). It stays until the next submit; an op that
+    /// was overtaken (a stale result) leaves it `Idle`.
+    pub fn request<R: Clone + 'static>(&self, key: impl Hash + std::fmt::Debug) -> Request<R> {
+        let label = format!("{key:?}");
+        match self.s.tickets.lock().unwrap().get(&self.ticket(key)) {
+            None => Request::Idle,
+            Some((Ticket::Pending(_), _)) => Request::Pending,
+            Some((Ticket::Done(Err(e)), _)) => Request::Done(Err(e.clone())),
+            Some((Ticket::Done(Ok(reply)), _)) => match reply.downcast_ref::<R>() {
+                Some(r) => Request::Done(Ok(r.clone())),
+                // A bug in the page; it must not take the window down.
+                None => Request::Done(Err(format!(
+                    "bug: request {label} does not reply with {}",
+                    std::any::type_name::<R>()
+                ))),
             },
-            _ => None,
         }
     }
-
-    /// The active job with this key (see [`crate::JobSpec`]).
-    pub fn job(&self, key: &str) -> Option<Run> {
-        self.k.jobs.board().runs.into_iter().find(|r| r.key == key && r.phase.active())
+    /// Take the finished outcome of a submitted op once (for saves: the
+    /// reply is not needed, only success or the error text).
+    pub fn outcome(&mut self, key: impl Hash + std::fmt::Debug) -> Option<Result<(), String>> {
+        let id = self.ticket(key);
+        let mut t = self.s.tickets.lock().unwrap();
+        if !matches!(t.get(&id), Some((Ticket::Done(_), _))) {
+            return None;
+        }
+        let Some((Ticket::Done(r), _)) = t.remove(&id) else {
+            return None;
+        };
+        if r.is_ok() {
+            self.s.saved_at = Some(self.s.now);
+        }
+        Some(r.map(drop))
     }
+
     /// The active job that `op` would join, if any.
     pub fn job_for<O: Op>(&self, op: &O) -> Option<Run> {
-        op.job().and_then(|j| self.job(&j.key))
+        self.cx().running(op)
     }
     pub fn cancel(&mut self, run: RunId) {
         let _ = self.k.jobs.cancel(run);
     }
     /// A button that starts `op` as a job and turns into Stop with progress while it runs.
-    pub fn job_button<O: Op>(&mut self, ui: &mut egui::Ui, icon: Icon, idle: &str, width: f32, enabled: bool, make: impl FnOnce() -> O) {
+    pub fn job_button<O: Op>(
+        &mut self,
+        ui: &mut egui::Ui,
+        icon: Icon,
+        idle: &str,
+        enabled: bool,
+        make: impl FnOnce() -> O,
+    ) {
         let op = make();
-        let key = op.job().map(|j| j.key).unwrap_or_default();
-        let run = self.job(&key);
-        if crate::kit::task_button(ui, icon, idle, width, run.as_ref().map(|r| (r.done, r.total)), enabled).clicked() {
+        let run = self.job_for(&op);
+        if crate::kit::task_button(
+            ui,
+            icon,
+            idle,
+            run.as_ref().map(|r| (r.done, r.total)),
+            enabled,
+        )
+        .clicked()
+        {
             match run {
                 Some(r) => self.cancel(r.id),
                 None => self.run(op),
@@ -275,17 +373,47 @@ impl<'a> UiCx<'a> {
         }
         self.s.panels_open = true;
         self.s.activity_open = false;
-        self.s.panel_anchor = Some(PanelAnchor { plugin: self.plugin, rect: rect.unwrap_or(egui::Rect::NOTHING) });
+        self.s.panel_anchor = Some(PanelAnchor {
+            plugin: self.plugin,
+            rect: rect.unwrap_or(egui::Rect::NOTHING),
+        });
+    }
+    /// A chip in the status bar. A click opens the plugin's panel under the
+    /// chip in a narrow window, else its page (in a wide window the panels are
+    /// beside the page anyway); without either, all panels.
+    pub fn status_chip(
+        &mut self,
+        ui: &mut egui::Ui,
+        lead: crate::kit::Lead,
+        text: &str,
+        tooltip: &str,
+    ) -> egui::Response {
+        let r = crate::kit::chip(ui, Some(lead), text, tooltip);
+        if r.clicked() {
+            let mine = |p: usize| Some(p) == self.plugin;
+            let panel = self
+                .k
+                .reg
+                .contributions(&crate::shell::PANELS)
+                .iter()
+                .any(|c| mine(c.plugin));
+            let page = self
+                .k
+                .reg
+                .pages
+                .iter()
+                .find(|e| mine(e.plugin))
+                .map(|e| e.spec.id);
+            match page {
+                Some(page) if self.wide() || !panel => self.navigate(page),
+                _ => self.toggle_panels_from(&r),
+            }
+        }
+        r
     }
     /// [`Self::toggle_panels`] for a chip's response: the popover anchors to it.
     pub fn toggle_panels_from(&mut self, chip: &egui::Response) {
         self.toggle_panels_at(Some(chip.rect));
-    }
-    /// A toast in this session with an Undo button; `undo` runs when it is clicked.
-    /// Use it after deleting or excluding something instead of asking first.
-    pub fn undo(&mut self, title: &str, text: &str, undo: impl FnOnce(&mut UiCx) + Send + 'static) {
-        let notice = crate::Notice { id: self.k.next_notice_id(), title: title.into(), text: text.into(), error: false, page: None };
-        self.s.toasts.push(Toast { notice, at: self.s.now, action: Some(("Undo".into(), Box::new(undo))) });
     }
     pub fn wide(&self) -> bool {
         self.s.wide
@@ -301,22 +429,17 @@ impl<'a> UiCx<'a> {
     pub fn slot<P: 'static>(&mut self, ui: &mut egui::Ui, slot: &Slot<P>, props: &P) {
         let list: Vec<_> = self.k.reg.contributions(slot).to_vec();
         for c in list {
-            ui.push_id(&c.id, |ui| self.scoped(Some(c.plugin), |cx| (c.view)(ui, cx, props)));
+            ui.push_id(&c.id, |ui| {
+                self.scoped(Some(c.plugin), |cx| (c.view)(ui, cx, props))
+            });
         }
     }
     /// Draw contributions last-to-first (for right-to-left layouts, so they still read in order).
     pub fn slot_rev<P: 'static>(&mut self, ui: &mut egui::Ui, slot: &Slot<P>, props: &P) {
         let list: Vec<_> = self.k.reg.contributions(slot).to_vec();
         for c in list.into_iter().rev() {
-            ui.push_id(&c.id, |ui| self.scoped(Some(c.plugin), |cx| (c.view)(ui, cx, props)));
-        }
-    }
-    /// Draw contributions with a callback around each (e.g. columns of a row).
-    pub fn slot_each<P: 'static>(&mut self, ui: &mut egui::Ui, slot: &Slot<P>, props: &P, mut each: impl FnMut(&mut egui::Ui, &mut UiCx, &dyn Fn(&mut egui::Ui, &mut UiCx))) {
-        let list: Vec<_> = self.k.reg.contributions(slot).to_vec();
-        for c in list {
             ui.push_id(&c.id, |ui| {
-                self.scoped(Some(c.plugin), |cx| each(ui, cx, &|ui, cx| (c.view)(ui, cx, props)))
+                self.scoped(Some(c.plugin), |cx| (c.view)(ui, cx, props))
             });
         }
     }

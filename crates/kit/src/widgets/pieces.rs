@@ -4,7 +4,13 @@ use super::*;
 pub fn separator(ui: &mut Ui) {
     let p = theme::palette(ui);
     let r = ui.available_rect_before_wrap();
-    ui.painter().line_segment([pos2(r.left(), r.top() + 0.5), pos2(r.right(), r.top() + 0.5)], Stroke::new(1_f32, p.border));
+    ui.painter().line_segment(
+        [
+            pos2(r.left(), r.top() + 0.5),
+            pos2(r.right(), r.top() + 0.5),
+        ],
+        Stroke::new(1_f32, p.border),
+    );
     ui.add_space(1.);
 }
 
@@ -31,7 +37,11 @@ pub fn tag_width(ui: &Ui, text: &str, max_width: f32) -> f32 {
     if compact_row(ui) {
         return 10.;
     }
-    let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(theme::CAPTION), Color32::PLACEHOLDER);
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        FontId::proportional(theme::CAPTION),
+        Color32::PLACEHOLDER,
+    );
     (galley.size().x + 12.).min(max_width)
 }
 /// The dot that stands for a tag color.
@@ -39,7 +49,13 @@ pub fn tag_dot(ui: &mut Ui, hue: usize) -> Response {
     let (ink, _) = theme::palette(ui).tag(hue);
     dot(ui, ink)
 }
-pub(crate) fn pill(ui: &mut Ui, text: &str, ink: Color32, fill: Color32, max_width: f32) -> Response {
+pub(crate) fn pill(
+    ui: &mut Ui,
+    text: &str,
+    ink: Color32,
+    fill: Color32,
+    max_width: f32,
+) -> Response {
     let font = FontId::proportional(theme::CAPTION);
     let (mut job, icons) = crate::emoji::layout(text, font, ink);
     job.wrap = egui::text::TextWrapping::truncate_at_width((max_width - 12.).max(12.));
@@ -51,7 +67,9 @@ pub(crate) fn pill(ui: &mut Ui, text: &str, ink: Color32, fill: Color32, max_wid
     ui.painter().galley(pos, galley.clone(), ink);
     crate::emoji::paint(ui, ui.painter(), pos, &galley, &icons);
     if elided {
-        r.on_hover_ui(|ui| { crate::emoji::text_label(ui, text, true, false); })
+        r.on_hover_ui(|ui| {
+            crate::emoji::text_label(ui, text, true, false);
+        })
     } else {
         r
     }
@@ -84,7 +102,8 @@ pub enum Lead {
 /// Status-bar chip: dot or icon, short text; click opens details.
 pub fn chip(ui: &mut Ui, lead: Option<Lead>, text: &str, tooltip: &str) -> Response {
     let p = theme::palette(ui);
-    let (mut job, icons) = crate::emoji::layout(text, FontId::proportional(theme::SMALL), p.foreground);
+    let (mut job, icons) =
+        crate::emoji::layout(text, FontId::proportional(theme::SMALL), p.foreground);
     let lead_w = match lead {
         None => 0.,
         Some(Lead::Dot(_)) => 14.,
@@ -101,7 +120,8 @@ pub fn chip(ui: &mut Ui, lead: Option<Lead>, text: &str, tooltip: &str) -> Respo
     let mut x = rect.left() + 9.;
     match lead {
         Some(Lead::Dot(c)) => {
-            ui.painter().circle_filled(pos2(x + 4., rect.center().y), 4., c);
+            ui.painter()
+                .circle_filled(pos2(x + 4., rect.center().y), 4., c);
             x += lead_w;
         }
         Some(Lead::Icon(icon, c)) => {
@@ -114,13 +134,22 @@ pub fn chip(ui: &mut Ui, lead: Option<Lead>, text: &str, tooltip: &str) -> Respo
     ui.painter().galley(pos, galley.clone(), p.foreground);
     crate::emoji::paint(ui, ui.painter(), pos, &galley, &icons);
     if response.has_focus() {
-        ui.painter().rect_stroke(rect, 12, Stroke::new(2_f32, p.accent), egui::StrokeKind::Inside);
+        ui.painter().rect_stroke(
+            rect,
+            12,
+            Stroke::new(2_f32, p.accent),
+            egui::StrokeKind::Inside,
+        );
     }
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, text));
     if !tooltip.is_empty() && (tooltip != text || galley.elided) {
-        response.on_hover_ui(|ui| { crate::emoji::text_label(ui, tooltip, true, false); })
+        response.on_hover_ui(|ui| {
+            crate::emoji::text_label(ui, tooltip, true, false);
+        })
     } else if galley.elided {
-        response.on_hover_ui(|ui| { crate::emoji::text_label(ui, text, true, false); })
+        response.on_hover_ui(|ui| {
+            crate::emoji::text_label(ui, text, true, false);
+        })
     } else {
         response
     }

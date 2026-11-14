@@ -19,10 +19,12 @@
 use rproxy_kernel::{kit, prelude::*, ui::{Column, ListEditor}};
 
 pub static PLUGIN: Plugin = Plugin {
-    id: "routing", name: "Routing",
+    id: "routing",
+    name: "Routing",
     description: "Send domains and networks via the server, directly, or block them.",
-    category: categories::NETWORK, requires: &["servers"],
-    required: false, default_enabled: true, platforms: Platform::ALL, setup,
+    requires: &["servers"],
+    setup,
+    ..Plugin::DEFAULT // category Network & system, on by default, every system
 };
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Table)]
@@ -37,7 +39,6 @@ fn setup(p: &mut Setup) -> Result<()> {
     p.core(|snap| Fragment::rules(Stage::User, snap.get(&RULES).iter().filter_map(|r| core_rule(r, &servers::route(snap)).ok())));
     p.page_fn(PageSpec { id: "routing", title: "Routing", icon: Icon::Routing, order: 30 }, |ui, cx| {
         kit::page_header(ui, "Routing", &kit::plural(cx.get(&RULES).len(), "rule", "rules"), |_| {});
-        kit::helper(ui, "Rules apply top to bottom and the first match wins.");
         ListEditor::new(&RULES)
             .add_form("Add rule", Rule::empty, |ui, r, w| { /* поля нового правила */ false })
             .column(Column::edit("Pattern", "Domain, IP or network", |r: &mut Rule| &mut r.pattern))
@@ -55,15 +56,16 @@ fn setup(p: &mut Setup) -> Result<()> {
 Правила для автора:
 - имя состояния начинается с `id` плагина и точки (`routing.rules`); писать в чужое состояние нельзя, только вызывать op владельца;
 - `cx.write(|w| …)` синхронный и короткий; сеть — вне него;
-- в UI нет клиента и сервера: `cx.get(&STATE)` читает снимок, `cx.submit(key, op)` выполняет действие и сам показывает «Saving…/Saved», `cx.outcome(key)` возвращает результат для черновика;
+- в UI нет клиента и сервера: `cx.get(&STATE)` читает снимок, `cx.submit(key, op)` выполняет действие и сам показывает «Saving…/Saved»; `cx.request::<Reply>(key)` даёт состояние запроса с типизированным ответом (`Request::Idle | Pending | Done(Ok(reply) | Err(text))`), `cx.outcome(key)` забирает только успех или ошибку (для черновиков); ключи локальны для плагина;
+- размеры экрана плагин не учитывает: kit сам сжимает строки на телефоне;
 - размеры и цвета только из `kit::theme` и `kit::colors(ui)`; готовые виджеты — `kit::*`, редактор списка — `ui::ListEditor`;
-- страница строится одинаково: `kit::page_header` (заголовок · счётчик … действия) → `kit::helper` → строка добавления (`ListEditor::add_form` или `kit::add_bar`) → `kit::list_card` / `kit::card` (подробно — [DESIGN.md](DESIGN.md#анатомия-страницы));
+- страница строится одинаково: `kit::page_header` (заголовок · счётчик … действия) → строка добавления (`ListEditor::add_form` или `kit::add_bar`) → `kit::list_card` / `kit::card` (подробно — [DESIGN.md](DESIGN.md#анатомия-страницы));
 - имя понятия одно во всех местах (вкладка, плагин, настройка); счётчики через `kit::plural`;
 - у фоновой задачи, ошибки которой объясняет страница, — `JobSpec::page("…")`: тост предложит открыть её.
 
 ## Как переопределять поведение
 
-Цепочка обработчиков op упорядочена: ранг (`Override` → `Specific` → `Default` → `Fallback`), вес заявки (`claim`), затем зависимый плагин раньше того, от кого зависит.
+Цепочка обработчиков op упорядочена: ранг (`Specific` (через `p.wrap`) → `Default` → `Fallback`), вес заявки (`claim`), затем зависимый плагин раньше того, от кого зависит.
 
 ```rust
 // Формат подписки: заявить только свои документы.
@@ -100,13 +102,13 @@ p.wrap(|cx, f: Fetch, next: Next<Fetch>| async move {
 
 | Зона | Объявлена | Что туда кладут | Пример |
 |---|---|---|---|
-| `shell::STATUS` | ядро | Один короткий чип (`kit::chip`) на тему; клик → `cx.toggle_panels()` | сервер, Auto select, слушатель |
+| `shell::STATUS` | ядро | Один короткий чип: `cx.status_chip(ui, lead, text, tooltip)`; клик открывает панель плагина под чипом (узкое окно) или его страницу — решает ядро | сервер, Auto select, слушатель |
 | `shell::PANELS` | ядро | Карточка с подробностями и быстрыми действиями; первая строка — `shell::panel_title` | Connection, Listeners |
 | `shell::SETTINGS_SECTIONS` | ядро | Строка `kit::settings_row` в карточке General; подпись называет настройку | интервалы, Start at login |
 | страница (`p.page`, `p.page_fn`) | ядро | Экран плагина в нижней навигации; лишние уходят в More | Subscriptions, Routing |
 | `servers::TOOLBAR` | servers | Действия в заголовке страницы (справа) | Auto select, Check all, Name filters |
 | `servers::TOOLS` | servers | Блок во всю ширину под тулбаром | редактор фильтров |
-| `servers::COLUMNS` | servers | Колонка фиксированной ширины, числа справа; при `server == None` — подпись | Rating, Latency |
+| `servers::COLUMNS` | servers | Колонка списка серверов через `servers::column(p, Column { id, order, title, help, secondary }, \|ui, cx, server\| …)`: ширину, подпись и скрытие второстепенных колонок на телефоне берёт на себя servers | Rating, Latency |
 | `servers::DETAILS` | servers | Строки `kit::property` раскрытого сервера (общая колонка подписей) | задержка, скорость, тесты |
 | `servers::CONNECTION` | servers | Блок в карточке подключения (`kit::stats`, строка с иконкой) | Latency / Rating / Tests, причина Auto select |
 | `subscriptions::SECTIONS` | subscriptions | Секция под списком подписок | — |
@@ -119,7 +121,38 @@ p.wrap(|cx, f: Fetch, next: Next<Fetch>| async move {
 
 Долгие задачи — `p.service(name, spec, run)`: задача перезапускается при смене `spec(snapshot)` (`None` — остановить) и отменяется при остановке ядра. Что задача изменила в системе, возвращает `.on_stop(|cx, spec| async { … })`: ядро вызывает его после остановки (смена spec, выключение, выход), и следующий запуск ждёт его окончания (так системный прокси возвращается). `p.data_dir()` — собственная папка плагина `<data>/plugins/<id>` для файлов вне SQLite (сертификаты, кеш, журналы). `cx.core().routed_http()` — HTTP-клиент по обычным правилам (для загрузок, которым прямой путь закрыт); `cx.core().direct_or_routed("GitHub", |c| c.get(url).send())` — сначала напрямую с коротким таймаутом соединения, затем этим клиентом. Ошибка задачи по расписанию (`p.every`) показывается один раз, пока задача снова не пройдёт. Общие мелочи: `random_bytes::<N>()`, `hex(&bytes)`, `now()`.
 
-Чужой вклад можно заменить (`p.replace`), обернуть (`p.wrap_view`) или скрыть (`p.hide`) по его id `плагин/имя`.
+Чужой вклад можно заменить (`p.replace`), обернуть (`p.wrap_view`) или скрыть (`p.hide`) по его id `плагин/имя`. Опечатка в id останавливает запуск с перечнем существующих вкладов; если плагин-владелец выключен, правка просто пропускается.
+
+## Типовые задачи
+
+**Списки.** `p.list(&RULES)` даёт таблицу, порядок и ops `Add`, `Save`, `Edit`, `Move`, `Remove` с событиями `Added`, `Saved`, `Removed`. Ops и события называют свой список: `cx.call(Add::new(&RULES, rule))`, `Remove::new(&RULES, id)`. `Edit::new(&RULES, id, |r| r.pattern = p)` меняет поля внутри транзакции, не затирая то, что изменили другие. Строки хранятся в таблице типа записи (`#[table(name)]`); второму списку того же типа нужна своя: `p.list(&ARCHIVE).table("rules_archive")` (совпадение таблиц останавливает запуск с понятным текстом).
+
+**Актуальность результата.** Долгая операция (сеть) не должна сохранить устаревший ответ:
+
+```rust
+let input = cx.input(move |snap| snap.get(&SOURCES).iter().find(|s| s.id == id).map(|s| s.url.clone()));
+let Some(url) = input.value().cloned() else { return Ok(()) };   // объекта уже нет
+let body = fetch(&url).await?;
+cx.write(move |w| { input.check(w)?; /* сохранить */ Ok(()) }).await  // изменился или удалён — тихая отмена
+```
+
+`JobSpec::latest()` отменяет идущий запуск с тем же ключом, а после него выполняется самый новый запрос (правка во время загрузки); `.queued()` не отменяет текущий, но следующим тоже выполняется самый новый. Устаревший результат (`input.check`) — тихая отмена: ни уведомления, ни ошибки в `cx.request`. Ключи задач локальны для плагина-владельца op: `JobSpec::keyed(id.to_string(), "Load subscription")`; без ключа (`JobSpec::new`) задача одна на тип op.
+
+**Фоновая работа.** Обработчики событий (`p.on`, `p.on_change`) и действия из UI выполняются как задачи плагина: при остановке ядро отменяет и дожидается их, ошибка показывается с именем плагина, паника — с её текстом. Если событие приходит, пока обработчик ещё работает: по умолчанию запускается ещё один; `.latest()` отменяет прежний, `.queued()` выполняет по одному и после текущего берёт самое новое событие. Сервис с `.restart_on_error()` после ошибки или паники запускается снова через 2 с, затем реже, до 5 мин; одна и та же ошибка показывается один раз. Ждать в тестах: `kernel.idle().await`.
+
+**Сохранённые данные между версиями.** Новое необязательное поле записи (`Option<T>`) и новое поле настройки с `#[serde(default)]` не требуют ничего. Новое обязательное поле записи: `#[column(default = "0")]` (SQL-значение для старых строк). Остальное — `p.migrate(1, |sql| { sql.execute("UPDATE …", [])?; Ok(()) })`, затем `2`, `3`…: каждая версия выполняется один раз в своей транзакции, до создания и проверки таблиц, ядро помнит выполненные. На новой установке (у плагина ещё нет своих таблиц и настроек) схема уже последняя: версии отмечаются выполненными без запуска. Настройка, которую не удаётся прочитать, не останавливает приложение: старое значение откладывается в `<имя>.broken`, берётся значение по умолчанию и показывается уведомление с именем настройки.
+
+**Контракты.** Если у возможности может быть несколько реализаций, её типы, ops, события и хуки лежат в `crates/contracts` (сейчас — `health`: `Report`, `CheckAll`, `QuickCheck`, `Checked`). Реализация объявляет `provides: &[health::CAPABILITY]`, пользователь — `requires: &[health::CAPABILITY]` и зависит только от `rproxy-contracts`. Контракт без логики и хранения; заводите его только для действительно заменяемых возможностей.
+
+**Готовые элементы интерфейса.**
+- Строка настройки, связанная с полем: `cx.setting(ui, "Check servers", &CONFIG, |s| &mut s.check_secs, |ui, v| kit::interval(ui, "check", v))`.
+- Инструмент с кнопкой в тулбаре и панелью: `p.tool(&servers::TOOLBAR, &servers::TOOLS, Tool { id: "filters", label: "Name filters", icon: Icon::Filter, order: 50 }, |snap| count(snap), |ui, cx| { … })` — состояние «открыт», заголовок, закрытие и узкий экран берёт на себя ядро.
+- Кнопка задачи с прогрессом и остановкой (ширину считает сама): `cx.job_button(ui, Icon::Refresh, "Refresh all", enabled, || RefreshAll)`.
+- Ответ операции рядом с кнопкой: `cx.submit(key, op)`, затем `match cx.request::<Reply>(key) { Request::Pending => …, Request::Done(Ok(reply)) => …, … }` (пример — «Check now» в подробностях сервера).
+- Счётчик в заголовке страницы: `kit::count(n, "rule", "rules")` (пусто при нуле).
+- Поля формы добавления в одну строку: `kit::Fields::new(width).input("pattern", &mut r.pattern, "Domain").choice("route", &mut r.action, Route::ALL).show(ui)` — ширины считает kit.
+- `cx.submit` выполняет op сразу и возвращает ответ в `cx.request`; задачи (`JobSpec`: прогресс, отмена, Activity, `latest`/`queued`) запускают `cx.job_button` и `cx.run`. Нужен и ответ, и поведение задачи — держите результат в live-состоянии плагина.
+- Папка плагина во время работы: `cx.data_dir()`.
 
 ## Плагины в поставке
 
@@ -140,4 +173,4 @@ p.wrap(|cx, f: Fetch, next: Next<Fetch>| async move {
 
 ## Тесты
 
-`crates/kernel/tests/kernel.rs` показывает, как проверить плагин без UI: `Host::start(vec![&PLUGIN, …], dir)`, затем `host.kernel().cx_for("id").call(op)` и чтение `snapshot().get(&STATE)`. Сквозные тесты с настоящим mihomo — `tests/e2e.rs`.
+`crates/kernel/tests/kernel.rs` показывает, как проверить плагин без UI: `Host::start(vec![&PLUGIN, …], dir)`, затем `host.kernel().cx_for("id").call(op)` и чтение `snapshot().get(&STATE)`. `host.kernel().idle().await` ждёт, пока закончатся задачи, обработчики событий и действия UI — вместо `sleep`. Неизвестный id в `cx_for` останавливает тест с понятным текстом. Сквозные тесты с настоящим mihomo — `tests/e2e.rs`, переход данных между версиями плагина — `crates/kernel/tests/migrations.rs`.

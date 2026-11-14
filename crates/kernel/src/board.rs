@@ -4,14 +4,13 @@ pub type RunId = u64;
 pub enum Phase {
     Running,
     Cancelling,
-    Committing,
     Succeeded,
     Cancelled,
     Failed,
 }
 impl Phase {
     pub fn active(self) -> bool {
-        matches!(self, Self::Running | Self::Cancelling | Self::Committing)
+        matches!(self, Self::Running | Self::Cancelling)
     }
 }
 

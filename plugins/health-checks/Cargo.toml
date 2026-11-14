@@ -1,12 +1,12 @@
 [package]
 name = "plugin-health-checks"
 version = "0.2.0"
-edition = "2021"
+edition = "2024"
 publish = false
 
 [dependencies]
-futures-util = { workspace = true }
 rproxy-kernel = { path = "../../crates/kernel" }
+rproxy-contracts = { path = "../../crates/contracts" }
 plugin-servers = { path = "../servers" }
 serde = { workspace = true }
 reqwest = { workspace = true }

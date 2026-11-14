@@ -1,8 +1,9 @@
 use eframe::egui;
-use ksni::{menu::StandardItem, TrayMethods};
+use ksni::{TrayMethods, menu::StandardItem};
 use std::sync::{
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc, Arc, Mutex,
+    mpsc,
 };
 
 /// Linux window backends do not report GNOME's appearance preference. The
@@ -17,34 +18,68 @@ impl SystemTheme {
         let value = Arc::new(std::sync::atomic::AtomicU8::new(0));
         let current = value.clone();
         let task = tokio::spawn(async move {
-            let Ok(bus) = zbus::Connection::session().await else { return };
-            let Ok(settings) = zbus::Proxy::new(&bus, "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop", "org.freedesktop.portal.Settings").await else { return };
+            let Ok(bus) = zbus::Connection::session().await else {
+                return;
+            };
+            let Ok(settings) = zbus::Proxy::new(
+                &bus,
+                "org.freedesktop.portal.Desktop",
+                "/org/freedesktop/portal/desktop",
+                "org.freedesktop.portal.Settings",
+            )
+            .await
+            else {
+                return;
+            };
             // Subscribe first so a change during the initial read is not lost.
-            let Ok(mut changes) = settings.receive_signal("SettingChanged").await else { return };
+            let Ok(mut changes) = settings.receive_signal("SettingChanged").await else {
+                return;
+            };
             let publish = |v: &zbus::zvariant::Value<'_>| {
                 if let Some(theme) = portal_theme(v) {
-                    current.store(if theme == egui::Theme::Dark { 1 } else { 2 }, Ordering::Release);
+                    current.store(
+                        if theme == egui::Theme::Dark { 1 } else { 2 },
+                        Ordering::Release,
+                    );
                     ctx.request_repaint();
                 }
             };
             let key = ("org.freedesktop.appearance", "color-scheme");
-            let initial: zbus::Result<zbus::zvariant::OwnedValue> = settings.call("ReadOne", &key).await;
-            let initial = match initial { Ok(v) => Ok(v), Err(_) => settings.call("Read", &key).await };
-            if let Ok(v) = initial { publish(&v); }
+            let initial: zbus::Result<zbus::zvariant::OwnedValue> =
+                settings.call("ReadOne", &key).await;
+            let initial = match initial {
+                Ok(v) => Ok(v),
+                Err(_) => settings.call("Read", &key).await,
+            };
+            if let Ok(v) = initial {
+                publish(&v);
+            }
             while let Some(signal) = changes.next().await {
-                if let Ok((namespace, name, v)) = signal.body().deserialize::<(String, String, zbus::zvariant::OwnedValue)>() {
-                    if namespace == key.0 && name == key.1 { publish(&v); }
+                if let Ok((namespace, name, v)) =
+                    signal
+                        .body()
+                        .deserialize::<(String, String, zbus::zvariant::OwnedValue)>()
+                    && namespace == key.0
+                    && name == key.1
+                {
+                    publish(&v);
                 }
             }
         });
         Self { value, task }
     }
     pub fn get(&self) -> Option<egui::Theme> {
-        match self.value.load(Ordering::Acquire) { 1 => Some(egui::Theme::Dark), 2 => Some(egui::Theme::Light), _ => None }
+        match self.value.load(Ordering::Acquire) {
+            1 => Some(egui::Theme::Dark),
+            2 => Some(egui::Theme::Light),
+            _ => None,
+        }
     }
 }
 impl Drop for SystemTheme {
-    fn drop(&mut self) { self.task.abort(); }
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 fn portal_theme(value: &zbus::zvariant::Value<'_>) -> Option<egui::Theme> {
     use zbus::zvariant::Value;
@@ -72,11 +107,25 @@ pub struct WindowControl {
     pub context: Arc<Mutex<Option<egui::Context>>>,
     tx: mpsc::Sender<Wake>,
 }
-pub enum Wake { Open(u64), Quit }
+pub enum Wake {
+    Open(u64),
+    Quit,
+}
 impl WindowControl {
     pub fn new() -> (Self, mpsc::Receiver<Wake>) {
         let (tx, rx) = mpsc::channel();
-        (Self { wayland: Default::default(), open_sequence: Default::default(), handled_open: Default::default(), online: Default::default(), quitting: Default::default(), context: Default::default(), tx }, rx)
+        (
+            Self {
+                wayland: Default::default(),
+                open_sequence: Default::default(),
+                handled_open: Default::default(),
+                online: Default::default(),
+                quitting: Default::default(),
+                context: Default::default(),
+                tx,
+            },
+            rx,
+        )
     }
     pub fn send(&self, event: WindowEvent) {
         // Publish the wake under the same mutex as window creation. It survives
@@ -91,13 +140,19 @@ impl WindowControl {
         };
         let _ = self.tx.send(wake);
         if let Some(ctx) = context.as_ref() {
-            if event == WindowEvent::Quit { ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
+            if event == WindowEvent::Quit {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
             ctx.request_repaint();
         }
     }
     pub fn handle_open(&self, ctx: &egui::Context) {
         let sequence = self.open_sequence.load(Ordering::Acquire);
-        if sequence <= self.handled_open.load(Ordering::Acquire) || ctx.input(|i| i.viewport().close_requested()) { return; }
+        if sequence <= self.handled_open.load(Ordering::Acquire)
+            || ctx.input(|i| i.viewport().close_requested())
+        {
+            return;
+        }
         if self.wayland.load(Ordering::Acquire) {
             // winit cannot unminimize/focus a Wayland window. Recreate its native
             // surface on explicit Open; the queued request remains unacknowledged.
@@ -110,7 +165,7 @@ impl WindowControl {
         }
     }
 }
-pub use crate::icon::{icon, Link};
+pub use crate::icon::{Link, icon};
 pub struct Tray {
     pub link: Link,
     control: WindowControl,
@@ -119,8 +174,15 @@ impl Tray {
     pub async fn start(control: WindowControl) -> Option<ksni::Handle<Self>> {
         control.online.store(true, Ordering::Release);
         // Flatpak may not own other bus names; the tray works with the unique name.
-        let tray = Self { control: control.clone(), link: Link::Idle };
-        let handle = match tray.disable_dbus_name(rproxy_kernel::Platform::is_flatpak()).spawn().await {
+        let tray = Self {
+            control: control.clone(),
+            link: Link::Idle,
+        };
+        let handle = match tray
+            .disable_dbus_name(rproxy_kernel::Platform::is_flatpak())
+            .spawn()
+            .await
+        {
             Ok(h) => h,
             Err(_) => {
                 control.online.store(false, Ordering::Release);
@@ -142,7 +204,11 @@ impl ksni::Tray for Tray {
         for p in i.rgba.as_chunks_mut::<4>().0 {
             p.rotate_right(1);
         }
-        vec![ksni::Icon { width: i.width as i32, height: i.height as i32, data: i.rgba }]
+        vec![ksni::Icon {
+            width: i.width as i32,
+            height: i.height as i32,
+            data: i.rgba,
+        }]
     }
     fn activate(&mut self, _: i32, _: i32) {
         self.control.send(WindowEvent::Open)
@@ -157,9 +223,18 @@ impl ksni::Tray for Tray {
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         vec![
-            StandardItem { label: "Open rproxy".into(), activate: Box::new(|t: &mut Self| t.control.send(WindowEvent::Open)), ..Default::default() }
-                .into(),
-            StandardItem { label: "Quit".into(), activate: Box::new(|t: &mut Self| t.control.send(WindowEvent::Quit)), ..Default::default() }.into(),
+            StandardItem {
+                label: "Open rproxy".into(),
+                activate: Box::new(|t: &mut Self| t.control.send(WindowEvent::Open)),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "Quit".into(),
+                activate: Box::new(|t: &mut Self| t.control.send(WindowEvent::Quit)),
+                ..Default::default()
+            }
+            .into(),
         ]
     }
 }
@@ -175,7 +250,10 @@ mod tests {
         assert_eq!(portal_theme(&Value::U32(0)), Some(Theme::Light));
         assert_eq!(portal_theme(&Value::U32(1)), Some(Theme::Dark));
         assert_eq!(portal_theme(&Value::U32(2)), Some(Theme::Light));
-        assert_eq!(portal_theme(&Value::Value(Box::new(Value::U32(1)))), Some(Theme::Dark));
+        assert_eq!(
+            portal_theme(&Value::Value(Box::new(Value::U32(1)))),
+            Some(Theme::Dark)
+        );
         assert_eq!(portal_theme(&Value::U32(99)), None);
         assert_eq!(portal_theme(&Value::from("dark")), None);
     }

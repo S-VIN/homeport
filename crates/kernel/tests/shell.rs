@@ -1,4 +1,4 @@
-use rproxy_kernel::{egui, Host};
+use rproxy_kernel::{Host, egui};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_kernel_draws_the_shell() {
@@ -9,7 +9,13 @@ async fn empty_kernel_draws_the_shell() {
     let mut counts = Vec::new();
     for _ in 0..4 {
         let out = ctx.run_ui(
-            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640., 560.))), ..Default::default() },
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640., 560.),
+                )),
+                ..Default::default()
+            },
             |ui| session.ui(ui),
         );
         counts.push(out.shapes.len());

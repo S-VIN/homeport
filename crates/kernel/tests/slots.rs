@@ -1,21 +1,14 @@
 //! Extension points for plugins that change other plugins: `replace`,
-//! `wrap_view` and `hide` edit another plugin's contributions to a zone, and
-//! `migrate` runs SQL before state loads.
-use rproxy_kernel::{egui, prelude::*, Host};
-use std::sync::atomic::{AtomicBool, Ordering};
+//! `wrap_view` and `hide` edit another plugin's contributions to a zone.
+use rproxy_kernel::{Host, egui, prelude::*};
 
 static ROW: Slot<()> = Slot::new("base.row", "Test zone on the base page.");
-static MIGRATED: AtomicBool = AtomicBool::new(false);
 
 static BASE: Plugin = Plugin {
     id: "base",
     name: "Base",
-    description: "",
     category: categories::SERVERS,
-    requires: &[],
     required: true,
-    default_enabled: true,
-    platforms: Platform::ALL,
     setup: |p| {
         p.fill(&ROW, "one", 0, |ui, _, _| {
             ui.label("original one");
@@ -26,21 +19,26 @@ static BASE: Plugin = Plugin {
         p.fill(&ROW, "three", 2, |ui, _, _| {
             ui.label("original three");
         });
-        p.page_fn(PageSpec { id: "base", title: "Base", icon: Icon::Servers, order: 10 }, |ui, cx| {
-            cx.slot(ui, &ROW, &());
-        });
+        p.page_fn(
+            PageSpec {
+                id: "base",
+                title: "Base",
+                icon: Icon::Servers,
+                order: 10,
+            },
+            |ui, cx| {
+                cx.slot(ui, &ROW, &());
+            },
+        );
         Ok(())
     },
+    ..Plugin::DEFAULT
 };
 static EXTRA: Plugin = Plugin {
     id: "extra",
     name: "Extra",
-    description: "",
     category: categories::SERVERS,
     requires: &["base"],
-    required: false,
-    default_enabled: true,
-    platforms: Platform::ALL,
     setup: |p| {
         p.replace(&ROW, "base/one", |ui, _, _| {
             ui.label("replaced one");
@@ -50,14 +48,9 @@ static EXTRA: Plugin = Plugin {
             inner(ui, cx, props);
         });
         p.hide(&ROW, "base/three");
-        p.migrate(|sql| {
-            sql.execute_batch("CREATE TABLE IF NOT EXISTS extra_marker (id INTEGER PRIMARY KEY)")
-                .map_err(|e| Error::msg(e.to_string()))?;
-            MIGRATED.store(true, Ordering::SeqCst);
-            Ok(())
-        });
         Ok(())
     },
+    ..Plugin::DEFAULT
 };
 
 fn texts(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
@@ -69,17 +62,22 @@ fn texts(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn plugins_edit_other_plugins_contributions_and_migrate() {
+async fn plugins_edit_other_plugins_contributions() {
     let dir = tempfile::tempdir().unwrap();
     let host = Host::start(vec![&BASE, &EXTRA], dir.path()).await.unwrap();
-    assert!(MIGRATED.load(Ordering::SeqCst), "migration ran before state loaded");
 
     let ctx = egui::Context::default();
     let mut session = host.session(&ctx);
     let mut shown = Vec::new();
     for _ in 0..4 {
         let out = ctx.run_ui(
-            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900., 700.))), ..Default::default() },
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900., 700.),
+                )),
+                ..Default::default()
+            },
             |ui| session.ui(ui),
         );
         shown.clear();
@@ -87,8 +85,14 @@ async fn plugins_edit_other_plugins_contributions_and_migrate() {
         out.drop_without_applying_deltas();
     }
     let has = |t: &str| shown.iter().any(|s| s.contains(t));
-    assert!(has("replaced one") && !has("original one"), "replace: {shown:?}");
-    assert!(has("before two") && has("original two"), "wrap_view: {shown:?}");
+    assert!(
+        has("replaced one") && !has("original one"),
+        "replace: {shown:?}"
+    );
+    assert!(
+        has("before two") && has("original two"),
+        "wrap_view: {shown:?}"
+    );
     assert!(!has("original three"), "hide: {shown:?}");
     drop(session);
     host.shutdown().await;

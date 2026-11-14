@@ -1,12 +1,12 @@
 use crate::{
+    Error, Op, Plugin, Policy, Result, RunId, Setup, State,
     changes::Changes,
     core::{Core, CoreApi},
     jobs::{JobContext, Jobs, Task, Timing},
-    op::{self, short_name},
+    op::{self, Handlers, short_name},
     setup::Registry,
     state::{Cell, OrderRow, PluginRow, SettingRow, Snapshot, Value, Write},
     store::Store,
-    Error, Op, Plugin, Policy, Result, RunId, Setup, State,
 };
 use std::{
     any::{Any, TypeId},
@@ -14,8 +14,8 @@ use std::{
     panic::AssertUnwindSafe,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, Mutex, RwLock, Weak,
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -70,8 +70,12 @@ pub struct Kernel {
     ui_open: Arc<dyn Fn() -> bool + Send + Sync>,
     /// Set by shutdown: no more writes, events or jobs from this kernel.
     closed: std::sync::atomic::AtomicBool,
+    /// Event handlers and UI ops in flight: cancelled and awaited on shutdown.
+    tasks: tokio_util::task::TaskTracker,
+    stop: tokio_util::sync::CancellationToken,
     /// Job keys with a queued follow-up run.
-    queued: Mutex<std::collections::HashSet<String>>,
+    /// The run waiting behind an active job of the same key (the newest request).
+    queued: Mutex<HashMap<String, Task>>,
     pub data_dir: PathBuf,
     me: Weak<Kernel>,
 }
@@ -89,20 +93,35 @@ struct RunningService {
 }
 
 /// Enabled plugins in dependency order, plus the reason each skipped plugin is off.
-pub(crate) fn resolve(catalog: &[&'static Plugin], saved: &HashMap<String, bool>) -> (Vec<&'static Plugin>, Vec<(String, String)>) {
+pub(crate) fn resolve(
+    catalog: &[&'static Plugin],
+    saved: &HashMap<String, bool>,
+) -> (Vec<&'static Plugin>, Vec<(String, String)>) {
     let mut policies: HashMap<&str, Policy> = HashMap::new();
     for p in catalog {
         if let Some(old) = policies.insert(p.category.id, p.category.policy) {
-            assert_eq!(old, p.category.policy, "category {} declared with two policies", p.category.id);
+            assert_eq!(
+                old, p.category.policy,
+                "category {} declared with two policies",
+                p.category.id
+            );
         }
     }
     let mut why = Vec::new();
-    let mut on: Vec<&'static Plugin> = catalog.iter().copied().filter(|p| is_enabled(p, saved)).collect();
+    let mut on: Vec<&'static Plugin> = catalog
+        .iter()
+        .copied()
+        .filter(|p| is_enabled(p, saved))
+        .collect();
     on.retain(|p| {
         if p.supported() {
             return true;
         }
-        assert!(!p.required, "required plugin {} does not support this system", p.id);
+        assert!(
+            !p.required,
+            "required plugin {} does not support this system",
+            p.id
+        );
         why.push((p.id.to_owned(), p.platforms_note().unwrap_or_default()));
         false
     });
@@ -111,24 +130,44 @@ pub(crate) fn resolve(catalog: &[&'static Plugin], saved: &HashMap<String, bool>
     on.retain(|p| {
         if p.category.policy == Policy::Exclusive {
             if let Some(winner) = taken.get(p.category.id) {
-                let winner = catalog.iter().find(|c| c.id == *winner).map_or(*winner, |c| c.name);
-                why.push((p.id.to_owned(), format!("{winner} is already on; only one {} plugin can run", p.category.name.to_lowercase())));
+                let winner = catalog
+                    .iter()
+                    .find(|c| c.id == *winner)
+                    .map_or(*winner, |c| c.name);
+                why.push((
+                    p.id.to_owned(),
+                    format!(
+                        "{winner} is already on; only one {} plugin can run",
+                        p.category.name.to_lowercase()
+                    ),
+                ));
                 return false;
             }
             taken.insert(p.category.id, p.id);
         }
         true
     });
+    // A requirement names a plugin or a capability it provides.
+    let gives = |p: &Plugin, need: &str| p.id == need || p.provides.contains(&need);
     loop {
         let before = on.len();
-        let ids: Vec<&str> = on.iter().map(|p| p.id).collect();
-        on.retain(|p| match p.requires.iter().find(|r| !ids.contains(r)) {
-            Some(missing) => {
-                let name = catalog.iter().find(|c| c.id == *missing).map_or(*missing, |c| c.name);
-                why.push((p.id.to_owned(), format!("Needs {name}, which is off")));
-                false
+        let present = on.clone();
+        on.retain(|p| {
+            match p
+                .requires
+                .iter()
+                .find(|r| !present.iter().any(|o| gives(o, r)))
+            {
+                Some(missing) => {
+                    let name = catalog
+                        .iter()
+                        .find(|c| gives(c, missing))
+                        .map_or(*missing, |c| c.name);
+                    why.push((p.id.to_owned(), format!("Needs {name}, which is off")));
+                    false
+                }
+                None => true,
             }
-            None => true,
         });
         if on.len() == before {
             break;
@@ -138,7 +177,12 @@ pub(crate) fn resolve(catalog: &[&'static Plugin], saved: &HashMap<String, bool>
     while ordered.len() < on.len() {
         let next = on
             .iter()
-            .find(|p| !ordered.iter().any(|o| o.id == p.id) && p.requires.iter().all(|r| ordered.iter().any(|o| o.id == *r)))
+            .find(|p| {
+                !ordered.iter().any(|o| o.id == p.id)
+                    && p.requires
+                        .iter()
+                        .all(|r| ordered.iter().any(|o| gives(o, r)))
+            })
             .copied()
             .expect("plugin dependency cycle");
         ordered.push(next);
@@ -147,40 +191,59 @@ pub(crate) fn resolve(catalog: &[&'static Plugin], saved: &HashMap<String, bool>
 }
 
 impl Kernel {
-    pub(crate) fn load_configuration(catalog: &[&'static Plugin], store: &Store, data_dir: &std::path::Path, all_plugins: bool) -> Result<Snapshot> {
+    pub(crate) fn load_configuration(
+        catalog: &[&'static Plugin],
+        store: &Store,
+        data_dir: &std::path::Path,
+        all_plugins: bool,
+    ) -> Result<Snapshot> {
         store.register::<PluginRow>()?;
         store.register::<OrderRow>()?;
         store.register::<SettingRow>()?;
-        let saved: HashMap<String, bool> = store.transaction(|tx| tx.all::<PluginRow>())?.into_iter().map(|r| (r.id, r.enabled)).collect();
+        store.register::<crate::state::MigrationRow>()?;
+        let saved: HashMap<String, bool> = store
+            .transaction(|tx| tx.all::<PluginRow>())?
+            .into_iter()
+            .map(|r| (r.id, r.enabled))
+            .collect();
         // Import validation also reads data of disabled plugins (not of plugins
         // for other systems: those never run here). It
         // only registers/deserializes; no services or core process are started.
-        let plugins = if all_plugins { catalog.iter().copied().filter(|p| p.supported()).collect() } else { resolve(catalog, &saved).0 };
-        let mut reg = Registry { plugins, data_dir: data_dir.to_owned(), ..Default::default() };
-        Setup { reg: &mut reg, plugin: None }.setting(&THEME);
+        let plugins = if all_plugins {
+            catalog.iter().copied().filter(|p| p.supported()).collect()
+        } else {
+            resolve(catalog, &saved).0
+        };
+        let mut reg = Registry {
+            plugins,
+            data_dir: data_dir.to_owned(),
+            ..Default::default()
+        };
+        Setup {
+            reg: &mut reg,
+            plugin: None,
+        }
+        .setting(&THEME);
         for i in 0..reg.plugins.len() {
             let p = reg.plugins[i];
-            (p.setup)(&mut Setup { reg: &mut reg, plugin: Some(i) })
-                .map_err(|e| Error::msg(format!("Plugin {} failed to start: {e}", p.name)))?;
+            (p.setup)(&mut Setup {
+                reg: &mut reg,
+                plugin: Some(i),
+            })
+            .map_err(|e| Error::msg(format!("Plugin {} failed to start: {e}", p.name)))?;
         }
         reg.finish();
-        for (p, m) in &reg.migrations {
-            store.transaction(|tx| m(tx.sql())).map_err(|e| Error::msg(format!("{}: migration failed: {e}", reg.plugins[*p].name)))?;
-        }
-        for (_, _, p) in &reg.persist {
-            (p.register)(store)?;
-        }
-        let mut cells: HashMap<&'static str, Cell> = store.transaction(|tx| {
-            reg.persist
-                .iter()
-                .map(|(name, _, p)| Ok((*name, Cell { value: (p.load)(tx)? })))
-                .collect::<Result<_>>()
-        })?;
+        migrate(store, &mut reg)?;
+        let mut cells = load_cells(store, &mut reg, all_plugins)?;
         for (name, init) in &reg.live {
             cells.insert(name, Cell { value: init() });
         }
         let reg = Arc::new(reg);
-        Ok(Snapshot { cells: Arc::new(cells), reg, rev: 1 })
+        Ok(Snapshot {
+            cells: Arc::new(cells),
+            reg,
+            rev: 1,
+        })
     }
 
     pub(crate) async fn start(
@@ -193,7 +256,11 @@ impl Kernel {
     ) -> Result<Arc<Kernel>> {
         let snapshot = Self::load_configuration(&catalog, &store, &data_dir, false)?;
         let reg = snapshot.reg.clone();
-        let saved: HashMap<String, bool> = store.transaction(|tx| tx.all::<PluginRow>())?.into_iter().map(|r| (r.id, r.enabled)).collect();
+        let saved: HashMap<String, bool> = store
+            .transaction(|tx| tx.all::<PluginRow>())?
+            .into_iter()
+            .map(|r| (r.id, r.enabled))
+            .collect();
         let (_, disabled_reasons) = resolve(&catalog, &saved);
         let changes = Changes::default();
         let k = Arc::new_cyclic(|me| Kernel {
@@ -204,7 +271,7 @@ impl Kernel {
             jobs: Jobs::with_changes(Handle::current(), changes.clone()),
             core: Arc::new(Core::new(changes.clone(), data_dir.join("core"))),
             changes,
-            http: reqwest::Client::builder()
+            http: crate::mihomo::http()
                 .no_proxy()
                 .user_agent("rproxy")
                 .timeout(Duration::from_secs(30))
@@ -214,7 +281,10 @@ impl Kernel {
             next_notice: AtomicU64::new(1),
             schedules: Mutex::default(),
             services: Mutex::default(),
-            updates: Mutex::new(crate::updates::CoreUpdates { installed: rproxy_mihomo::installed(&data_dir.join("core")).is_file(), ..Default::default() }),
+            updates: Mutex::new(crate::updates::CoreUpdates {
+                installed: rproxy_mihomo::installed(&data_dir.join("core")).is_file(),
+                ..Default::default()
+            }),
             catalog,
             saved_toggles: Mutex::new(saved),
             disabled_reasons,
@@ -222,6 +292,8 @@ impl Kernel {
             restore,
             ui_open,
             closed: Default::default(),
+            tasks: Default::default(),
+            stop: Default::default(),
             queued: Mutex::default(),
             data_dir,
             me: me.clone(),
@@ -242,6 +314,9 @@ impl Kernel {
                 k.core.monitor().await;
             }
         });
+        for warning in &k.reg.warnings {
+            k.notify_error("Settings", warning);
+        }
         k.dispatch(Started);
         Ok(k)
     }
@@ -254,10 +329,19 @@ impl Kernel {
             self.closed.store(true, Ordering::SeqCst);
         }
         // Stop every service and wait for its cleanup (e.g. restoring the system proxy).
-        let services: Vec<_> = self.services.lock().unwrap().drain().map(|(_, s)| s.done).collect();
+        let services: Vec<_> = self
+            .services
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, s)| s.done)
+            .collect();
         for done in services {
             let _ = done.await;
         }
+        self.stop.cancel();
+        self.tasks.close();
+        self.tasks.wait().await;
         self.jobs.shutdown().await;
         // UI operations without a job can still hold the writer across core I/O.
         // Drain them before the host snapshots or replaces the shared database.
@@ -267,6 +351,40 @@ impl Kernel {
 
     pub fn closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+    /// Run work that belongs to `cx`'s plugin (an event handler, a UI op): it
+    /// is cancelled and awaited on shutdown, and its error or panic is shown
+    /// with the plugin's name. Resolves to the result unless cancelled.
+    pub(crate) fn track<R: Send + 'static>(
+        &self,
+        cx: &Cx,
+        fut: impl std::future::Future<Output = Result<R>> + Send + 'static,
+    ) -> tokio::task::JoinHandle<Option<Result<R>>> {
+        let (cx, stop) = (cx.clone(), self.stop.clone());
+        self.tasks.spawn(async move {
+            let result = tokio::select! {
+                r = caught(fut) => r,
+                _ = stop.cancelled() => return None,
+            };
+            if let Err(e) = &result
+                && !e.cancelled()
+                && !cx.k.closed()
+            {
+                cx.k.notify_error(&format!("{} failed", cx.plugin_name()), &e.message);
+            }
+            Some(result)
+        })
+    }
+    /// Wait until no job, event handler or UI op is running (tests).
+    pub async fn idle(&self) {
+        loop {
+            let busy =
+                !self.tasks.is_empty() || self.jobs.board().runs.iter().any(|r| r.phase.active());
+            if !busy {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
     fn ensure_open(&self) -> Result<()> {
         if self.closed() {
@@ -282,11 +400,23 @@ impl Kernel {
     }
     /// A context acting as the kernel itself.
     pub fn cx(&self) -> Cx {
-        Cx { k: self.arc(), plugin: None, job: None }
+        Cx {
+            k: self.arc(),
+            plugin: None,
+            job: None,
+        }
     }
     /// A context acting as plugin `id` (tests, glue code).
     pub fn cx_for(&self, id: &str) -> Cx {
-        Cx { k: self.arc(), plugin: self.reg.plugin_index(id), job: None }
+        let plugin = self
+            .reg
+            .plugin_index(id)
+            .unwrap_or_else(|| panic!("no enabled plugin `{id}`"));
+        Cx {
+            k: self.arc(),
+            plugin: Some(plugin),
+            job: None,
+        }
     }
     pub fn plugins(&self) -> &[&'static Plugin] {
         &self.reg.plugins
@@ -323,17 +453,23 @@ impl Kernel {
     }
 
     // ---- transactions ---------------------------------------------------
-    pub(crate) async fn write<R>(&self, plugin: Option<usize>, f: impl FnOnce(&mut Write<'_>) -> Result<R>) -> Result<R> {
+    pub(crate) async fn write<R>(
+        &self,
+        plugin: Option<usize>,
+        f: impl FnOnce(&mut Write<'_>) -> Result<R>,
+    ) -> Result<R> {
         let _w = self.writer.lock().await;
         self.ensure_open()?;
         let base = self.snapshot();
         let mut w = Write::new(&base, plugin);
         let out = std::panic::catch_unwind(AssertUnwindSafe(|| f(&mut w)))
-            .map_err(|p| Error::new("bug", panic_text(p)))??;
+            .map_err(|p| Error::new("bug", panic_text(&*p)))??;
         for c in &self.reg.cascades {
             c(&base, &mut w);
         }
-        let Write { changed, events, .. } = w;
+        let Write {
+            changed, events, ..
+        } = w;
         if changed.is_empty() {
             drop(_w);
             for e in events {
@@ -342,7 +478,10 @@ impl Kernel {
             return Ok(out);
         }
         let names: Vec<&'static str> = changed.keys().copied().collect();
-        let changed: HashMap<&'static str, Value> = changed.into_iter().map(|(k, v)| (k, Arc::from(v) as Value)).collect();
+        let changed: HashMap<&'static str, Value> = changed
+            .into_iter()
+            .map(|(k, v)| (k, Arc::from(v) as Value))
+            .collect();
         let next = base.with(changed);
         if let Err(e) = self.core.sync(&self.reg, &next).await {
             // Put the previous configuration back (the core may be half-updated).
@@ -372,7 +511,9 @@ impl Kernel {
         for e in events {
             e(&k);
         }
-        self.dispatch(crate::Changed { states: Arc::new(names) });
+        self.dispatch(crate::Changed {
+            states: Arc::new(names),
+        });
         self.reschedule();
         Ok(out)
     }
@@ -381,18 +522,18 @@ impl Kernel {
         if self.closed() {
             return;
         }
-        let Some(list) = self.reg.observers.get(&TypeId::of::<E>()) else { return };
+        let Some(list) = self.reg.observers.get(&TypeId::of::<E>()) else {
+            return;
+        };
         let event: Arc<dyn Any + Send + Sync> = Arc::new(event);
         for o in list {
-            let cx = Cx { k: self.arc(), plugin: (o.plugin != usize::MAX).then_some(o.plugin), job: None };
+            let cx = Cx {
+                k: self.arc(),
+                plugin: (o.plugin != usize::MAX).then_some(o.plugin),
+                job: None,
+            };
             if let Some(fut) = (o.f)(cx.clone(), &*event) {
-                tokio::spawn(async move {
-                    if let Err(e) = fut.await {
-                        if !e.cancelled() {
-                            cx.k.notify_error(&format!("{} failed", cx.plugin_name()), &e.message);
-                        }
-                    }
-                });
+                o.policy.run(&cx, fut);
             }
         }
     }
@@ -408,8 +549,14 @@ impl Kernel {
             known.insert(s.name.clone(), every);
             match every {
                 Some(d) if !d.is_zero() => {
-                    let cx = Cx { k: self.arc(), plugin: Some(s.plugin), job: None };
-                    let _ = self.jobs.schedule(&s.name, (s.task)(&cx), Timing::repeating(d, d));
+                    let cx = Cx {
+                        k: self.arc(),
+                        plugin: Some(s.plugin),
+                        job: None,
+                    };
+                    let _ = self
+                        .jobs
+                        .schedule(&s.name, (s.task)(&cx), Timing::repeating(d, d));
                 }
                 _ => {
                     let _ = self.jobs.unschedule(&s.name);
@@ -425,7 +572,10 @@ impl Kernel {
             let spec = (s.spec)(&snap);
             let current = running.remove(&s.name);
             let unchanged = match (&spec, &current) {
-                (Some(new), Some(r)) => r.spec.as_ref().is_some_and(|old| (s.same)(new.as_ref(), old.as_ref())),
+                (Some(new), Some(r)) => r
+                    .spec
+                    .as_ref()
+                    .is_some_and(|old| (s.same)(new.as_ref(), old.as_ref())),
                 (None, None) => true,
                 (None, Some(r)) => r.spec.is_none(),
                 (Some(_), None) => false,
@@ -439,8 +589,17 @@ impl Kernel {
             // Dropping the current run's sender stops it; the next run waits until it has.
             let previous = current.map(|r| r.done);
             let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-            let cx = Cx { k: self.arc(), plugin: Some(s.plugin), job: None };
-            let (plugin, run, on_stop) = (self.reg.plugins[s.plugin].name, s.run.clone(), s.stop.clone());
+            let cx = Cx {
+                k: self.arc(),
+                plugin: Some(s.plugin),
+                job: None,
+            };
+            let (plugin, run, on_stop, restart) = (
+                self.reg.plugins[s.plugin].name,
+                s.run.clone(),
+                s.stop.clone(),
+                s.restart,
+            );
             let report = move |cx: &Cx, r: Result<()>| {
                 if let (Err(e), false) = (r, cx.k.closed()) {
                     cx.k.notify_error(plugin, &e.message);
@@ -452,15 +611,41 @@ impl Kernel {
                     let _ = previous.await;
                 }
                 let Some(spec) = task_spec else { return };
+                let runs = async {
+                    // With `restart_on_error`, a failed run is retried after a pause
+                    // that doubles up to five minutes; the same error is shown once.
+                    let mut pause = std::time::Duration::from_secs(2);
+                    let mut shown: Option<String> = None;
+                    loop {
+                        let r = caught(run(cx.clone(), spec.clone())).await;
+                        let failed = r.as_ref().err().map(|e| e.message.clone());
+                        if failed.is_none() || failed != shown {
+                            report(&cx, r);
+                        }
+                        if failed.is_none() || !restart {
+                            return;
+                        }
+                        shown = failed;
+                        tokio::time::sleep(pause).await;
+                        pause = (pause * 2).min(std::time::Duration::from_secs(300));
+                    }
+                };
                 tokio::select! {
-                    r = run(cx.clone(), spec.clone()) => report(&cx, r),
+                    _ = runs => {}
                     _ = stopped => {}
                 }
                 if let Some(on_stop) = on_stop {
-                    report(&cx, on_stop(cx.clone(), spec).await);
+                    report(&cx, caught(on_stop(cx.clone(), spec)).await);
                 }
             });
-            running.insert(s.name.clone(), RunningService { spec, _stop: stop, done });
+            running.insert(
+                s.name.clone(),
+                RunningService {
+                    spec,
+                    _stop: stop,
+                    done,
+                },
+            );
         }
     }
 
@@ -482,19 +667,29 @@ impl Kernel {
     fn push_notice(&self, title: &str, text: &str, error: bool, page: Option<&'static str>) {
         let id = self.next_notice.fetch_add(1, Ordering::Relaxed);
         let mut n = self.notices.lock().unwrap();
-        n.push_back(Notice { id, title: title.into(), text: text.into(), error, page });
+        n.push_back(Notice {
+            id,
+            title: title.into(),
+            text: text.into(),
+            error,
+            page,
+        });
         while n.len() > 16 {
             n.pop_front();
         }
         drop(n);
         self.changes.notify();
     }
-    pub(crate) fn notices_after(&self, id: u64) -> Vec<Notice> {
-        self.notices.lock().unwrap().iter().filter(|n| n.id > id).cloned().collect()
-    }
-    /// A fresh notice id (for toasts that live in one session only).
-    pub(crate) fn next_notice_id(&self) -> u64 {
-        self.next_notice.fetch_add(1, Ordering::Relaxed)
+    /// Notices newer than `id` (0: all kept), e.g. to check in a test that
+    /// an error was shown.
+    pub fn notices_after(&self, id: u64) -> Vec<Notice> {
+        self.notices
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|n| n.id > id)
+            .cloned()
+            .collect()
     }
     pub(crate) fn last_notice(&self) -> u64 {
         self.next_notice.load(Ordering::Relaxed) - 1
@@ -506,18 +701,24 @@ impl Kernel {
         let mut t = self.saved_toggles.lock().unwrap();
         self.ensure_open()?;
         let mut changes = vec![(id.to_owned(), enabled)];
-        if enabled {
-            if let Some(p) = self.catalog.iter().find(|p| p.id == id) {
-                if p.category.policy == Policy::Exclusive {
-                    for other in self.catalog.iter().filter(|o| o.id != id && o.category.id == p.category.id) {
-                        changes.push((other.id.to_owned(), false));
-                    }
-                }
+        if enabled
+            && let Some(p) = self.catalog.iter().find(|p| p.id == id)
+            && p.category.policy == Policy::Exclusive
+        {
+            for other in self
+                .catalog
+                .iter()
+                .filter(|o| o.id != id && o.category.id == p.category.id)
+            {
+                changes.push((other.id.to_owned(), false));
             }
         }
         self.store.transaction(|tx| {
             for (id, on) in &changes {
-                tx.put(&PluginRow { id: id.clone(), enabled: *on })?;
+                tx.put(&PluginRow {
+                    id: id.clone(),
+                    enabled: *on,
+                })?;
             }
             Ok(())
         })?;
@@ -539,13 +740,6 @@ impl Kernel {
     }
 }
 
-fn panic_text(p: Box<dyn Any + Send>) -> String {
-    p.downcast_ref::<String>()
-        .cloned()
-        .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
-        .unwrap_or_else(|| "internal error".into())
-}
-
 /// Execution context of a handler, observer or job: who acts, plus access to
 /// state, other ops, the core and the job's progress/cancellation.
 #[derive(Clone)]
@@ -556,13 +750,22 @@ pub struct Cx {
 }
 impl Cx {
     pub(crate) fn as_plugin(&self, plugin: Option<usize>) -> Cx {
-        Cx { k: self.k.clone(), plugin, job: self.job.clone() }
+        Cx {
+            k: self.k.clone(),
+            plugin,
+            job: self.job.clone(),
+        }
     }
     pub fn kernel(&self) -> &Arc<Kernel> {
         &self.k
     }
     pub fn plugin_id(&self) -> &'static str {
         self.plugin.map_or("kernel", |p| self.k.reg.plugins[p].id)
+    }
+    /// The plugin's own folder, as `Setup::data_dir`.
+    pub fn data_dir(&self) -> std::path::PathBuf {
+        let id = self.plugin.map_or("kernel", |p| self.k.reg.plugins[p].id);
+        self.k.reg.data_dir.join("plugins").join(id)
     }
     pub fn plugin_name(&self) -> &'static str {
         self.plugin.map_or("rproxy", |p| self.k.reg.plugins[p].name)
@@ -593,7 +796,11 @@ impl Cx {
         }
     }
     /// Change a live state this plugin owns; the UI repaints if it changed.
-    pub fn update_live<T: Clone + PartialEq + Send + Sync + 'static, R>(&self, s: &State<T>, f: impl FnOnce(&mut T) -> R) -> R {
+    pub fn update_live<T: Clone + PartialEq + Send + Sync + 'static, R>(
+        &self,
+        s: &State<T>,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> R {
         let cell = self.live_cell(s);
         let mut current = cell.0.write().unwrap();
         let mut value = (**current).clone();
@@ -607,15 +814,27 @@ impl Cx {
     }
     /// Put `item` into a live list while the returned guard lives, e.g. the
     /// servers being checked right now: `let _busy = cx.mark_live(&BUSY, id);`
-    pub fn mark_live<T: Clone + PartialEq + Send + Sync + 'static>(&self, s: &'static State<Vec<T>>, item: T) -> LiveMark {
+    pub fn mark_live<T: Clone + PartialEq + Send + Sync + 'static>(
+        &self,
+        s: &'static State<Vec<T>>,
+        item: T,
+    ) -> LiveMark {
         self.update_live(s, |list| list.push(item.clone()));
         let cx = self.clone();
-        LiveMark(Some(Box::new(move || cx.update_live(s, |list| list.retain(|x| *x != item)))))
+        LiveMark(Some(Box::new(move || {
+            cx.update_live(s, |list| list.retain(|x| *x != item))
+        })))
     }
     fn live_cell<T: Send + Sync + 'static>(&self, s: &State<T>) -> Arc<crate::state::Live<T>> {
         let snap = self.k.snapshot();
         if let Some(me) = self.plugin {
-            assert_eq!(snap.reg.owner(s.name), Some(me), "plugin {} cannot write state {}; call an Op of its owner instead", snap.reg.plugins[me].id, s.name);
+            assert_eq!(
+                snap.reg.owner(s.name),
+                Some(me),
+                "plugin {} cannot write state {}; call an Op of its owner instead",
+                snap.reg.plugins[me].id,
+                s.name
+            );
         }
         snap.live_cell(s)
     }
@@ -627,32 +846,50 @@ impl Cx {
         self.k.write(self.plugin, f).await
     }
     /// Run an op inline (inherits this job's progress and cancellation).
-    pub fn call<O: Op>(&self, op: O) -> impl std::future::Future<Output = Result<O::Reply>> + Send + 'static {
+    pub fn call<O: Op>(
+        &self,
+        op: O,
+    ) -> impl std::future::Future<Output = Result<O::Reply>> + Send + 'static + use<O> {
         let h = self.k.reg.ops.get(&TypeId::of::<O>()).map(|b| &**b);
         op::run(self, h, op)
     }
     /// The job that runs ops made by `make` with this context. With `last_error`
     /// (scheduled jobs), the same error is shown once until a run succeeds.
-    pub(crate) fn task_with<O: Op>(&self, spec: crate::JobSpec, last_error: Option<Arc<Mutex<Option<String>>>>, make: impl Fn() -> O + Send + Sync + 'static) -> Task {
+    pub(crate) fn task_with<O: Op>(
+        &self,
+        key: String,
+        spec: crate::JobSpec,
+        last_error: Option<Arc<Mutex<Option<String>>>>,
+        make: impl Fn() -> O + Send + Sync + 'static,
+    ) -> Task {
         let cx = self.clone();
         let label = spec.label.clone();
         let page = spec.page;
-        Task::new(spec.key, move |jcx| {
+        Task::new(key, move |jcx| {
             let run = jcx.clone();
-            let cx = Cx { job: Some(jcx), ..cx.clone() };
+            let cx = Cx {
+                job: Some(jcx),
+                ..cx.clone()
+            };
             let (label, op, last_error) = (label.clone(), make(), last_error.clone());
             async move {
-                let r = cx.call(op).await.map(drop);
+                let r = caught(cx.call(op)).await.map(drop);
                 let repeated = last_error.is_some_and(|last| {
                     let message = r.as_ref().err().map(|e| e.message.clone());
-                    std::mem::replace(&mut *last.lock().unwrap(), message.clone()).is_some_and(|m| Some(m) == message)
+                    std::mem::replace(&mut *last.lock().unwrap(), message.clone())
+                        .is_some_and(|m| Some(m) == message)
                 });
-                if let Err(e) = &r {
-                    if !e.cancelled() && !cx.k.closed() && !repeated {
-                        // An error reads as one: "Couldn't …" set by the op, else "<label> failed".
-                        let title = run.run().and_then(|r| r.failure_title).unwrap_or_else(|| format!("{label} failed"));
-                        cx.k.notify_error_at(&title, &e.message, page);
-                    }
+                if let Err(e) = &r
+                    && !e.cancelled()
+                    && !cx.k.closed()
+                    && !repeated
+                {
+                    // An error reads as one: "Couldn't …" set by the op, else "<label> failed".
+                    let title = run
+                        .run()
+                        .and_then(|r| r.failure_title)
+                        .unwrap_or_else(|| format!("{label} failed"));
+                    cx.k.notify_error_at(&title, &e.message, page);
                 }
                 r
             }
@@ -662,36 +899,101 @@ impl Cx {
     }
     /// Start an op as a background job (see [`Op::job`] and [`crate::JobSpec::queue`]).
     pub fn spawn<O: Op>(&self, op: O) -> Result<RunId> {
-        let spec = op.job().unwrap_or_else(|| crate::JobSpec::keyed(format!("{}:{}", short_name::<O>(), crate::Id::random()), short_name::<O>()));
-        let (key, queue) = (spec.key.clone(), spec.queue);
+        let spec = op.job().unwrap_or_else(|| {
+            crate::JobSpec::keyed(crate::Id::random().to_string(), short_name::<O>())
+        });
+        let (key, queue, latest) = (self.job_key(&op, &spec.key), spec.queue, spec.latest);
         let cell = Arc::new(Mutex::new(Some(op)));
-        let task = self.task_with(spec, None, move || cell.lock().unwrap().take().expect("op runs once"));
+        let task = self.task_with(key.clone(), spec, None, move || {
+            cell.lock().unwrap().take().expect("op runs once")
+        });
         let jobs = &self.k.jobs;
-        if queue {
-            if let Some(active) = jobs.board().runs.into_iter().find(|r| r.key == key && r.phase.active()) {
-                // One follow-up per key: later requests are covered by it.
-                if !self.k.queued.lock().unwrap().insert(key.clone()) {
-                    return Ok(active.id);
-                }
-                let k = self.k.clone();
-                let handle = jobs.handle(active.id);
-                tokio::spawn(async move {
-                    if let Some(h) = handle {
-                        h.wait().await;
-                    }
-                    k.queued.lock().unwrap().remove(&key);
-                    if !k.closed() {
-                        let _ = k.jobs.start(task);
-                    }
-                });
+        if (queue || latest)
+            && let Some(active) = jobs
+                .board()
+                .runs
+                .into_iter()
+                .find(|r| r.key == key && r.phase.active())
+        {
+            if latest {
+                let _ = jobs.cancel(active.id);
+            }
+            // One follow-up per key, always the newest request.
+            if self
+                .k
+                .queued
+                .lock()
+                .unwrap()
+                .insert(key.clone(), task)
+                .is_some()
+            {
                 return Ok(active.id);
             }
+            let k = self.k.clone();
+            let handle = jobs.handle(active.id);
+            // Tracked, so `idle()` also waits for the follow-up.
+            self.k.tasks.spawn(async move {
+                if let Some(h) = handle {
+                    // Shutdown cancels the active job later: don't hold it up.
+                    tokio::select! {
+                        _ = h.wait() => {}
+                        _ = k.stop.cancelled() => return,
+                    }
+                }
+                let next = k.queued.lock().unwrap().remove(&key);
+                if let Some(task) = next.filter(|_| !k.closed()) {
+                    let _ = k.jobs.start(task);
+                }
+            });
+            return Ok(active.id);
         }
         Ok(jobs.start(task)?.id)
     }
-    /// The active run of a job key, if any.
-    pub fn running(&self, key: &str) -> Option<crate::Run> {
-        self.k.jobs.board().runs.into_iter().find(|r| r.key == key && r.phase.active())
+    /// Read what an op's result depends on (e.g. a subscription's link) when
+    /// it starts; [`Input::check`] inside the final write then refuses to save
+    /// a result that an edit or a removal overtook meanwhile.
+    pub fn input<K: Clone + PartialEq + Send + Sync + 'static>(
+        &self,
+        read: impl Fn(&Snapshot) -> Option<K> + Send + Sync + 'static,
+    ) -> Input<K> {
+        let value = read(&self.snapshot());
+        Input {
+            read: Arc::new(read),
+            value,
+        }
+    }
+    /// The active job that `op` would join, if any.
+    pub fn running<O: Op>(&self, op: &O) -> Option<crate::Run> {
+        let key = self.job_key(op, &op.job()?.key);
+        self.k
+            .jobs
+            .board()
+            .runs
+            .into_iter()
+            .find(|r| r.key == key && r.phase.active())
+    }
+    /// `<plugin that handles O>/<key or op type>`: job keys never clash
+    /// between plugins, and every caller of one op finds the same job.
+    pub(crate) fn job_key<O: Op>(&self, op: &O, key: &str) -> String {
+        // The plugin whose handler does the work (wrappers aside), as the
+        // claims pick it for this op.
+        let owner = self
+            .k
+            .reg
+            .ops
+            .get(&TypeId::of::<O>())
+            .and_then(|b| b.downcast_ref::<Handlers<O>>())
+            .and_then(|h| {
+                op::chain(&h.0, &self.snapshot(), op)
+                    .into_iter()
+                    .find(|h| h.rank != crate::Rank::Specific)
+            })
+            .map_or("kernel", |h| self.k.reg.plugins[h.plugin].id);
+        if key.is_empty() {
+            format!("{owner}/{}", short_name::<O>())
+        } else {
+            format!("{owner}/{key}")
+        }
     }
     /// Deliver an event now.
     pub fn emit<E: Clone + Send + Sync + 'static>(&self, event: E) {
@@ -712,7 +1014,11 @@ impl Cx {
     }
     /// Run `fut` unless the job is cancelled first.
     pub async fn or_cancel<T>(&self, fut: impl std::future::Future<Output = T>) -> Result<T> {
-        tokio::select! { biased; _ = self.cancelled() => Err(Error::new("cancelled", "Cancelled")), v = fut => Ok(v) }
+        tokio::select! {
+            biased;
+            _ = self.cancelled() => Err(Error::new("cancelled", "Cancelled")),
+            v = fut => Ok(v),
+        }
     }
     pub fn progress(&self, done: u64, total: Option<u64>) {
         if let Some(j) = &self.job {
@@ -732,7 +1038,10 @@ impl Cx {
         }
     }
     pub fn core(&self) -> CoreApi {
-        CoreApi { core: self.k.core.clone(), kernel: self.k.clone() }
+        CoreApi {
+            core: self.k.core.clone(),
+            kernel: self.k.clone(),
+        }
     }
     /// Default direct HTTP client (no proxy, 30 s timeout).
     pub fn http(&self) -> &reqwest::Client {
@@ -754,27 +1063,214 @@ impl Drop for LiveMark {
     }
 }
 
+/// Bring saved data up to the plugins' schemas: lenient table step (new
+/// columns), migrations in version order, then the strict check. A plugin that
+/// never saved anything starts on its newest schema: its migrations are
+/// recorded as done without running.
+fn migrate(store: &Store, reg: &mut Registry) -> Result<()> {
+    use crate::state::MigrationRow;
+    let done = |id: String| MigrationRow {
+        id,
+        at: crate::now() as i64,
+    };
+    reg.migrations.sort_by_key(|(p, v, _)| (*p, *v));
+    let fresh: Vec<bool> = store.transaction(|tx| {
+        (0..reg.plugins.len())
+            .map(|p| Ok(!installed(tx, reg.plugins[p].id)? && !has_data(tx.sql(), reg, p)?))
+            .collect()
+    })?;
+    for (_, _, p) in &reg.persist {
+        (p.register)(store, false)?;
+    }
+    for (p, version, step) in &reg.migrations {
+        let plugin = &reg.plugins[*p];
+        let id = format!("{}|{version}", plugin.id);
+        store
+            .transaction(|tx| {
+                if tx.get::<MigrationRow>(id.as_str())?.is_none() {
+                    if !fresh[*p] {
+                        step(tx.sql())?;
+                    }
+                    tx.put(&done(id.clone()))?;
+                }
+                Ok(())
+            })
+            .map_err(|e| Error::msg(format!("{}: migration {version} failed: {e}", plugin.name)))?;
+    }
+    store.transaction(|tx| {
+        for p in &reg.plugins {
+            let id = format!("{}|installed", p.id);
+            if tx.get::<MigrationRow>(id.as_str())?.is_none() {
+                tx.put(&done(id))?;
+            }
+        }
+        Ok(())
+    })?;
+    for (_, _, p) in &reg.persist {
+        (p.register)(store, true)?;
+    }
+    Ok(())
+}
+
+/// Read every persisted state. A setting that no longer reads (an older or
+/// damaged value) starts from its default instead of stopping the app, with a
+/// warning; import validation (`strict`) refuses it.
+fn load_cells(
+    store: &Store,
+    reg: &mut Registry,
+    strict: bool,
+) -> Result<HashMap<&'static str, Cell>> {
+    let mut warnings = Vec::new();
+    let cells = store.transaction(|tx| {
+        let mut cells = HashMap::new();
+        for (name, plugin, p) in &reg.persist {
+            let value = match ((p.load)(tx), &p.fallback) {
+                (Ok(value), _) => value,
+                (Err(e), Some(default)) if !strict && e.code == "setting" => {
+                    set_aside(tx, name)?;
+                    let owner = plugin.map_or("rproxy", |i| reg.plugins[i].name);
+                    let warning = format!("{owner}: the saved setting {name} could not be read, so its default is used.");
+                    warnings.push(warning);
+                    default()
+                }
+                (Err(e), _) => return Err(e),
+            };
+            cells.insert(*name, Cell { value });
+        }
+        Ok(cells)
+    })?;
+    reg.warnings = warnings;
+    Ok(cells)
+}
+
+/// Keep an unreadable setting as `<name>.broken` and drop it, so the profile
+/// still exports and imports cleanly.
+fn set_aside(tx: &crate::store::Tx<'_>, name: &str) -> Result<()> {
+    if let Some(row) = tx.get::<SettingRow>(name)? {
+        tx.put(&SettingRow {
+            id: format!("{name}.broken"),
+            json: row.json,
+        })?;
+        tx.delete::<SettingRow>(name)?;
+    }
+    Ok(())
+}
+
+/// The plugin ran here before (it gets a `<plugin>|installed` migration row).
+fn installed(tx: &crate::store::Tx<'_>, plugin: &str) -> Result<bool> {
+    Ok(tx
+        .get::<crate::state::MigrationRow>(format!("{plugin}|installed").as_str())?
+        .is_some())
+}
+
+/// The plugin saved something before: one of its tables exists or it has a
+/// setting (for data from before the `installed` row existed).
+fn has_data(
+    sql: &crate::store::rusqlite::Connection,
+    reg: &Registry,
+    plugin: usize,
+) -> Result<bool> {
+    let id = reg.plugins[plugin].id;
+    let exists = |table: &str| -> Result<bool> {
+        let query = "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?)";
+        Ok(sql.query_row(query, [table], |r| r.get(0))?)
+    };
+    let setting: bool = sql.query_row(
+        "SELECT EXISTS(SELECT 1 FROM kernel_settings WHERE substr(id, 1, length(?1) + 1) = ?1 || '.')",
+        [id],
+        |r| r.get(0),
+    )?;
+    let mut tables = reg
+        .tables
+        .iter()
+        .filter(|(_, state)| reg.owner(state) == Some(plugin))
+        .map(|(table, _)| *table);
+    Ok(setting || tables.try_fold(false, |found, t| Ok::<_, Error>(found || exists(t)?))?)
+}
+
+/// What an op read when it started (see [`Cx::input`]).
+#[derive(Clone)]
+pub struct Input<K> {
+    read: Arc<dyn Fn(&Snapshot) -> Option<K> + Send + Sync>,
+    value: Option<K>,
+}
+impl<K: PartialEq> Input<K> {
+    /// The value at the start; `None` when the object did not exist.
+    pub fn value(&self) -> Option<&K> {
+        self.value.as_ref()
+    }
+    /// Still the same in the state this write starts from.
+    pub fn current(&self, w: &Write<'_>) -> bool {
+        self.value.is_some() && (self.read)(w.base()) == self.value
+    }
+    /// Inside `cx.write`: a silent cancellation when the input changed or is gone.
+    pub fn check(&self, w: &Write<'_>) -> Result<()> {
+        if self.current(w) {
+            Ok(())
+        } else {
+            Err(Error::new("cancelled", "Changed while this was running."))
+        }
+    }
+}
+
+/// Run `fut`; a panic becomes an error with its text, so it is shown and handled
+/// like any other failure.
+pub(crate) async fn caught<R>(fut: impl std::future::Future<Output = Result<R>>) -> Result<R> {
+    use futures_util::FutureExt;
+    std::panic::AssertUnwindSafe(fut)
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|panic| Err(Error::new("panic", panic_text(&*panic))))
+}
+
+/// The message of a caught panic.
+pub(crate) fn panic_text(panic: &(dyn Any + Send)) -> String {
+    let text = panic
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned());
+    format!(
+        "Crashed: {}",
+        text.unwrap_or_else(|| "unknown error".into())
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{categories, Platform};
+    use crate::{Platform, categories};
     static ELSEWHERE: Plugin = Plugin {
         id: "elsewhere",
         name: "Elsewhere",
         description: "",
         category: categories::NETWORK,
         requires: &[],
+        provides: &[],
         required: false,
         default_enabled: true,
-        platforms: if cfg!(windows) { &[Platform::Macos] } else { &[Platform::Windows] },
+        platforms: if cfg!(windows) {
+            &[Platform::Macos]
+        } else {
+            &[Platform::Windows]
+        },
         setup: |_| Ok(()),
     };
-    static NEEDS_IT: Plugin = Plugin { id: "needs-it", name: "Needs it", requires: &["elsewhere"], platforms: Platform::ALL, ..ELSEWHERE };
+    static NEEDS_IT: Plugin = Plugin {
+        id: "needs-it",
+        name: "Needs it",
+        requires: &["elsewhere"],
+        platforms: Platform::ALL,
+        ..ELSEWHERE
+    };
     #[test]
     fn plugins_for_other_systems_are_skipped_with_a_reason() {
         let (on, why) = resolve(&[&ELSEWHERE, &NEEDS_IT], &HashMap::new());
         assert!(on.is_empty());
-        let only = if cfg!(windows) { "macOS only" } else { "Windows only" };
+        let only = if cfg!(windows) {
+            "macOS only"
+        } else {
+            "Windows only"
+        };
         assert!(why.contains(&("elsewhere".into(), only.into())));
         assert!(why.contains(&("needs-it".into(), "Needs Elsewhere, which is off".into())));
     }

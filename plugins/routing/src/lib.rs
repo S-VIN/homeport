@@ -67,14 +67,14 @@ pub struct UpdateGeo;
 impl Op for UpdateGeo {
     type Reply = ();
     fn job(&self) -> Option<JobSpec> {
-        Some(JobSpec::keyed("routing/geo", "Update geo data").page("routing"))
+        Some(JobSpec::new("Update geo data").page("routing"))
     }
 }
 struct RefreshGeo;
 impl Op for RefreshGeo {
     type Reply = ();
     fn job(&self) -> Option<JobSpec> {
-        Some(JobSpec::keyed("routing/geo-status", "Read geo data status").quiet())
+        Some(JobSpec::new("Read geo data status").quiet())
     }
 }
 fn geo_providers(snap: &Snapshot) -> Vec<RuleProvider> {
@@ -116,12 +116,9 @@ pub static PLUGIN: Plugin = Plugin {
     id: "routing",
     name: "Routing",
     description: "Send domains and networks via the server, directly, or block them. The first match wins.",
-    category: categories::NETWORK,
     requires: &["servers"],
-    required: false,
-    default_enabled: true,
-    platforms: Platform::ALL,
     setup,
+    ..Plugin::DEFAULT
 };
 
 choices!(pub enum Route {
@@ -162,7 +159,11 @@ pub fn core_rule(rule: &Rule, via: &Target) -> Result<CoreRule> {
     } else if pattern == "*" {
         CoreRule::Match(t)
     } else if let Some(net) = network {
-        CoreRule::IpCidr { net, target: t, no_resolve: true }
+        CoreRule::IpCidr {
+            net,
+            target: t,
+            no_resolve: true,
+        }
     } else {
         CoreRule::DomainRegex(domain_regex(&pattern), t)
     })
@@ -223,7 +224,12 @@ pub fn rule_pattern(pattern: &str) -> Result<(String, Option<IpNet>)> {
             .ok_or_else(|| Error::msg("Use an IP, a CIDR network or a prefix like 192.168.*."))?;
         let octets: Vec<u8> = prefix
             .split('.')
-            .map(|octet| octet.parse().ok().filter(|_| octet.len() == 1 || !octet.starts_with('0')))
+            .map(|octet| {
+                octet
+                    .parse()
+                    .ok()
+                    .filter(|_| octet.len() == 1 || !octet.starts_with('0'))
+            })
             .collect::<Option<_>>()
             .filter(|o: &Vec<u8>| (1..=3).contains(&o.len()))
             .ok_or_else(|| Error::msg("Invalid IPv4 prefix."))?;
@@ -249,7 +255,9 @@ fn setup(p: &mut Setup) -> Result<()> {
     p.list(&RULES).validate(|_, rule, _, others| {
         let (pattern, network) = rule_pattern(&rule.pattern)?;
         let clash = others.iter().any(|r| {
-            r.pattern == pattern || network.is_some() && rule_pattern(&r.pattern).ok().and_then(|(_, n)| n) == network
+            r.pattern == pattern
+                || network.is_some()
+                    && rule_pattern(&r.pattern).ok().and_then(|(_, n)| n) == network
         });
         if clash {
             bail!("Routing pattern already exists.");
@@ -298,15 +306,25 @@ fn setup(p: &mut Setup) -> Result<()> {
         |s| (!geo_providers(s).is_empty()).then_some(Duration::from_secs(60)),
         || RefreshGeo,
     );
-    // New geo rules download in the background; show their state soon after.
+    // New geo rules download in the background; show their state soon after
+    // the last of several quick edits.
     p.on_change([RULES.name], |cx: Cx| async move {
         if !geo_providers(&cx.snapshot()).is_empty() {
             tokio::time::sleep(Duration::from_secs(3)).await;
             read_geo(&cx).await?;
         }
         Ok(())
-    });
-    p.page_fn(PageSpec { id: "routing", title: "Routing", icon: Icon::Routing, order: 30 }, page);
+    })
+    .latest();
+    p.page_fn(
+        PageSpec {
+            id: "routing",
+            title: "Routing",
+            icon: Icon::Routing,
+            order: 30,
+        },
+        page,
+    );
     Ok(())
 }
 
@@ -325,11 +343,7 @@ fn kind(pattern: &str) -> &'static str {
 fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
     let geo_status = (*cx.live(&GEO)).clone();
     let n = cx.get(&RULES).len();
-    let counter = if n == 0 {
-        String::new()
-    } else {
-        kit::plural(n, "rule", "rules")
-    };
+    let counter = kit::count(n, "rule", "rules");
     let has_geo = !geo_providers(cx.snapshot()).is_empty();
     kit::page_header(ui, "Routing", &counter, |ui| {
         if has_geo {
@@ -337,7 +351,6 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
                 ui,
                 Icon::Refresh,
                 "Update geo data",
-                140.,
                 cx.core_status().running(),
                 || UpdateGeo,
             );
@@ -346,32 +359,61 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
 
     ListEditor::new(&RULES)
         .add_form("Add routing rule", || Rule { id: Id::random(), pattern: String::new(), action: Route::Proxy }, |ui, r, width| {
-            let w = (width - 120. - kit::theme::HORIZONTAL_GAP).max(60.);
-            let e = kit::input(ui, "pattern", &mut r.pattern, "Domain, IP or network", w, false)
-                .on_hover_text("First match wins. Unmatched traffic uses the selected server. Examples: *.example.org, 10.0.0.0/8, geosite:category-ru, geoip:ru.");
-            kit::choice(ui, "route", &mut r.action, Route::ALL, 120., "");
-            kit::submitted(ui, &e) && !r.pattern.trim().is_empty()
+            kit::Fields::new(width)
+                .input("pattern", &mut r.pattern, "Domain, IP or network")
+                .help("First match wins. Unmatched traffic uses the selected server. Examples: *.example.org, 10.0.0.0/8, geosite:category-ru, geoip:ru.")
+                .choice("route", &mut r.action, Route::ALL)
+                .show(ui)
+                && !r.pattern.trim().is_empty()
         })
         .column(Column::edit("Pattern", "Domain, IP or network", |r: &mut Rule| &mut r.pattern))
         .column(Column::custom("Type", 74., |ui, _, r: &Rule| {
             kit::badge(ui, kind(&r.pattern), kit::Tone::Neutral);
         }))
         .column(Column::choice("Route", 120., |r: &mut Rule| &mut r.action, Route::ALL))
-        .subtitle(move |rows, i| {
-            if rows[..i].iter().any(|r| r.pattern == "*") {
-                return Some(("Never used: the * rule above matches everything first".into(), kit::Tone::Warning));
-            }
-            let (kind, name) = geo(&rows[i].pattern)?;
-            let status = geo_status.get(&provider(kind, name).name).cloned();
-            let what = if kind == Geo::Site { ("domain", "domains") } else { ("network", "networks") };
-            Some(match status {
-                Some(GeoStatus { rules, updated: Some(_) }) if rules > 0 => (kit::plural(rules as usize, what.0, what.1), kit::Tone::Neutral),
-                Some(GeoStatus { updated: Some(_), .. }) => ("The list is empty. Check the name".into(), kit::Tone::Warning),
-                _ => ("Not downloaded yet. Check the name or update geo data".into(), kit::Tone::Warning),
-            })
-        })
+        .subtitle(move |rows, i| rule_note(rows, i, &geo_status))
         .empty(Icon::Routing, "No routing rules")
         .show(ui, cx);
+}
+
+/// The line under a rule: shadowed by an earlier `*`, or how many entries
+/// its geo list has.
+fn rule_note(
+    rows: &[Rule],
+    i: usize,
+    geo: &HashMap<String, GeoStatus>,
+) -> Option<(String, kit::Tone)> {
+    if rows[..i].iter().any(|r| r.pattern == "*") {
+        return Some((
+            "Never used: the * rule above matches everything first".into(),
+            kit::Tone::Warning,
+        ));
+    }
+    let (kind, name) = self::geo(&rows[i].pattern)?;
+    let what = if kind == Geo::Site {
+        ("domain", "domains")
+    } else {
+        ("network", "networks")
+    };
+    Some(match geo.get(&provider(kind, name).name) {
+        Some(GeoStatus {
+            rules,
+            updated: Some(_),
+        }) if *rules > 0 => (
+            kit::plural(*rules as usize, what.0, what.1),
+            kit::Tone::Neutral,
+        ),
+        Some(GeoStatus {
+            updated: Some(_), ..
+        }) => (
+            "The list is empty. Check the name".into(),
+            kit::Tone::Warning,
+        ),
+        _ => (
+            "Not downloaded yet. Check the name or update geo data".into(),
+            kit::Tone::Warning,
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -380,7 +422,10 @@ mod tests {
     #[test]
     fn patterns_normalize_without_ambiguous_prefixes() {
         assert!(rule_pattern("192.900.*").is_err());
-        assert_eq!(rule_pattern("192.168.*").unwrap().1.unwrap().to_string(), "192.168.0.0/16");
+        assert_eq!(
+            rule_pattern("192.168.*").unwrap().1.unwrap().to_string(),
+            "192.168.0.0/16"
+        );
         assert_eq!(rule_pattern("**.Example.ORG").unwrap().0, "*.example.org");
         assert_eq!(rule_pattern("10.1.2.3/8").unwrap().0, "10.0.0.0/8");
         assert_eq!(

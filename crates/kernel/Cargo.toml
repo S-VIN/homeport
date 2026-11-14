@@ -1,7 +1,7 @@
 [package]
 name = "rproxy-kernel"
 version = "0.2.0"
-edition = "2021"
+edition = "2024"
 publish = false
 description = "rproxy kernel: plugins, state, ops, events, UI zones and the mihomo core"
 
@@ -24,7 +24,7 @@ reqwest = { workspace = true }
 sha2 = "0.11.1"
 
 [target.'cfg(not(windows))'.dependencies]
-flate2 = "1.1.11"
+flate2 = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 zip = { version = "9.5.1", default-features = false, features = ["deflate"] }

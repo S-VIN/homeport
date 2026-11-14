@@ -1,14 +1,14 @@
 //! Host side: one egui context per browser tab, frames streamed over a WebSocket.
-use crate::{image, pack, unpack, wire, Frame, Item, ShapeOp, TexId, Texture, ToHost};
+use crate::{Frame, Item, ShapeOp, TexId, Texture, ToHost, image, pack, unpack, wire};
 use axum::{
+    Router,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::header,
     response::{IntoResponse, Response},
     routing::get,
-    Router,
 };
 use egui::epaint::Galley;
 use std::{
@@ -25,7 +25,9 @@ pub trait Frontend: Send + Sync + 'static {
 }
 pub trait FrontendSession: Send {
     fn ui(&mut self, ui: &mut egui::Ui);
-    fn file_dialog(&mut self) -> Option<crate::FileDialog> { None }
+    fn file_dialog(&mut self) -> Option<crate::FileDialog> {
+        None
+    }
     fn file_reply(&mut self, _: crate::FileReply) {}
 }
 
@@ -37,16 +39,32 @@ pub struct Asset {
 
 /// `GET /ws` plus static assets.
 pub fn router(frontend: Arc<dyn Frontend>, assets: &'static [Asset]) -> Router {
-    let mut app = Router::new().route("/ws", get(upgrade)).with_state(frontend);
+    let mut app = Router::new()
+        .route("/ws", get(upgrade))
+        .with_state(frontend);
     for a in assets {
         let (mime, bytes) = (a.mime, a.bytes);
-        app = app.route(a.path, get(move || async move { ([(header::CONTENT_TYPE, mime), (header::CACHE_CONTROL, "no-cache")], bytes) }));
+        app = app.route(
+            a.path,
+            get(move || async move {
+                (
+                    [
+                        (header::CONTENT_TYPE, mime),
+                        (header::CACHE_CONTROL, "no-cache"),
+                    ],
+                    bytes,
+                )
+            }),
+        );
     }
     app
 }
 
 async fn upgrade(State(frontend): State<Arc<dyn Frontend>>, ws: WebSocketUpgrade) -> Response {
-    ws.max_message_size(40 << 20).max_frame_size(40 << 20).on_upgrade(move |socket| session(socket, frontend)).into_response()
+    ws.max_message_size(40 << 20)
+        .max_frame_size(40 << 20)
+        .on_upgrade(move |socket| session(socket, frontend))
+        .into_response()
 }
 
 /// Remote frames never run faster than this.
@@ -112,13 +130,13 @@ async fn session(mut socket: WebSocket, frontend: Arc<dyn Frontend>) {
         input.viewports = raw.viewports.clone();
         let out = ctx.run_ui(raw, |root| ui.ui(root));
         last = Instant::now();
-        if let Some(v) = out.viewport_output.get(&egui::ViewportId::ROOT) {
-            if v.repaint_delay < Duration::from_secs(3600) {
-                let at = Instant::now() + v.repaint_delay;
-                let mut d = due.lock().unwrap();
-                if d.is_none_or(|old| at < old) {
-                    *d = Some(at);
-                }
+        if let Some(v) = out.viewport_output.get(&egui::ViewportId::ROOT)
+            && v.repaint_delay < Duration::from_secs(3600)
+        {
+            let at = Instant::now() + v.repaint_delay;
+            let mut d = due.lock().unwrap();
+            if d.is_none_or(|old| at < old) {
+                *d = Some(at);
             }
         }
         let bytes = encoder.encode_with_file(out, ui.file_dialog());
@@ -169,7 +187,11 @@ impl Encoder {
     pub fn encode(&mut self, out: egui::FullOutput) -> Vec<u8> {
         self.encode_with_file(out, None)
     }
-    pub fn encode_with_file(&mut self, mut out: egui::FullOutput, file_dialog: Option<crate::FileDialog>) -> Vec<u8> {
+    pub fn encode_with_file(
+        &mut self,
+        mut out: egui::FullOutput,
+        file_dialog: Option<crate::FileDialog>,
+    ) -> Vec<u8> {
         self.frame += 1;
         let frame_no = self.frame;
         let mut fresh: Vec<(u64, Arc<Galley>)> = Vec::new();
@@ -191,10 +213,21 @@ impl Encoder {
         };
         let mut items: Vec<Item> = Vec::with_capacity(out.shapes.len());
         for c in out.shapes {
-            wire(c.shape, c.clip_rect, c.transform_after_tessellation, &mut galley_id, &mut items);
+            wire(
+                c.shape,
+                c.clip_rect,
+                c.transform_after_tessellation,
+                &mut galley_id,
+                &mut items,
+            );
         }
         self.by_ptr.retain(|_, (w, _)| w.strong_count() > 0);
-        let forget: Vec<u64> = self.galleys.iter().filter(|(_, used)| frame_no - **used > 600).map(|(id, _)| *id).collect();
+        let forget: Vec<u64> = self
+            .galleys
+            .iter()
+            .filter(|(_, used)| frame_no - **used > 600)
+            .map(|(id, _)| *id)
+            .collect();
         for id in &forget {
             self.galleys.remove(id);
         }
@@ -210,13 +243,19 @@ impl Encoder {
         while i < hashes.len() {
             if let Some(&from) = index.get(&hashes[i]) {
                 let mut len = 0;
-                while i + len < hashes.len() && (from as usize + len) < self.prev.len() && self.prev[from as usize + len] == hashes[i + len] {
+                while i + len < hashes.len()
+                    && (from as usize + len) < self.prev.len()
+                    && self.prev[from as usize + len] == hashes[i + len]
+                {
                     len += 1;
                 }
                 if !pending.is_empty() {
                     ops.push(ShapeOp::New(std::mem::take(&mut pending)));
                 }
-                ops.push(ShapeOp::Keep { from, len: len as u32 });
+                ops.push(ShapeOp::Keep {
+                    from,
+                    len: len as u32,
+                });
                 i += len;
             } else {
                 pending.push(items[i].take().unwrap());
@@ -232,11 +271,27 @@ impl Encoder {
             .textures_delta
             .set
             .drain()
-            .flat_map(|(id, deltas)| deltas.into_iter().map(move |d| Texture { id: TexId::from(id), image: image(&d.image), options: d.options, pos: d.pos }))
+            .flat_map(|(id, deltas)| {
+                deltas.into_iter().map(move |d| Texture {
+                    id: TexId::from(id),
+                    image: image(&d.image),
+                    options: d.options,
+                    pos: d.pos,
+                })
+            })
             .collect();
         let free = out.textures_delta.free.drain().map(TexId::from).collect();
         let mut platform = out.platform_output;
         platform.events.clear();
-        pack(&Frame { file_dialog, ppp: out.pixels_per_point, textures, free, galleys: fresh, forget, shapes: ops, platform })
+        pack(&Frame {
+            file_dialog,
+            ppp: out.pixels_per_point,
+            textures,
+            free,
+            galleys: fresh,
+            forget,
+            shapes: ops,
+            platform,
+        })
     }
 }

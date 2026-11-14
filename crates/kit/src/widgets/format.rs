@@ -2,9 +2,18 @@ use super::*;
 
 /// Relative age of a Unix timestamp.
 pub fn age(time: u64) -> String {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     match now.saturating_sub(time) {
-        s @ 0..=59 => if s < 5 { "just now".into() } else { format!("{s} s ago") },
+        s @ 0..=59 => {
+            if s < 5 {
+                "just now".into()
+            } else {
+                format!("{s} s ago")
+            }
+        }
         s @ 60..=3599 => format!("{} min ago", s / 60),
         s @ 3600..=86399 => format!("{} h ago", s / 3600),
         s => format!("{} d ago", s / 86400),
@@ -40,7 +49,11 @@ pub fn qr_code(ui: &mut Ui, data: &str, size: f32) -> Response {
         if color == qrcode::Color::Dark {
             let (x, y) = ((i % n + quiet) as f32, (i / n + quiet) as f32);
             let min = rect.min + egui::vec2(x * cell, y * cell);
-            painter.rect_filled(Rect::from_min_size(min, egui::vec2(cell + 0.25, cell + 0.25)), 0., ink);
+            painter.rect_filled(
+                Rect::from_min_size(min, egui::vec2(cell + 0.25, cell + 0.25)),
+                0.,
+                ink,
+            );
         }
     }
     response
@@ -56,28 +69,50 @@ mod tests {
             ("Ready", 300., Some("Ready"), false),
             ("A long value that cannot fit", 60., None, true),
             ("A long value that cannot fit", 60., Some(""), false),
-            ("TUN", 300., Some("Routes apps through a virtual network interface"), true),
+            (
+                "TUN",
+                300.,
+                Some("Routes apps through a virtual network interface"),
+                true,
+            ),
         ] {
             let ctx = egui::Context::default();
             let mut target = None;
             let mut widget = None;
             for frame in 0..20 {
-                let events = if frame == 1 { vec![egui::Event::PointerMoved(target.unwrap())] } else { vec![] };
-                let out = ctx.run_ui(egui::RawInput {
-                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(400., 300.))),
-                    time: Some(frame as f64 * 0.1), events, ..Default::default()
-                }, |ui| {
-                    egui::CentralPanel::default().show(ui, |ui| {
-                        ui.allocate_ui_with_layout(vec2(width, CONTROL), Layout::top_down(Align::Min), |ui| {
-                            let response = truncated(ui, text, help);
-                            target = Some(response.rect.center());
-                            widget = Some(response.id);
+                let events = if frame == 1 {
+                    vec![egui::Event::PointerMoved(target.unwrap())]
+                } else {
+                    vec![]
+                };
+                let out = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(400., 300.))),
+                        time: Some(frame as f64 * 0.1),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            ui.allocate_ui_with_layout(
+                                vec2(width, CONTROL),
+                                Layout::top_down(Align::Min),
+                                |ui| {
+                                    let response = truncated(ui, text, help);
+                                    target = Some(response.rect.center());
+                                    widget = Some(response.id);
+                                },
+                            );
                         });
-                    });
-                });
+                    },
+                );
                 out.drop_without_applying_deltas();
             }
-            assert_eq!(egui::Tooltip::was_tooltip_open_last_frame(&ctx, widget.unwrap()), expected, "{text}: {help:?}");
+            assert_eq!(
+                egui::Tooltip::was_tooltip_open_last_frame(&ctx, widget.unwrap()),
+                expected,
+                "{text}: {help:?}"
+            );
         }
     }
 
@@ -85,20 +120,32 @@ mod tests {
     fn switch_works_with_keyboard_and_ignores_disabled_input() {
         let ctx = egui::Context::default();
         let mut value = false;
-        let key = || egui::Event::Key { key: egui::Key::Space, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        let key = || egui::Event::Key {
+            key: egui::Key::Space,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
         let mut draw = |events: Vec<egui::Event>, enabled: bool, focus: bool| {
             let mut changed = false;
-            let out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
-                egui::CentralPanel::default().show(ui, |ui| {
-                    ui.add_enabled_ui(enabled, |ui| {
-                        let response = toggle(ui, &mut value, "Auto select");
-                        if focus {
-                            response.request_focus();
-                        }
-                        changed = response.changed();
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        ui.add_enabled_ui(enabled, |ui| {
+                            let response = toggle(ui, &mut value, "Auto select");
+                            if focus {
+                                response.request_focus();
+                            }
+                            changed = response.changed();
+                        });
                     });
-                });
-            });
+                },
+            );
             out.drop_without_applying_deltas();
             (value, changed)
         };

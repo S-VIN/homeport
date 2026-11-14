@@ -1,7 +1,7 @@
 //! Geo rules, connections, configuration exchange and the tunnel with the real bundled mihomo.
 use plugin_inbounds::INBOUNDS;
-use plugin_routing::{Route, Rule, GEO};
-use rproxy_kernel::{list::Add, list::Save, Host, Id, Kernel};
+use plugin_routing::{GEO, Route, Rule};
+use rproxy_kernel::{Host, Id, Kernel, list::Add, list::Save};
 use std::{sync::Arc, time::Duration};
 
 async fn until(k: &Kernel, what: &str, secs: u64, ok: impl Fn(&Kernel) -> bool) {
@@ -31,7 +31,10 @@ async fn start(dir: &std::path::Path) -> Arc<Host> {
         .port();
     // The seeded listener starts off when its default port is taken (another rproxy).
     inbound.enabled = true;
-    k.cx_for("inbounds").call(Save(inbound)).await.unwrap();
+    k.cx_for("inbounds")
+        .call(Save::new(&INBOUNDS, inbound))
+        .await
+        .unwrap();
     host
 }
 
@@ -48,11 +51,14 @@ async fn geo_rules_download_and_unknown_lists_do_not_break_the_core() {
         "geosite:no-such-list-rproxy",
     ] {
         routing
-            .call(Add::new(Rule {
-                id: Id::random(),
-                pattern: pattern.into(),
-                action: Route::Direct,
-            }))
+            .call(Add::new(
+                &plugin_routing::RULES,
+                Rule {
+                    id: Id::random(),
+                    pattern: pattern.into(),
+                    action: Route::Direct,
+                },
+            ))
             .await
             .unwrap();
     }
@@ -63,11 +69,12 @@ async fn geo_rules_download_and_unknown_lists_do_not_break_the_core() {
             && g.get("geoip-ru").is_some_and(|s| s.rules > 100)
     })
     .await;
-    assert!(!k
-        .snapshot()
-        .live(&GEO)
-        .get("geosite-no-such-list-rproxy")
-        .is_some_and(|s| s.rules > 0));
+    assert!(
+        !k.snapshot()
+            .live(&GEO)
+            .get("geosite-no-such-list-rproxy")
+            .is_some_and(|s| s.rules > 0)
+    );
     k.cx_for("routing")
         .call(plugin_routing::UpdateGeo)
         .await
@@ -80,7 +87,7 @@ async fn geo_rules_download_and_unknown_lists_do_not_break_the_core() {
 }
 
 fn via(port: u16) -> reqwest::Client {
-    reqwest::Client::builder()
+    rproxy_kernel::mihomo::http()
         .no_proxy()
         .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).unwrap())
         .timeout(Duration::from_secs(15))
@@ -99,7 +106,9 @@ async fn warp_is_set_up_and_carries_traffic_as_the_exit() {
     // or none when the network reaches Cloudflare directly.
     if let Ok(upstream) = std::env::var("RPROXY_TEST_UPSTREAM") {
         let (host_, port) = upstream.rsplit_once(':').unwrap();
-        let doc = format!("proxies:\n  - {{name: Upstream, type: socks5, server: {host_}, port: {port}, udp: true}}");
+        let doc = format!(
+            "proxies:\n  - {{name: Upstream, type: socks5, server: {host_}, port: {port}, udp: true}}"
+        );
         let id = Id::random();
         let proxies = k
             .cx_for("subscriptions")
@@ -190,11 +199,14 @@ async fn connections_show_live_traffic_and_can_be_closed() {
     let _window = host.session(&rproxy_kernel::egui::Context::default());
     let k = host.kernel();
     k.cx_for("routing")
-        .call(Add::new(Rule {
-            id: Id::random(),
-            pattern: "*".into(),
-            action: Route::Direct,
-        }))
+        .call(Add::new(
+            &plugin_routing::RULES,
+            Rule {
+                id: Id::random(),
+                pattern: "*".into(),
+                action: Route::Direct,
+            },
+        ))
         .await
         .unwrap();
     let port = k.snapshot().get(&INBOUNDS)[0].port;
@@ -252,13 +264,16 @@ async fn configuration_round_trip_preserves_settings_without_automatic_backups()
         action: Route::Block,
     };
     k.cx_for("routing")
-        .call(Add::new(rule.clone()))
+        .call(Add::new(&plugin_routing::RULES, rule.clone()))
         .await
         .unwrap();
     let bytes = host.export_configuration().unwrap();
     let config = host.prepare_import("saved.sqlite3".into(), &bytes).unwrap();
     k.cx_for("routing")
-        .call(rproxy_kernel::list::Remove::<Rule>::new(rule.id))
+        .call(rproxy_kernel::list::Remove::new(
+            &plugin_routing::RULES,
+            rule.id,
+        ))
         .await
         .unwrap();
     assert!(k.snapshot().get(&plugin_routing::RULES).is_empty());
@@ -272,7 +287,10 @@ async fn configuration_round_trip_preserves_settings_without_automatic_backups()
             .collect::<Vec<_>>(),
         vec![rule.id]
     );
-    assert!(!dir.path().join("backups").exists(), "export/import must not create hidden copies");
+    assert!(
+        !dir.path().join("backups").exists(),
+        "export/import must not create hidden copies"
+    );
     assert!(k.core_status().running());
     host.shutdown().await;
 }
@@ -287,7 +305,10 @@ async fn the_tunnel_reports_when_it_cannot_start() {
     let host = start(dir.path()).await;
     let k = host.kernel();
     k.cx_for("inbounds")
-        .call(rproxy_kernel::Update { state: &plugin_inbounds::DEVICE, change: Box::new(|d| d.tun = true) })
+        .call(rproxy_kernel::Update {
+            state: &plugin_inbounds::DEVICE,
+            change: Box::new(|d| d.tun = true),
+        })
         .await
         .unwrap();
     assert!(k.core_status().running(), "the rest keeps working");

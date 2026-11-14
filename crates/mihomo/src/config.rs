@@ -2,7 +2,7 @@
 //! merges fragments deterministically and is the only place that knows mihomo's
 //! YAML/JSON shape.
 use ipnet::IpNet;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::{collections::BTreeSet, net::IpAddr};
 
 /// Where a connection goes.
@@ -42,7 +42,11 @@ pub enum Rule {
     DomainSuffix(String, Target),
     DomainKeyword(String, Target),
     DomainRegex(String, Target),
-    IpCidr { net: IpNet, target: Target, no_resolve: bool },
+    IpCidr {
+        net: IpNet,
+        target: Target,
+        no_resolve: bool,
+    },
     GeoIp(String, Target),
     InName(String, Target),
     /// Match a [`RuleProvider`] by name. IP sets resolve domains unless `no_resolve`.
@@ -60,8 +64,16 @@ impl Rule {
             Self::DomainSuffix(d, t) => format!("DOMAIN-SUFFIX,{d},{}", t.wire()),
             Self::DomainKeyword(d, t) => format!("DOMAIN-KEYWORD,{d},{}", t.wire()),
             Self::DomainRegex(r, t) => format!("DOMAIN-REGEX,{r},{}", t.wire()),
-            Self::IpCidr { net, target, no_resolve } => {
-                let kind = if net.addr().is_ipv4() { "IP-CIDR" } else { "IP-CIDR6" };
+            Self::IpCidr {
+                net,
+                target,
+                no_resolve,
+            } => {
+                let kind = if net.addr().is_ipv4() {
+                    "IP-CIDR"
+                } else {
+                    "IP-CIDR6"
+                };
                 let suffix = if *no_resolve { ",no-resolve" } else { "" };
                 format!("{kind},{net},{}{suffix}", target.wire())
             }
@@ -250,7 +262,12 @@ impl Config {
         let mut names = BTreeSet::new();
         let mut dns_owner: Option<&str> = None;
         for (order, (owner, f)) in fragments.into_iter().enumerate() {
-            for name in f.proxies.iter().map(|p| &p.name).chain(f.groups.iter().map(|g| &g.name)) {
+            for name in f
+                .proxies
+                .iter()
+                .map(|p| &p.name)
+                .chain(f.groups.iter().map(|g| &g.name))
+            {
                 if reserved(name, "test") {
                     return Err(format!("{owner}: proxy or group name {name} is reserved"));
                 }
@@ -285,7 +302,7 @@ impl Config {
                 match cfg.rule_providers.iter().find(|o| o.name == p.name) {
                     Some(o) if *o == p => {}
                     Some(_) => {
-                        return Err(format!("{owner}: rule set {} is defined twice", p.name))
+                        return Err(format!("{owner}: rule set {} is defined twice", p.name));
                     }
                     None => cfg.rule_providers.push(p),
                 }
@@ -296,8 +313,15 @@ impl Config {
                 if reserved(&l.name, "checks") || l.name == ROUTED {
                     return Err(format!("{owner}: listener name {} is reserved", l.name));
                 }
-                if let Some(other) = cfg.listeners.iter().find(|o| o.port == l.port && overlaps(o.listen, l.listen)) {
-                    return Err(format!("{owner}: port {} is already used by listener {}", l.port, other.name));
+                if let Some(other) = cfg
+                    .listeners
+                    .iter()
+                    .find(|o| o.port == l.port && overlaps(o.listen, l.listen))
+                {
+                    return Err(format!(
+                        "{owner}: port {} is already used by listener {}",
+                        l.port, other.name
+                    ));
                 }
                 cfg.listeners.push(l);
             }
@@ -327,13 +351,20 @@ impl Config {
             if let Some(via) = p.options.get("dialer-proxy") {
                 let via = via.as_str().unwrap_or_default();
                 if via == p.name || !known(&Target::Group(via.to_owned())) {
-                    return Err(format!("Proxy {} is dialed through an unknown proxy {via}", p.name));
+                    return Err(format!(
+                        "Proxy {} is dialed through an unknown proxy {via}",
+                        p.name
+                    ));
                 }
             }
         }
         for g in &cfg.groups {
             if let Some(m) = g.members.iter().find(|m| !known(m)) {
-                return Err(format!("Group {} references an unknown member {}", g.name, m.wire()));
+                return Err(format!(
+                    "Group {} references an unknown member {}",
+                    g.name,
+                    m.wire()
+                ));
             }
         }
         Ok(cfg)
@@ -354,8 +385,12 @@ impl Config {
 
 /// Names of the kernel's check lanes: `test`/`test-N` groups, `checks`/`checks-N` listeners.
 fn reserved(name: &str, prefix: &str) -> bool {
-    name.strip_prefix(prefix)
-        .is_some_and(|rest| rest.is_empty() || rest.strip_prefix('-').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
+    name.strip_prefix(prefix).is_some_and(|rest| {
+        rest.is_empty()
+            || rest
+                .strip_prefix('-')
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    })
 }
 
 pub fn overlaps(a: IpAddr, b: IpAddr) -> bool {
@@ -395,7 +430,12 @@ pub fn render(cfg: &Config, sys: &System<'_>, listeners: &[&Listener]) -> Value 
         let mut choices = Vec::new();
         if *kind == GroupKind::Select {
             // The first member is mihomo's default after a reload; keep the selection there.
-            choices.push(selected.as_ref().map(Target::wire).unwrap_or_else(|| "REJECT".into()));
+            choices.push(
+                selected
+                    .as_ref()
+                    .map(Target::wire)
+                    .unwrap_or_else(|| "REJECT".into()),
+            );
             if selected.is_some() {
                 choices.push("REJECT".into());
             }
@@ -435,12 +475,21 @@ pub fn render(cfg: &Config, sys: &System<'_>, listeners: &[&Listener]) -> Value 
         .iter()
         .map(|g| group(&g.name, &g.kind, &g.members, &g.selected))
         .collect();
-    let all: Vec<Target> = cfg.proxies.iter().map(|p| Target::Proxy(p.name.clone())).collect();
+    let all: Vec<Target> = cfg
+        .proxies
+        .iter()
+        .map(|p| Target::Proxy(p.name.clone()))
+        .collect();
     let mut ls = Vec::new();
     let mut rules = Vec::new();
     for (lane, port) in sys.check_ports.iter().enumerate() {
         let target = sys.check_targets.get(lane).cloned().flatten();
-        groups.push(group(&format!("test-{lane}"), &GroupKind::Select, &all, &target));
+        groups.push(group(
+            &format!("test-{lane}"),
+            &GroupKind::Select,
+            &all,
+            &target,
+        ));
         ls.push(json!({"name": format!("checks-{lane}"), "type": "socks", "listen": "127.0.0.1", "port": port,
             "users": [{"username": "check", "password": sys.check_password}]}));
         rules.push(format!("IN-NAME,checks-{lane},test-{lane}"));
@@ -464,7 +513,10 @@ pub fn render(cfg: &Config, sys: &System<'_>, listeners: &[&Listener]) -> Value 
         let mut v = json!({"name": l.name, "type": kind, "listen": l.listen.to_string(), "port": l.port, "udp": l.udp});
         if !l.users.is_empty() {
             v["users"] = Value::Array(
-                l.users.iter().map(|(u, p)| json!({"username": u, "password": p})).collect(),
+                l.users
+                    .iter()
+                    .map(|(u, p)| json!({"username": u, "password": p}))
+                    .collect(),
             );
         }
         ls.push(v);
@@ -562,17 +614,32 @@ mod tests {
     #[test]
     fn stages_order_rules_and_reject_conflicts() {
         let a = Fragment {
-            groups: vec![Group { name: "main".into(), kind: GroupKind::Select, members: vec![], selected: None }],
+            groups: vec![Group {
+                name: "main".into(),
+                kind: GroupKind::Select,
+                members: vec![],
+                selected: None,
+            }],
             rules: vec![(Stage::Final, Rule::Match(Target::Group("main".into())))],
             ..Default::default()
         };
-        let b = Fragment::rules(Stage::User, [Rule::Domain("example.com".into(), Target::Direct)]);
+        let b = Fragment::rules(
+            Stage::User,
+            [Rule::Domain("example.com".into(), Target::Direct)],
+        );
         let cfg = Config::compose([("servers", a.clone()), ("routing", b)]).unwrap();
         assert_eq!(cfg.rules.len(), 2);
         assert!(matches!(cfg.rules[0], Rule::Domain(..)));
         assert!(Config::compose([("x", a.clone()), ("y", a)]).is_err());
-        let l = Listener { name: "a".into(), kind: ListenerKind::Mixed, listen: "0.0.0.0".parse().unwrap(),
-            port: 1, udp: true, users: vec![], optional: true };
+        let l = Listener {
+            name: "a".into(),
+            kind: ListenerKind::Mixed,
+            listen: "0.0.0.0".parse().unwrap(),
+            port: 1,
+            udp: true,
+            users: vec![],
+            optional: true,
+        };
         let mut l2 = l.clone();
         l2.name = "b".into();
         l2.listen = "127.0.0.1".parse().unwrap();
@@ -580,7 +647,13 @@ mod tests {
     }
 
     fn proxy(name: &str) -> Proxy {
-        Proxy { name: name.into(), protocol: "http".into(), server: "127.0.0.1".into(), port: 1, options: Map::new() }
+        Proxy {
+            name: name.into(),
+            protocol: "http".into(),
+            server: "127.0.0.1".into(),
+            port: 1,
+            options: Map::new(),
+        }
     }
 
     #[test]
@@ -590,7 +663,10 @@ mod tests {
             proxies: vec![proxy("a"), proxy("b")],
             groups: vec![Group {
                 name: "main".into(),
-                kind: GroupKind::Fallback { url: "http://x/".into(), interval_secs: 30 },
+                kind: GroupKind::Fallback {
+                    url: "http://x/".into(),
+                    interval_secs: 30,
+                },
                 members: members.clone(),
                 selected: Some(Target::Proxy("a".into())),
             }],
@@ -611,12 +687,22 @@ mod tests {
         // A select group still starts with the selection, then REJECT.
         let mut select = cfg.clone();
         select.groups[0].kind = GroupKind::Select;
-        assert_eq!(render(&select, &sys, &[])["proxy-groups"][0]["proxies"], json!(["a", "REJECT", "b"]));
+        assert_eq!(
+            render(&select, &sys, &[])["proxy-groups"][0]["proxies"],
+            json!(["a", "REJECT", "b"])
+        );
     }
 
     #[test]
     fn check_lanes_have_own_listener_group_and_rule() {
-        let cfg = Config::compose([("servers", Fragment { proxies: vec![proxy("a"), proxy("b")], ..Default::default() })]).unwrap();
+        let cfg = Config::compose([(
+            "servers",
+            Fragment {
+                proxies: vec![proxy("a"), proxy("b")],
+                ..Default::default()
+            },
+        )])
+        .unwrap();
         let targets = [None, Some(Target::Proxy("b".into()))];
         let sys = System {
             controller: &json!({"external-controller-unix": "/s"}),
@@ -632,18 +718,37 @@ mod tests {
         assert_eq!(groups[1]["proxies"], json!(["b", "REJECT", "a"]));
         assert_eq!(doc["listeners"][1]["name"], "checks-1");
         assert_eq!(doc["listeners"][1]["port"], 1002);
-        assert_eq!(doc["rules"], json!(["IN-NAME,checks-0,test-0", "IN-NAME,checks-1,test-1", "MATCH,REJECT"]));
+        assert_eq!(
+            doc["rules"],
+            json!([
+                "IN-NAME,checks-0,test-0",
+                "IN-NAME,checks-1,test-1",
+                "MATCH,REJECT"
+            ])
+        );
         // Lane names are reserved; similar names are not.
         let group = |name: &str| Fragment {
-            groups: vec![Group { name: name.into(), kind: GroupKind::Select, members: vec![], selected: None }],
+            groups: vec![Group {
+                name: name.into(),
+                kind: GroupKind::Select,
+                members: vec![],
+                selected: None,
+            }],
             ..Default::default()
         };
         for name in ["test", "test-3"] {
             assert!(Config::compose([("x", group(name))]).is_err(), "{name}");
         }
         assert!(Config::compose([("x", group("tests"))]).is_ok());
-        let l = Listener { name: "checks-2".into(), kind: ListenerKind::Mixed, listen: "127.0.0.1".parse().unwrap(),
-            port: 1, udp: true, users: vec![], optional: true };
+        let l = Listener {
+            name: "checks-2".into(),
+            kind: ListenerKind::Mixed,
+            listen: "127.0.0.1".parse().unwrap(),
+            port: 1,
+            udp: true,
+            users: vec![],
+            optional: true,
+        };
         assert!(Config::compose([("x", Fragment::listeners([l]))]).is_err());
     }
 }

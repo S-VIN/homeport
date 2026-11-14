@@ -3,7 +3,7 @@
 use plugin_servers::Proxy;
 use plugin_subscriptions::Parse;
 use rproxy_kernel::prelude::*;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 pub static PLUGIN: Plugin = Plugin {
     id: "format-xray",
@@ -11,25 +11,30 @@ pub static PLUGIN: Plugin = Plugin {
     description: "Xray client profiles: VLESS, Shadowsocks and Hysteria 2 outbounds with their transports.",
     category: categories::FORMATS,
     requires: &["subscriptions"],
-    required: false,
-    default_enabled: true,
-    platforms: Platform::ALL,
     setup,
+    ..Plugin::DEFAULT
 };
 
 fn setup(p: &mut Setup) -> Result<()> {
     p.handle(|_: Cx, op: Parse| async move { parse(&op.body) })
         .claim(|_, op| {
             let b = op.body.trim_start_matches('\u{feff}').trim_start();
-            ((b.starts_with('{') || b.starts_with('[')) && (b.contains("outbounds") || b.contains("\"protocol\""))).then_some(Claim::content(70))
+            ((b.starts_with('{') || b.starts_with('['))
+                && (b.contains("outbounds") || b.contains("\"protocol\"")))
+            .then_some(Claim::content(70))
         });
     Ok(())
 }
 
 /// Parse an Xray document (one profile or a list of profiles).
 pub fn parse(body: &str) -> Result<Vec<Proxy>> {
-    let doc: Value = serde_json::from_str(body.trim_start_matches('\u{feff}')).map_err(|_| invalid("Invalid Xray JSON."))?;
-    profiles(&doc)?.into_iter().enumerate().map(|(i, v)| Proxy::from_value(v, i + 1)).collect()
+    let doc: Value = serde_json::from_str(body.trim_start_matches('\u{feff}'))
+        .map_err(|_| invalid("Invalid Xray JSON."))?;
+    profiles(&doc)?
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| Proxy::from_value(v, i + 1))
+        .collect()
 }
 
 fn invalid(m: impl Into<String>) -> Error {

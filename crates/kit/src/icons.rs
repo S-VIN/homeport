@@ -112,7 +112,10 @@ impl Icon {
 
 /// Font of an icon glyph at `size`.
 pub fn font(size: f32, filled: bool) -> FontId {
-    FontId::new(size, FontFamily::Name(if filled { FILL } else { REGULAR }.into()))
+    FontId::new(
+        size,
+        FontFamily::Name(if filled { FILL } else { REGULAR }.into()),
+    )
 }
 
 /// Paint `icon` centered on `at` at the default size.

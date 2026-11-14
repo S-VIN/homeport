@@ -1,7 +1,7 @@
 //! The mihomo core as a kernel service. Plugins describe configuration with
 //! [`Setup::core`](crate::Setup::core) fragments; the kernel composes and applies
 //! them on every commit. Imperative access goes through [`CoreApi`].
-use crate::{changes::Changes, mihomo, setup::Registry, Error, Result, Snapshot};
+use crate::{Error, Result, Snapshot, changes::Changes, mihomo, setup::Registry};
 use mihomo::{Config, Mihomo, Target};
 use std::{
     collections::BTreeMap,
@@ -48,7 +48,12 @@ pub(crate) struct Core {
 }
 
 pub(crate) fn compose(reg: &Registry, snap: &Snapshot) -> Result<Config> {
-    Config::compose(reg.fragments.iter().map(|(p, f)| (reg.plugins[*p].id, f(snap)))).map_err(Error::msg)
+    Config::compose(
+        reg.fragments
+            .iter()
+            .map(|(p, f)| (reg.plugins[*p].id, f(snap))),
+    )
+    .map_err(Error::msg)
 }
 
 impl Core {
@@ -114,7 +119,9 @@ impl Core {
     pub async fn sync(&self, reg: &Registry, snap: &Snapshot) -> Result<()> {
         let cfg = compose(reg, snap)?;
         let mut proc = self.proc.lock().await;
-        let Some(m) = proc.as_mut() else { return Ok(()) };
+        let Some(m) = proc.as_mut() else {
+            return Ok(());
+        };
         if m.applied() == Some(&cfg) {
             return Ok(());
         }
@@ -129,7 +136,9 @@ impl Core {
         if proc.as_mut().is_some_and(|m| !m.alive()) {
             *proc = None;
             self.set(|s| {
-                s.state = CoreState::Failed("Mihomo stopped. Restart the core to restore the saved configuration.".into());
+                s.state = CoreState::Failed(
+                    "Mihomo stopped. Restart the core to restore the saved configuration.".into(),
+                );
                 s.listener_errors.clear();
             });
         }
@@ -146,14 +155,24 @@ impl Core {
             self.set(|s| s.state = CoreState::Starting);
         }
     }
-    async fn with<R>(&self, f: impl AsyncFnOnce(&mut Mihomo) -> mihomo::process::Result<R>) -> Result<R> {
+    async fn with<R>(
+        &self,
+        f: impl AsyncFnOnce(&mut Mihomo) -> mihomo::process::Result<R>,
+    ) -> Result<R> {
         let mut proc = self.proc.lock().await;
-        let m = proc.as_mut().ok_or_else(|| Error::msg("Mihomo is offline."))?;
+        let m = proc
+            .as_mut()
+            .ok_or_else(|| Error::msg("Mihomo is offline."))?;
         f(m).await.map_err(Error::msg)
     }
     /// Controller handle for requests that must not hold the process lock.
     async fn controller(&self) -> Result<mihomo::Controller> {
-        self.proc.lock().await.as_ref().map(Mihomo::controller).ok_or_else(|| Error::msg("Mihomo is offline."))
+        self.proc
+            .lock()
+            .await
+            .as_ref()
+            .map(Mihomo::controller)
+            .ok_or_else(|| Error::msg("Mihomo is offline."))
     }
 }
 
@@ -214,11 +233,28 @@ impl CoreApi {
     /// Route a free check lane to `target` until the lease is released
     /// (waits while every lane is in use).
     pub async fn lease(&self, target: Target) -> Result<Lease> {
-        let permit = self.core.lanes.clone().acquire_owned().await.map_err(|_| Error::msg("Mihomo is stopping."))?;
-        let lane = self.core.free.lock().unwrap().pop().expect("a free lane for every permit");
+        let permit = self
+            .core
+            .lanes
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::msg("Mihomo is stopping."))?;
+        let lane = self
+            .core
+            .free
+            .lock()
+            .unwrap()
+            .pop()
+            .expect("a free lane for every permit");
         // From here on the lease owns the lane: dropping it (an error, or the
         // caller giving up while routing) resets and returns the lane.
-        let mut lease = Lease { core: self.core.clone(), http: reqwest::Client::new(), lane, permit: Some(permit) };
+        let mut lease = Lease {
+            core: self.core.clone(),
+            http: crate::mihomo::http().build().expect("an HTTP client"),
+            lane,
+            permit: Some(permit),
+        };
         lease.http = self
             .core
             .with(async move |m| {
@@ -238,25 +274,61 @@ impl CoreApi {
     }
     /// Delay test of a proxy or group run by mihomo itself (no lease needed, any
     /// number in parallel). `expected` uses mihomo's status syntax, e.g. `200-299`.
-    pub async fn probe(&self, proxy: &str, url: &str, timeout_ms: u32, expected: Option<&str>) -> Result<mihomo::Delay> {
-        self.core.controller().await?.delay(proxy, url, timeout_ms, expected).await.map_err(Error::msg)
+    pub async fn probe(
+        &self,
+        proxy: &str,
+        url: &str,
+        timeout_ms: u32,
+        expected: Option<&str>,
+    ) -> Result<mihomo::Delay> {
+        self.core
+            .controller()
+            .await?
+            .delay(proxy, url, timeout_ms, expected)
+            .await
+            .map_err(Error::msg)
     }
     /// The member a group currently carries traffic through (`None` when unknown).
     pub async fn group_now(&self, group: &str) -> Result<Option<String>> {
-        self.core.controller().await?.group_now(group).await.map_err(Error::msg)
+        self.core
+            .controller()
+            .await?
+            .group_now(group)
+            .await
+            .map_err(Error::msg)
     }
     /// `GET /connections` as returned by mihomo.
     pub async fn connections(&self) -> Result<serde_json::Value> {
-        self.core.controller().await?.connections().await.map_err(Error::msg)
+        self.core
+            .controller()
+            .await?
+            .connections()
+            .await
+            .map_err(Error::msg)
     }
     pub async fn close_connection(&self, id: &str) -> Result<()> {
-        self.core.controller().await?.close_connection(id).await.map_err(Error::msg)
+        self.core
+            .controller()
+            .await?
+            .close_connection(id)
+            .await
+            .map_err(Error::msg)
     }
     pub async fn close_all(&self) -> Result<()> {
-        self.core.controller().await?.close_all().await.map_err(Error::msg)
+        self.core
+            .controller()
+            .await?
+            .close_all()
+            .await
+            .map_err(Error::msg)
     }
     pub async fn version(&self) -> Result<String> {
-        self.core.controller().await?.version().await.map_err(Error::msg)
+        self.core
+            .controller()
+            .await?
+            .version()
+            .await
+            .map_err(Error::msg)
     }
     /// HTTP client whose requests follow the ordinary rules, like user traffic
     /// (for downloads that may be blocked on the direct path).
@@ -270,7 +342,7 @@ impl CoreApi {
         F: Fn(reqwest::Client) -> Fut,
         Fut: std::future::Future<Output = reqwest::Result<reqwest::Response>>,
     {
-        let direct = reqwest::Client::builder()
+        let direct = crate::mihomo::http()
             .no_proxy()
             .connect_timeout(std::time::Duration::from_secs(5))
             .build()
@@ -279,11 +351,18 @@ impl CoreApi {
             Ok(r) => return Ok(r),
             Err(e) => e,
         };
-        let routed = self.routed_http().await.map_err(|_| Error::msg(format!("Cannot reach {what}: {direct_error}")))?;
+        let routed = self
+            .routed_http()
+            .await
+            .map_err(|_| Error::msg(format!("Cannot reach {what}: {direct_error}")))?;
         send(routed)
             .await
             .and_then(|r| r.error_for_status())
-            .map_err(|e| Error::msg(format!("Cannot reach {what} directly or through the selected server: {e}")))
+            .map_err(|e| {
+                Error::msg(format!(
+                    "Cannot reach {what} directly or through the selected server: {e}"
+                ))
+            })
     }
     /// Rule sets known to the core: `{name: {ruleCount, updatedAt, …}}`.
     pub async fn rule_providers(&self) -> Result<serde_json::Value> {

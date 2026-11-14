@@ -23,11 +23,9 @@ pub static PLUGIN: Plugin = Plugin {
     name: "Servers",
     description: "Server catalog, manual connection and the main route.",
     category: categories::SERVERS,
-    requires: &[],
     required: true,
-    default_enabled: true,
-    platforms: Platform::ALL,
     setup,
+    ..Plugin::DEFAULT
 };
 
 choices!(pub enum Protocol {
@@ -87,7 +85,11 @@ pub fn main_target() -> Target {
 pub static ROUTE: Hook<(), Option<Target>> = Hook::new("servers.route");
 /// The target for traffic sent via the server (see [`ROUTE`]).
 pub fn route(snap: &Snapshot) -> Target {
-    snap.hooks(&ROUTE, &()).into_iter().flatten().next().unwrap_or_else(main_target)
+    snap.hooks(&ROUTE, &())
+        .into_iter()
+        .flatten()
+        .next()
+        .unwrap_or_else(main_target)
 }
 
 // ---- ops ------------------------------------------------------------------
@@ -129,7 +131,10 @@ impl Select {
     }
     /// An automatic switch away from `from`.
     pub fn auto(id: Option<Id>, from: Option<Id>) -> Self {
-        Self { id, auto: Some(from) }
+        Self {
+            id,
+            auto: Some(from),
+        }
     }
 }
 impl Op for Select {
@@ -149,7 +154,10 @@ async fn replace_source(cx: Cx, op: ReplaceFromSource) -> Result<Replaced> {
     }
     cx.write(move |w| {
         if !op.still_current.is_none_or(|check| check(w)) {
-            return Err(Error::new("cancelled", "Subscription changed while loading"));
+            return Err(Error::new(
+                "cancelled",
+                "Subscription changed while loading",
+            ));
         }
         let before: Vec<Id> = w
             .get(&SERVERS)
@@ -174,7 +182,12 @@ async fn replace_source(cx: Cx, op: ReplaceFromSource) -> Result<Replaced> {
         let current = *w.get(&SELECTED);
         let successor = current
             .filter(|id| !ids.contains(id))
-            .and_then(|id| w.get(&SERVERS).iter().find(|s| s.id == id && s.source == op.source).cloned())
+            .and_then(|id| {
+                w.get(&SERVERS)
+                    .iter()
+                    .find(|s| s.id == id && s.source == op.source)
+                    .cloned()
+            })
             .and_then(|old| successor(&old, &fresh));
         w.update(&SERVERS, |list| {
             list.retain(|s| s.source != op.source);
@@ -340,6 +353,7 @@ pub static TOOLBAR: Slot<()> =
 /// Full-width blocks under the toolbar (editors opened from the toolbar).
 pub static TOOLS: Slot<()> = Slot::new("servers.tools", "Servers page: blocks under the toolbar");
 /// Fixed-width cells on the right of every row. Draw a caption when `header`.
+/// Fill it through [`column`].
 pub static COLUMNS: Slot<Cell> =
     Slot::new("servers.columns", "Servers rows: extra fixed-width columns");
 /// Sections in an expanded server row.
@@ -353,13 +367,50 @@ pub static CONNECTION: Slot<Server> = Slot::new(
 
 /// What a column contribution draws: a caption (`server == None`) or a cell.
 pub struct Cell {
-    pub server: Option<Server>,
-    pub wide: bool,
+    /// `None` in the header row.
+    pub(crate) server: Option<Server>,
+    pub(crate) wide: bool,
+}
+
+/// An extra column of the server list (see [`column`]).
+pub struct Column {
+    /// Unique within the plugin.
+    pub id: &'static str,
+    /// Lower is further left.
+    pub order: i32,
+    pub title: &'static str,
+    /// Tooltip of the title.
+    pub help: &'static str,
+    /// Hidden when the list is narrow (a phone): only the most useful columns stay.
+    pub secondary: bool,
+}
+/// Add a column to the server list: `cell` draws one server's value. The list
+/// draws the title, keeps the columns aligned and drops secondary ones on
+/// narrow screens.
+pub fn column(
+    p: &mut Setup,
+    c: Column,
+    cell: impl Fn(&mut egui::Ui, &mut UiCx, &Server) + Send + Sync + 'static,
+) {
+    p.fill(&COLUMNS, c.id, c.order, move |ui, cx, props: &Cell| {
+        if c.secondary && !props.wide {
+            return;
+        }
+        kit::cell_right(ui, 60., |ui| match &props.server {
+            None => drop(kit::caption(ui, c.title).on_hover_text(c.help)),
+            Some(s) => cell(ui, cx, s),
+        });
+    });
 }
 
 fn setup(p: &mut Setup) -> Result<()> {
     p.collection(&SERVERS);
-    p.persist(&DEFINITIONS, outbound::register, outbound::read, outbound::sync);
+    p.persist(
+        &DEFINITIONS,
+        outbound::register,
+        outbound::read,
+        outbound::sync,
+    );
     p.setting(&SELECTED);
 
     p.handle(replace_source);
@@ -368,33 +419,49 @@ fn setup(p: &mut Setup) -> Result<()> {
     // A filter that excludes the connected server disconnects it.
     p.on(|cx: Cx, _: Changed| async move {
         let snap = cx.snapshot();
-        if let Some(s) = selected(&snap) {
-            if let Some(e) = exclusion(&snap, &s).filter(|e| e.disconnect) {
-                cx.call(Select::auto(None, Some(s.id))).await?;
-                cx.notify(&format!("Disconnected {}: {}", s.name, e.reason));
-                cx.emit(Excluded { server: s, reason: e.reason });
-            }
+        if let Some(s) = selected(&snap)
+            && let Some(e) = exclusion(&snap, &s).filter(|e| e.disconnect)
+        {
+            cx.call(Select::auto(None, Some(s.id))).await?;
+            cx.notify(&format!("Disconnected {}: {}", s.name, e.reason));
+            cx.emit(Excluded {
+                server: s,
+                reason: e.reason,
+            });
         }
         Ok(())
     });
     p.core(fragment);
-    p.hook(&rproxy_kernel::shell::TRAY, |snap, _| snap.get(&SELECTED).map(|_| TrayLink::Connected));
+    p.hook(&rproxy_kernel::shell::TRAY, |snap, _| {
+        snap.get(&SELECTED).map(|_| TrayLink::Connected)
+    });
     ui::register(p);
     Ok(())
 }
 
 async fn remove_source(cx: Cx, RemoveSource(source): RemoveSource) -> Result<()> {
     cx.write(move |w| {
-        let removed: Vec<Id> = w.get(&SERVERS).iter().filter(|s| s.source == source).map(|s| s.id).collect();
+        let removed: Vec<Id> = w
+            .get(&SERVERS)
+            .iter()
+            .filter(|s| s.source == source)
+            .map(|s| s.id)
+            .collect();
         if removed.is_empty() {
             return Ok(());
         }
         w.update(&SERVERS, |l| l.retain(|s| s.source != source));
-        w.update(&DEFINITIONS, |d| Arc::make_mut(d).retain(|id, _| !removed.contains(id)));
+        w.update(&DEFINITIONS, |d| {
+            Arc::make_mut(d).retain(|id, _| !removed.contains(id))
+        });
         if w.get(&SELECTED).is_some_and(|id| removed.contains(&id)) {
             w.set(&SELECTED, None);
         }
-        w.emit(ServersChanged { source, added: vec![], removed });
+        w.emit(ServersChanged {
+            source,
+            added: vec![],
+            removed,
+        });
         Ok(())
     })
     .await
@@ -423,7 +490,11 @@ async fn select(cx: Cx, op: Select) -> Result<()> {
         }
         if from != op.id {
             w.set(&SELECTED, op.id);
-            w.emit(SelectionChanged { from, to: op.id, auto: op.auto.is_some() });
+            w.emit(SelectionChanged {
+                from,
+                to: op.id,
+                auto: op.auto.is_some(),
+            });
         }
         Ok(())
     })
@@ -448,10 +519,20 @@ fn fragment(snap: &Snapshot) -> Fragment {
             })
         })
         .collect();
-    let known: HashSet<Id> = servers.iter().filter(|s| defs.contains_key(&s.id)).map(|s| s.id).collect();
+    let known: HashSet<Id> = servers
+        .iter()
+        .filter(|s| defs.contains_key(&s.id))
+        .map(|s| s.id)
+        .collect();
     let selected = (*snap.get(&SELECTED)).filter(|id| known.contains(id));
     let failover = selected
-        .and_then(|id| snap.hooks(&FAILOVER, &id).into_iter().flatten().next().map(|f| (id, f)))
+        .and_then(|id| {
+            snap.hooks(&FAILOVER, &id)
+                .into_iter()
+                .flatten()
+                .next()
+                .map(|f| (id, f))
+        })
         .map(|(id, mut f)| {
             let mut seen = HashSet::from([id]);
             f.backups.retain(|b| known.contains(b) && seen.insert(*b));
@@ -461,14 +542,23 @@ fn fragment(snap: &Snapshot) -> Fragment {
     let main = match failover {
         Some((id, f)) => mihomo::Group {
             name: MAIN.into(),
-            kind: mihomo::GroupKind::Fallback { url: f.url, interval_secs: f.interval_secs },
-            members: std::iter::once(id).chain(f.backups).map(|id| Target::Proxy(id.to_string())).collect(),
+            kind: mihomo::GroupKind::Fallback {
+                url: f.url,
+                interval_secs: f.interval_secs,
+            },
+            members: std::iter::once(id)
+                .chain(f.backups)
+                .map(|id| Target::Proxy(id.to_string()))
+                .collect(),
             selected: Some(Target::Proxy(id.to_string())),
         },
         None => mihomo::Group {
             name: MAIN.into(),
             kind: mihomo::GroupKind::Select,
-            members: proxies.iter().map(|p| Target::Proxy(p.name.clone())).collect(),
+            members: proxies
+                .iter()
+                .map(|p| Target::Proxy(p.name.clone()))
+                .collect(),
             selected: selected.map(|id| Target::Proxy(id.to_string())),
         },
     };
@@ -483,7 +573,11 @@ fn fragment(snap: &Snapshot) -> Fragment {
 /// The refreshed server that replaces `old`: same name (preferring the same
 /// endpoint), else the same protocol, address and port.
 fn successor(old: &Server, fresh: &[Server]) -> Option<Id> {
-    let endpoint = |s: &Server| s.protocol == old.protocol && s.address.eq_ignore_ascii_case(&old.address) && s.port == old.port;
+    let endpoint = |s: &Server| {
+        s.protocol == old.protocol
+            && s.address.eq_ignore_ascii_case(&old.address)
+            && s.port == old.port
+    };
     let named: Vec<&Server> = fresh.iter().filter(|s| s.name == old.name).collect();
     named
         .iter()
@@ -559,16 +653,35 @@ mod tests {
     use super::natural_key;
     #[test]
     fn a_refreshed_server_keeps_its_connection() {
-        use super::{successor, Id, Protocol, Server};
+        use super::{Id, Protocol, Server, successor};
         let source = Id::random();
-        let server = |name: &str, address: &str, port: u16| Server { id: Id::random(), source, name: name.into(), protocol: Protocol::Vless, address: address.into(), port };
+        let server = |name: &str, address: &str, port: u16| Server {
+            id: Id::random(),
+            source,
+            name: name.into(),
+            protocol: Protocol::Vless,
+            address: address.into(),
+            port,
+        };
         let old = server("Berlin", "a.example", 443);
         let renamed = server("Berlin 2", "A.example", 443);
         let moved = server("Berlin", "b.example", 8443);
         let twin = server("Berlin", "a.example", 443);
-        assert_eq!(successor(&old, &[renamed.clone(), moved.clone()]), Some(moved.id), "same name first");
-        assert_eq!(successor(&old, &[moved.clone(), twin.clone()]), Some(twin.id), "same name and endpoint best");
-        assert_eq!(successor(&old, std::slice::from_ref(&renamed)), Some(renamed.id), "else the same endpoint");
+        assert_eq!(
+            successor(&old, &[renamed.clone(), moved.clone()]),
+            Some(moved.id),
+            "same name first"
+        );
+        assert_eq!(
+            successor(&old, &[moved.clone(), twin.clone()]),
+            Some(twin.id),
+            "same name and endpoint best"
+        );
+        assert_eq!(
+            successor(&old, std::slice::from_ref(&renamed)),
+            Some(renamed.id),
+            "else the same endpoint"
+        );
         assert_eq!(successor(&old, &[server("Paris", "c.example", 443)]), None);
     }
     #[test]

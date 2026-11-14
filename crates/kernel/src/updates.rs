@@ -6,7 +6,7 @@
 //! the direct path first and then the ordinary route (the selected server), are
 //! checked against the SHA-256 digest GitHub publishes for the asset, and the new
 //! binary must report the expected version before it replaces anything.
-use crate::{jobs::Task, Error, Kernel, Result};
+use crate::{Error, Kernel, Result, jobs::Task};
 use std::{path::Path, sync::Arc, time::Duration};
 
 const LATEST: &str = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest";
@@ -52,7 +52,10 @@ impl Kernel {
     pub fn core_updates(&self) -> CoreUpdates {
         // Read from disk: an app update can bring a newer bundled core, and a
         // broken update is removed when it fails to start.
-        CoreUpdates { installed: self.installed_core().is_some(), ..self.updates.lock().unwrap().clone() }
+        CoreUpdates {
+            installed: self.installed_core().is_some(),
+            ..self.updates.lock().unwrap().clone()
+        }
     }
     /// The installed update's executable, if it is used instead of the bundled core.
     pub fn installed_core(&self) -> Option<std::path::PathBuf> {
@@ -66,15 +69,30 @@ impl Kernel {
             crate::bail!("Granting access is only needed on macOS.");
         }
         let home = self.core.home.clone();
-        let script = rproxy_mihomo::grant_tun_script(&rproxy_mihomo::unprivileged(&home), &rproxy_mihomo::privileged(&home));
-        let out = tokio::task::spawn_blocking(move || std::process::Command::new("osascript").arg("-e").arg(script).output())
-            .await
-            .map_err(|e| Error::msg(e.to_string()))?
-            .map_err(|e| Error::msg(format!("Cannot ask for administrator rights: {e}")))?;
+        let script = rproxy_mihomo::grant_tun_script(
+            &rproxy_mihomo::unprivileged(&home),
+            &rproxy_mihomo::privileged(&home),
+        );
+        let out = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(script)
+                .output()
+        })
+        .await
+        .map_err(|e| Error::msg(e.to_string()))?
+        .map_err(|e| Error::msg(format!("Cannot ask for administrator rights: {e}")))?;
         if !out.status.success() {
             // -128: the user cancelled the password dialog.
             let text = String::from_utf8_lossy(&out.stderr);
-            crate::bail!("{}", if text.contains("-128") { "Access was not granted.".to_owned() } else { format!("Could not grant access: {}", text.trim()) });
+            crate::bail!(
+                "{}",
+                if text.contains("-128") {
+                    "Access was not granted.".to_owned()
+                } else {
+                    format!("Could not grant access: {}", text.trim())
+                }
+            );
         }
         self.restart_core().await
     }
@@ -90,7 +108,14 @@ impl Kernel {
 
     /// GET from GitHub, directly or through the ordinary route.
     async fn fetch(&self, url: &str, timeout: Duration) -> Result<reqwest::Response> {
-        self.core_api().direct_or_routed("GitHub", |c| c.get(url).header(reqwest::header::USER_AGENT, "rproxy").timeout(timeout).send()).await
+        self.core_api()
+            .direct_or_routed("GitHub", |c| {
+                c.get(url)
+                    .header(reqwest::header::USER_AGENT, "rproxy")
+                    .timeout(timeout)
+                    .send()
+            })
+            .await
     }
 
     async fn latest_release(&self) -> Result<Release> {
@@ -192,8 +217,8 @@ impl Kernel {
                     std::fs::rename(target.with_extension("download"), &target)?;
                     std::fs::write(rproxy_mihomo::installed_version_file(&home), &r.version)
                 })
-                    .await
-                    .map_err(|e| Error::msg(format!("Cannot install the core: {}", e.message)))?;
+                .await
+                .map_err(|e| Error::msg(format!("Cannot install the core: {}", e.message)))?;
                 job.summary(format!("Updated to mihomo {}", r.version));
                 Ok(())
             }
@@ -211,7 +236,10 @@ impl Kernel {
                 let home = k.core.home.clone();
                 k.swap_core(|| {
                     // Also an older update that no longer runs.
-                    for file in [rproxy_mihomo::installed(&home), rproxy_mihomo::installed_version_file(&home)] {
+                    for file in [
+                        rproxy_mihomo::installed(&home),
+                        rproxy_mihomo::installed_version_file(&home),
+                    ] {
                         if file.is_file() {
                             std::fs::remove_file(file)?;
                         }
@@ -237,7 +265,10 @@ fn unpack(archive: &[u8]) -> Result<Vec<u8>> {
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive))
             .map_err(|e| Error::msg(e.to_string()))?;
         let index = (0..zip.len())
-            .find(|i| zip.by_index(*i).is_ok_and(|f| f.name().is_ok_and(|n| n.ends_with(".exe"))))
+            .find(|i| {
+                zip.by_index(*i)
+                    .is_ok_and(|f| f.name().is_ok_and(|n| n.ends_with(".exe")))
+            })
             .ok_or_else(|| Error::msg("The archive has no executable."))?;
         zip.by_index(index)
             .map_err(|e| Error::msg(e.to_string()))?
@@ -291,7 +322,9 @@ mod tests {
     use super::*;
     #[test]
     fn every_platform_has_a_release_asset() {
-        assert!(asset("1.19.34").is_some_and(|a| a.starts_with("mihomo-") && a.contains("1.19.34")));
+        assert!(
+            asset("1.19.34").is_some_and(|a| a.starts_with("mihomo-") && a.contains("1.19.34"))
+        );
         assert!(newer("1.19.34", "v1.19.32"));
     }
 }
