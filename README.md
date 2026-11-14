@@ -229,7 +229,9 @@ python3 scripts/build.py --release
 
 Скрипт `scripts/package.py` запускается **на целевой ОС и архитектуре** после
 release-сборки. Нужные инструменты упаковки (Linux: flatpak, flatpak-builder,
-ImageMagick, zstd; Windows: NSIS) устанавливает desktop.yml. Проверка готовых пакетов —
+librsvg2-bin, librsvg2-common, zstd; Windows: NSIS) устанавливает desktop.yml.
+`librsvg2-bin` создаёт PNG, а `librsvg2-common` нужен Flatpak для чтения SVG при экспорте.
+Проверка готовых пакетов —
 `python scripts/package.py --check --os <ОС> --arch <архитектура>`.
 Полная проверка каждой платформы требует соответствующего
 runner, локальная проверка Linux её не заменяет.
