@@ -1,0 +1,12 @@
+[package]
+name = "plugin-logs"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rproxy-kernel = { path = "../../crates/kernel" }
+plugin-servers = { path = "../servers" }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }

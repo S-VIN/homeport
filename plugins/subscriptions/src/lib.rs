@@ -36,6 +36,13 @@ pub struct Source {
     /// Unix seconds of the last successful load.
     pub updated: Option<u64>,
     pub error: Option<String>,
+    /// What the provider calls the subscription (`profile-title`).
+    pub title: Option<String>,
+    /// Traffic used and allowed, in bytes, and the end of the plan (unix
+    /// seconds), from the provider's `subscription-userinfo`.
+    pub used: Option<u64>,
+    pub total: Option<u64>,
+    pub expires: Option<u64>,
 }
 impl Source {
     pub fn new(url: impl Into<String>) -> Self {
@@ -44,19 +51,26 @@ impl Source {
             url: url.into(),
             updated: None,
             error: None,
+            title: None,
+            used: None,
+            total: None,
+            expires: None,
         }
     }
-    /// Provider host, or the link scheme for direct links.
+    /// The provider's name for it, else its host, or the link scheme for direct links.
     pub fn label(&self) -> String {
+        if let Some(title) = self.title.as_ref().filter(|t| !t.trim().is_empty()) {
+            return title.trim().to_owned();
+        }
         match url::Url::parse(&self.url) {
             Ok(u) if matches!(u.scheme(), "http" | "https") => {
-                u.host_str().unwrap_or("Source").to_owned()
+                u.host_str().unwrap_or("Subscription").to_owned()
             }
             Ok(u) => {
                 let name = u.fragment().map(percent).filter(|f| !f.is_empty());
                 name.unwrap_or_else(|| format!("{} link", u.scheme()))
             }
-            Err(_) => "Source".into(),
+            Err(_) => "Subscription".into(),
         }
     }
 }
@@ -128,7 +142,56 @@ pub struct Fetch {
     pub url: String,
 }
 impl Op for Fetch {
-    type Reply = String;
+    type Reply = Document;
+}
+/// A downloaded subscription and what its provider says about it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Document {
+    pub body: String,
+    pub info: Info,
+}
+/// Provider headers that other proxy apps show too.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Info {
+    pub title: Option<String>,
+    pub used: Option<u64>,
+    pub total: Option<u64>,
+    pub expires: Option<u64>,
+}
+impl Info {
+    fn read(headers: &reqwest::header::HeaderMap) -> Info {
+        let text = |key: &str| headers.get(key).and_then(|v| v.to_str().ok());
+        // `upload=1; download=2; total=3; expire=4`
+        let field = |name: &str| {
+            text("subscription-userinfo")?
+                .split(';')
+                .filter_map(|kv| kv.split_once('='))
+                .find(|(k, _)| k.trim().eq_ignore_ascii_case(name))
+                .and_then(|(_, v)| v.trim().parse::<f64>().ok())
+                .map(|v| v as u64)
+        };
+        let used = match (field("upload"), field("download")) {
+            (None, None) => None,
+            (up, down) => Some(up.unwrap_or(0).saturating_add(down.unwrap_or(0))),
+        };
+        let title = text("profile-title").map(|t| match t.strip_prefix("base64:") {
+            Some(b64) => {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD
+                    .decode(b64.trim())
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .unwrap_or_default()
+            }
+            None => t.to_owned(),
+        });
+        Info {
+            title: title.filter(|t| !t.trim().is_empty()),
+            used,
+            total: field("total").filter(|t| *t > 0),
+            expires: field("expire").filter(|e| *e > 0),
+        }
+    }
 }
 /// Turn a document into proxies. Format plugins claim the documents they know.
 #[derive(Clone)]
@@ -181,7 +244,7 @@ fn validate(snap: &Snapshot, s: &mut Source, others: &[Source]) -> Result<()> {
 
 /// Download a subscription document (size limit, gzip sniffing, UTF-8). Plugins that
 /// wrap [`Fetch`] reuse it with their own client.
-pub async fn http_get(client: &reqwest::Client, url: &str, device_id: &str) -> Result<String> {
+pub async fn http_get(client: &reqwest::Client, url: &str, device_id: &str) -> Result<Document> {
     let mut res = client
         .get(url)
         .header("x-hwid", device_id)
@@ -197,7 +260,7 @@ pub async fn http_get(client: &reqwest::Client, url: &str, device_id: &str) -> R
         .await
         .map_err(|e| {
             Error::msg(match e.status() {
-                Some(s) => format!("Source returned HTTP {}.", s.as_u16()),
+                Some(s) => format!("The subscription server returned HTTP {}.", s.as_u16()),
                 None => "Cannot reach the subscription provider.".into(),
             })
         })?;
@@ -221,8 +284,12 @@ pub async fn http_get(client: &reqwest::Client, url: &str, device_id: &str) -> R
         ));
     }
     if !res.status().is_success() {
-        bail!("Source returned HTTP {}.", res.status().as_u16());
+        bail!(
+            "The subscription server returned HTTP {}.",
+            res.status().as_u16()
+        );
     }
+    let info = Info::read(res.headers());
     let mut bytes = Vec::new();
     while let Some(chunk) = res
         .chunk()
@@ -246,11 +313,12 @@ pub async fn http_get(client: &reqwest::Client, url: &str, device_id: &str) -> R
         }
         bytes = plain;
     }
-    String::from_utf8(bytes).map_err(|_| Error::msg("Subscription is not UTF-8."))
+    let body = String::from_utf8(bytes).map_err(|_| Error::msg("Subscription is not UTF-8."))?;
+    Ok(Document { body, info })
 }
 
 /// Use the same identity for direct requests and retries through the selected proxy.
-pub async fn fetch_http(cx: &Cx, client: &reqwest::Client, url: &str) -> Result<String> {
+pub async fn fetch_http(cx: &Cx, client: &reqwest::Client, url: &str) -> Result<Document> {
     let id = cx.live(&DEVICE_ID);
     http_get(client, url, id.as_str()).await
 }
@@ -349,7 +417,7 @@ async fn refresh_source(cx: Cx, op: RefreshSource) -> Result<()> {
     };
     let _loading = cx.mark_live(&LOADING, op.id);
     let result = async {
-        let body = cx
+        let Document { body, info } = cx
             .or_cancel(cx.call(Fetch { source: op.id, url }))
             .await??;
         let proxies = if body.trim().trim_start_matches('\u{feff}').trim().is_empty() {
@@ -368,21 +436,23 @@ async fn refresh_source(cx: Cx, op: RefreshSource) -> Result<()> {
             proxies,
             still_current: Some(Box::new(move |w| still.current(w))),
         };
-        cx.call(replace).await.map(drop)
+        cx.call(replace).await.map(|_| info)
     }
     .await;
     if result.as_ref().is_err_and(|e| e.cancelled()) {
-        return result;
+        return result.map(drop);
     }
-    let outcome = result.as_ref().map(drop).map_err(|e| e.message.clone());
+    let outcome = result.as_ref().cloned().map_err(|e| e.message.clone());
     cx.write(move |w| {
         input.check(w)?;
         w.update(&SOURCES, |list| {
             if let Some(s) = list.iter_mut().find(|s| s.id == op.id) {
                 match outcome {
-                    Ok(()) => {
+                    Ok(info) => {
                         s.updated = Some(now());
                         s.error = None;
+                        (s.title, s.used, s.total, s.expires) =
+                            (info.title, info.used, info.total, info.expires);
                     }
                     Err(e) => s.error = Some(e),
                 }
@@ -391,7 +461,7 @@ async fn refresh_source(cx: Cx, op: RefreshSource) -> Result<()> {
         Ok(())
     })
     .await?;
-    result
+    result.map(drop)
 }
 
 fn setup(p: &mut Setup) -> Result<()> {
@@ -419,7 +489,10 @@ fn setup(p: &mut Setup) -> Result<()> {
             fetch_http(&cx, cx.http(), &f.url).await
         } else {
             // A direct link is its own document.
-            Ok(f.url)
+            Ok(Document {
+                body: f.url,
+                info: Info::default(),
+            })
         }
     })
     .rank(Rank::Fallback);
@@ -504,8 +577,43 @@ fn hue(sources: &[Source], id: Id) -> Option<usize> {
     None
 }
 
+/// Traffic and term of the plan, when the provider reports them.
+fn plan(s: &Source) -> Option<(String, bool)> {
+    let traffic = match (s.used, s.total) {
+        (Some(used), Some(total)) => Some(format!("{} of {}", kit::bytes(used), kit::bytes(total))),
+        // Without a limit only real use says something.
+        (Some(used), None) if used > 0 => Some(format!("{} used", kit::bytes(used))),
+        _ => None,
+    };
+    // Providers put a far-away date for "no end"; past ten years it is that.
+    let left = s
+        .expires
+        .map(|end| end as i64 - now() as i64)
+        .filter(|left| *left < 10 * 365 * 86_400);
+    let term = left.map(|left| match (left + 43_200) / 86_400 {
+        _ if left <= 0 => "expired".to_owned(),
+        0 => "expires today".to_owned(),
+        days => format!("expires in {}", kit::plural(days as usize, "day", "days")),
+    });
+    let alarming =
+        left.is_some_and(|l| l <= 3 * 86_400) || s.used.zip(s.total).is_some_and(|(u, t)| u >= t);
+    let text: Vec<String> = traffic.into_iter().chain(term).collect();
+    (!text.is_empty()).then(|| (text.join(" · "), alarming))
+}
+
 fn status(s: &Source, loading: bool) -> (String, Tone) {
-    let age = s.updated.map(kit::age);
+    let (text, tone) = load_status(s, loading);
+    match plan(s).filter(|_| !loading) {
+        Some((plan, alarming)) => {
+            let tone = if alarming { Tone::Warning } else { tone };
+            (format!("{text} · {plan}"), tone)
+        }
+        None => (text, tone),
+    }
+}
+
+fn load_status(s: &Source, loading: bool) -> (String, Tone) {
+    let age = s.updated.filter(|&t| t > 0).map(kit::age);
     match (&s.error, loading) {
         (_, true) => ("Loading…".into(), Tone::Neutral),
         (Some(e), _) => (
@@ -547,6 +655,10 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
             || RefreshAll,
         );
     });
+    kit::page_note(
+        ui,
+        "Auto select prefers servers from subscriptions higher in the list.",
+    );
 
     let loading = cx.live(&LOADING);
     ListEditor::new(&SOURCES)
@@ -589,8 +701,55 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
             })
             .right(),
         )
+        .column(
+            Column::custom("", 30., move |ui, cx, s: &Source| {
+                let idle = !cx.live(&LOADING).contains(&s.id);
+                if kit::icon_button(ui, Icon::Refresh, "Refresh", idle).clicked() {
+                    cx.run(RefreshSource { id: s.id });
+                }
+            })
+            .right(),
+        )
         .subtitle(|rows, i| Some(status(&rows[i], loading.contains(&rows[i].id))))
-        .empty(Icon::Subscriptions, "No subscriptions")
+        .empty(
+            Icon::Subscriptions,
+            "No subscriptions",
+            "Paste a subscription link or a vless:// link above.",
+        )
         .show(ui, cx);
     cx.slot(ui, &SECTIONS, &());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_headers_give_name_traffic_and_term() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            "subscription-userinfo",
+            "upload=1000; download=2000; total=10737418240; expire=1900000000"
+                .parse()
+                .unwrap(),
+        );
+        // "My VPN" in base64.
+        h.insert("profile-title", "base64:TXkgVlBO".parse().unwrap());
+        let info = Info::read(&h);
+        assert_eq!(info.title.as_deref(), Some("My VPN"));
+        assert_eq!(info.used, Some(3000));
+        assert_eq!(info.total, Some(10737418240));
+        assert_eq!(info.expires, Some(1900000000));
+        assert_eq!(
+            Info::read(&reqwest::header::HeaderMap::new()),
+            Info::default()
+        );
+
+        let mut s = Source::new("https://example.org/sub");
+        (s.title, s.used, s.total, s.expires) = (info.title, info.used, info.total, info.expires);
+        assert_eq!(s.label(), "My VPN");
+        let (text, alarming) = plan(&s).unwrap();
+        assert!(text.starts_with("2.9 KB of 10.0 GB · expires in"), "{text}");
+        assert!(!alarming);
+    }
 }

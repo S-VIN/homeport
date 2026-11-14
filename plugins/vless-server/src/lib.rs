@@ -27,7 +27,7 @@ pub mod site;
 pub static PLUGIN: Plugin = Plugin {
     id: "vless-server",
     name: "VLESS server",
-    description: "Let other devices connect to this machine over VLESS with REALITY and XHTTP, disguised as your own website.",
+    description: "Let other devices connect to this device over VLESS with REALITY and XHTTP, disguised as your own website.",
     requires: &["servers"],
     default_enabled: false,
     setup,
@@ -94,6 +94,7 @@ pub static CERTIFICATE: State<site::Certificate> = State::new("vless-server.cert
 pub struct SetEnabled(pub bool);
 impl Op for SetEnabled {
     type Reply = ();
+    const SAVES: bool = true;
 }
 
 pub fn generate_keys() -> Keys {
@@ -151,7 +152,7 @@ pub fn problem(snap: &Snapshot) -> Option<&'static str> {
 /// What blocks the server apart from clients.
 fn settings_problem(c: &Settings, keys: &Keys) -> Option<&'static str> {
     if !valid_domain(&c.domain) {
-        return Some("Enter your domain. Its DNS record must point to this machine.");
+        return Some("Enter your domain. Its DNS record must point to this device.");
     }
     if c.website == Website::Own
         && c.own_site
@@ -344,7 +345,7 @@ fn status_rows(ui: &mut egui::Ui, cx: &mut UiCx) {
             ui,
             Icon::Error,
             pal.danger,
-            "Listener",
+            "Port",
             &format!(
                 "{e}{}",
                 if cfg!(target_os = "linux") && c.port < 1024 {
@@ -358,10 +359,10 @@ fn status_rows(ui: &mut egui::Ui, cx: &mut UiCx) {
             ui,
             Icon::Connected,
             pal.success,
-            "Listener",
+            "Port",
             &format!("Listening on port {}", c.port),
         ),
-        None => line(ui, Icon::Info, pal.muted, "Listener", "Off"),
+        None => line(ui, Icon::Info, pal.muted, "Port", "Off"),
     }
     if c.website == Website::Builtin {
         let (icon, color, text) = match &*snap.live(&CERTIFICATE) {
@@ -381,7 +382,7 @@ fn status_rows(ui: &mut egui::Ui, cx: &mut UiCx) {
                 Icon::Error,
                 pal.danger,
                 format!(
-                    "Let's Encrypt failed: {e}. Check that {} points to this machine and port {} is reachable.",
+                    "Let's Encrypt failed: {e}. Check that {} points to this device and port {} is reachable.",
                     c.domain, c.port
                 ),
             ),
@@ -393,11 +394,11 @@ fn status_rows(ui: &mut egui::Ui, cx: &mut UiCx) {
             ui,
             Icon::Exit,
             pal.success,
-            "Exit",
-            "Client traffic leaves from this machine (rule * → Direct)",
+            "Client traffic",
+            "Leaves from this device (rule * → Direct)",
         ),
         Some(false) => {
-            kit::property_with(ui, "Exit", |ui| {
+            kit::property_with(ui, "Client traffic", |ui| {
                 ui.spacing_mut().item_spacing.x = 6.;
                 let via = if servers::selected(&snap).is_some() {
                     "goes via the selected server"
@@ -406,15 +407,14 @@ fn status_rows(ui: &mut egui::Ui, cx: &mut UiCx) {
                 };
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(format!("Client traffic follows Routing and {via}."))
-                            .color(pal.muted),
+                        egui::RichText::new(format!("Follows Routing and {via}.")).color(pal.muted),
                     )
                     .wrap(),
                 );
-                if kit::Button::ghost("Exit here")
+                if kit::Button::ghost("Send directly")
                     .tone(kit::Tone::Accent)
                     .show(ui)
-                    .on_hover_text("Add the routing rule * → Direct")
+                    .on_hover_text("Adds the routing rule * → Direct: this device's own traffic also goes direct")
                     .clicked()
                 {
                     cx.submit(
@@ -435,8 +435,8 @@ fn status_rows(ui: &mut egui::Ui, cx: &mut UiCx) {
             ui,
             Icon::Info,
             pal.muted,
-            "Exit",
-            "Routing is off: client traffic goes via the selected server.",
+            "Client traffic",
+            "Routing is off: it goes via the selected server.",
         ),
     }
 }
@@ -475,11 +475,25 @@ fn ui(p: &mut Setup) {
 }
 
 fn body(ui: &mut egui::Ui, cx: &mut UiCx, c: &Settings) {
+    server_settings(ui, cx, c);
+    ui.add_space(theme::SECTION_GAP);
+    kit::card(ui, |ui| status_rows(ui, cx));
+    ui.add_space(theme::SECTION_GAP);
+    kit::section(
+        ui,
+        "Clients",
+        Some("Each client gets its own link. Remove a client to revoke its access."),
+    );
+    clients(ui, cx);
+    shown_client(ui, cx, c);
+}
+
+fn server_settings(ui: &mut egui::Ui, cx: &mut UiCx, c: &Settings) {
     kit::settings_card(ui, |ui| {
         kit::settings_row(
             ui,
             "Domain",
-            "Your domain; its DNS record points to this machine",
+            "Your domain; its DNS record points to this device",
             |ui| {
                 if let Some(d) = kit::field(ui, "domain", &c.domain, "example.com", 190.) {
                     let d = d.trim().trim_end_matches('.').to_lowercase();
@@ -550,15 +564,9 @@ fn body(ui: &mut egui::Ui, cx: &mut UiCx, c: &Settings) {
             );
         }
     });
-    ui.add_space(theme::SECTION_GAP);
-    kit::card(ui, |ui| status_rows(ui, cx));
-    ui.add_space(theme::SECTION_GAP);
+}
 
-    kit::section(
-        ui,
-        "Clients",
-        Some("Each client gets its own link. Remove a client to revoke its access."),
-    );
+fn clients(ui: &mut egui::Ui, cx: &mut UiCx) {
     ListEditor::new(&CLIENTS)
         .unordered()
         .add_form(
@@ -603,9 +611,16 @@ fn body(ui: &mut egui::Ui, cx: &mut UiCx, c: &Settings) {
             })
             .right(),
         )
-        .empty(Icon::Users, "No clients")
+        .empty(
+            Icon::Users,
+            "No clients",
+            "Add a client to get its link and QR code.",
+        )
         .show(ui, cx);
-    // The QR code of one client, large enough for a phone camera.
+}
+
+/// The QR code of one client, large enough for a phone camera.
+fn shown_client(ui: &mut egui::Ui, cx: &mut UiCx, c: &Settings) {
     let snap = cx.snapshot().clone();
     let client =
         shown_qr(ui).and_then(|id| snap.get(&CLIENTS).iter().find(|c| c.id == id).cloned());
@@ -653,7 +668,7 @@ fn status_chip(p: &mut Setup) {
             ui,
             kit::Lead::Icon(Icon::Shield, color),
             "VLESS server",
-            "This machine accepts VLESS clients",
+            "This device accepts VLESS clients",
         );
     });
 }

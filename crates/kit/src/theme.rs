@@ -39,6 +39,20 @@ pub const UTILITY_WIDTH: f32 = 300.0;
 pub const UTILITY_BREAKPOINT: f32 = 960.0;
 /// Phone-sized window: list rows trade labels for icons (see `kit::compact_row`).
 pub const PHONE: f32 = 480.0;
+
+/// Fingers need about 40 px targets. On phones a tap that lands on nothing
+/// clickable goes to the closest control within this radius, so a 26 px
+/// button takes taps 40 px wide; a direct hit always wins.
+pub fn fit_pointer(ctx: &egui::Context) {
+    let radius = if ctx.content_rect().width() < PHONE {
+        8.
+    } else {
+        5.
+    };
+    if ctx.global_style().interaction.interact_radius != radius {
+        ctx.all_styles_mut(|s| s.interaction.interact_radius = radius);
+    }
+}
 /// Width of the label column in property lists (server details, About).
 pub const LABEL_WIDTH: f32 = 96.0;
 /// Corner radius of cards, popovers and toasts.

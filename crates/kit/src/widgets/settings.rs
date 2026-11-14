@@ -1,7 +1,8 @@
 use super::*;
 
-/// A row of a settings card: label with optional hover help on the left, the control on
-/// the right; stacks under a narrow width. Rows after the first get a divider.
+/// A row of a settings card: label with optional help on the left (on hover;
+/// a line under the label on phones, which have no hover), the control on the
+/// right; stacks under a narrow width. Rows after the first get a divider.
 pub fn settings_row(ui: &mut Ui, label: &str, help: &str, control: impl FnOnce(&mut Ui)) {
     let p = theme::palette(ui);
     settings_item(
@@ -11,7 +12,12 @@ pub fn settings_row(ui: &mut Ui, label: &str, help: &str, control: impl FnOnce(&
             let response =
                 ui.add(egui::Label::new(RichText::new(label).color(p.foreground)).wrap());
             if !help.is_empty() {
-                response.on_hover_text(help);
+                if phone(ui) {
+                    let help = RichText::new(help).size(theme::SMALL).color(p.muted);
+                    ui.add(egui::Label::new(help).wrap());
+                } else {
+                    response.on_hover_text(help);
+                }
             }
         },
         control,

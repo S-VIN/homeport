@@ -89,6 +89,7 @@ pub static STRIKES: State<Vec<Strike>> = State::new("auto-select.strikes");
 pub struct SetAuto(pub bool);
 impl Op for SetAuto {
     type Reply = ();
+    const SAVES: bool = true;
 }
 /// Why a decision is due, least important first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -127,7 +128,7 @@ impl Op for Decide {
     fn job(&self) -> Option<JobSpec> {
         // Requests must be evaluated: queue them behind a running decision.
         // The periodic watch just joins it.
-        let spec = JobSpec::new("Automatic selection");
+        let spec = JobSpec::new("Auto select");
         Some(if self.watch {
             spec.quiet()
         } else {
@@ -151,13 +152,13 @@ impl Reason {
     fn label(self) -> &'static str {
         match self {
             Self::Empty => "Nothing was connected",
-            Self::Enabled => "Automatic selection enabled",
-            Self::Priorities => "Source priorities changed",
+            Self::Enabled => "Auto select turned on",
+            Self::Priorities => "Subscription order changed",
             Self::Failure => "The selected server failed",
             Self::Failover => "The selected server failed; traffic moved to a backup",
             Self::Degradation => "The selected server degraded",
             Self::Improvement => "A better server was confirmed",
-            Self::Refined => "Best server after the first full check",
+            Self::Refined => "Best server after the first full test",
         }
     }
     fn limited(self) -> bool {
@@ -729,9 +730,9 @@ async fn search(cx: &Cx, w: &World, p: &mut Policy, reason: Reason, above: f64) 
         p.auto.retry_at = now() + wait;
         // No countdown in the text: it would stand still on screen.
         p.auto.last_reason = Some(if candidates.is_empty() {
-            "No eligible server: check subscriptions and filters".into()
+            "No eligible server: check subscriptions and exclusions".into()
         } else {
-            "No server answers yet; it tries again after each check and every few minutes".into()
+            "Keeping the current server: no candidate answered the quick test; retrying after the next test".into()
         });
         cx.summary(if candidates.is_empty() {
             "No eligible server"
@@ -798,7 +799,11 @@ async fn manual_choice_turns_auto_off(cx: Cx, op: Select, next: Next<Select>) ->
     next.run(&cx, op).await?;
     if manual && cx.get(&AUTO).enabled {
         cx.call(SetAuto(false)).await?;
-        cx.notify("Auto select is off: you chose the server yourself. Turn it on again on the Servers page.");
+        cx.notify_with(
+            "Auto select is off because you picked or disconnected a server yourself.",
+            "Turn back on",
+            || SetAuto(true),
+        );
     }
     Ok(())
 }
@@ -809,7 +814,7 @@ fn ui(p: &mut Setup) {
         let mut on = auto.enabled;
         let mut help = "Connecting manually turns Auto select off.".to_owned();
         if let Some(reason) = auto.last_reason.as_ref().filter(|_| auto.enabled) {
-            help.push_str(&format!("\nLast decision: {reason}"));
+            help.push_str(&format!("\nWhy this server: {reason}"));
         }
         let r = kit::toggle(ui, &mut on, "Auto select").on_hover_text(help);
         if r.changed() {
@@ -823,7 +828,7 @@ fn ui(p: &mut Setup) {
             let tip = auto
                 .last_reason
                 .clone()
-                .map_or_else(String::new, |r| format!("Last decision: {r}"));
+                .map_or_else(String::new, |r| format!("Why this server: {r}"));
             cx.status_chip(ui, kit::Lead::Icon(Icon::Auto, pal.accent), "Auto", &tip);
         }
     });
@@ -834,10 +839,11 @@ fn ui(p: &mut Setup) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.;
                 kit::icon(ui, Icon::Auto, 14., pal.accent);
-                let text = auto
-                    .last_reason
-                    .clone()
-                    .map_or_else(String::new, |r| format!("Last decision: {r}"));
+                // Always say what Auto select is doing, also before its first decision.
+                let text = auto.last_reason.clone().map_or_else(
+                    || "Auto select keeps this server while it works and switches when a clearly better one appears.".to_owned(),
+                    |r| format!("Why this server: {r}"),
+                );
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(text)

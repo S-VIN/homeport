@@ -97,15 +97,22 @@ macro_rules! sql_text {
     };
 }
 
-/// A closed set of labelled values: `Display`, `FromStr`, `ALL` and a TEXT column.
+/// A closed set of labelled values: `Display` (the label), `FromStr`, `ALL`
+/// and a TEXT column. Saved data holds the stable value name (`Proxy`), so a
+/// label can change freely; labels it had before are still read:
+/// `Proxy => "Proxy" | "Via server"`.
 #[macro_export]
 macro_rules! choices {
-    ($(#[$m:meta])* $vis:vis enum $name:ident { $($item:ident => $label:literal),+ $(,)? }) => {
+    ($(#[$m:meta])* $vis:vis enum $name:ident { $($item:ident => $label:literal $(| $old:literal)*),+ $(,)? }) => {
         $(#[$m])*
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-        $vis enum $name { $(#[serde(rename = $label)] $item),+ }
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        $vis enum $name { $($item),+ }
         impl $name {
             pub const ALL: &'static [Self] = &[$(Self::$item),+];
+            /// The name saved for this value.
+            pub fn key(self) -> &'static str {
+                match self { $(Self::$item => stringify!($item)),+ }
+            }
         }
         impl std::fmt::Display for $name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -115,9 +122,43 @@ macro_rules! choices {
         impl std::str::FromStr for $name {
             type Err = ();
             fn from_str(s: &str) -> std::result::Result<Self, ()> {
-                match s { $($label => Ok(Self::$item),)+ _ => Err(()) }
+                $(if s == stringify!($item) || s == $label $(|| s == $old)* {
+                    return Ok(Self::$item);
+                })+
+                Err(())
             }
         }
-        $crate::sql_text!($name);
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+                s.serialize_str(self.key())
+            }
+        }
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+                let s = <std::borrow::Cow<'de, str> as serde::Deserialize>::deserialize(d)?;
+                s.parse().map_err(|()| {
+                    serde::de::Error::custom(format!("unknown {} {s:?}", stringify!($name)))
+                })
+            }
+        }
+        impl $crate::store::ColumnType for $name {
+            const SQL_TYPE: &'static str = "TEXT";
+        }
+        impl $crate::store::rusqlite::ToSql for $name {
+            fn to_sql(
+                &self,
+            ) -> $crate::store::rusqlite::Result<$crate::store::rusqlite::types::ToSqlOutput<'_>> {
+                Ok(self.key().into())
+            }
+        }
+        impl $crate::store::rusqlite::types::FromSql for $name {
+            fn column_result(
+                v: $crate::store::rusqlite::types::ValueRef<'_>,
+            ) -> $crate::store::rusqlite::types::FromSqlResult<Self> {
+                v.as_str()?
+                    .parse()
+                    .map_err(|_| $crate::store::rusqlite::types::FromSqlError::InvalidType)
+            }
+        }
     };
 }

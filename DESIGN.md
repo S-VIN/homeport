@@ -62,7 +62,7 @@
 | Компонент | Использование |
 |---|---|
 | `Button::primary` | одно главное действие вида: Add, Save, Restart now |
-| `Button::secondary` | остальные действия: Refresh all, Check all, Connect, Disconnect, Reset filters; `.selected()` — открытый редактор (Name filters); `.count()` — счётчик внутри кнопки |
+| `Button::secondary` | остальные действия: Refresh all, Test all, Connect, Disconnect, Reset filters; `.selected()` — открытый редактор (Exclude by name); `.count()` — счётчик внутри кнопки |
 | `Button::ghost` | ссылки-действия: Manage, Open Subscriptions, Retry, Disconnect в строке (тон Danger) |
 | `Button::danger` | подтверждение разрушительного действия (замена настроек) |
 | `icon_button` / `icon_button_ex` | 26 × 26, всегда с подсказкой и доступным именем |
@@ -77,17 +77,17 @@
 
 ## Экраны
 
-- **Servers**: заголовок «Servers · 84 servers · 1 excluded», действия Auto select, Check all, Name filters (иконка фильтра со счётчиком; подпись в окне от 560 pt). Под ними три фильтра на всю ширину. Строка: шеврон, имя, цветной тег подписки, Rating (и Latency от 500 pt), ячейка состояния: постоянная кнопка «Disconnect» у подключённого (строка выделена; статус виден в Connection), постоянная кнопка «Connect» у остальных; двойной клик по имени подключает. Исключённый сервер — приглушённое имя и причина второй строкой. Детали — вложенная панель со свойствами, результатами тестов и «More details». Имена сортируются естественно (Auto 2 перед Auto 10).
+- **Servers**: заголовок «Servers · 84 servers · 1 excluded», действия Auto select, Test all, Exclude by name (иконка фильтра со счётчиком; подпись в окне от 560 pt). Под ними три фильтра на всю ширину. Строка: шеврон, имя, цветной тег подписки, Rating (и Latency от 500 pt), ячейка состояния: постоянная кнопка «Disconnect» у подключённого (строка выделена; статус виден в Connection), постоянная кнопка «Connect» у остальных; двойной клик по имени подключает. Исключённый сервер — приглушённое имя и причина второй строкой. Детали — вложенная панель со свойствами, результатами тестов и «More details». Имена сортируются естественно (Auto 2 перед Auto 10).
 - **Subscriptions**: цветная точка источника, хост, число серверов справа, вторая строка со статусом загрузки или ошибкой. Порядок — приоритет для Auto select.
 - **Routing**: шаблон нейтральным текстом, бейдж типа, выбор маршрута.
 - **Checks**: тестовые URL и ожидаемый статус (порядок не важен — без стрелок).
-- **Listeners**: колонки On / Address / Auth («Login» с замком или «No auth»), редактор адреса и логина раскрывается в строке.
+- **Proxy ports**: колонки On / Address / Auth («Login» с замком или «No auth»), редактор адреса и логина раскрывается в строке.
 - **Settings**: Import… и Export… доступны в заголовке без прокрутки. Импорт сначала проверяет файл, затем показывает имя и размер и требует явного подтверждения Replace settings; Cancel и Esc отменяют. Карточки General (Theme, Refresh subscriptions, Check servers, Start at login) и About.
 - **Plugins**: самостоятельная вкладка, группы Servers, Subscription formats, Server selection · one at a time, Network & system. Переключатели имеют доступные имена; Open… ведёт на рабочую страницу функции. Интервал — пресеты «Every hour … Every week» и Custom с числом в минутах или часах. Зависимости показываются только если не выполнены («Inactive · Needs Checks, which is off»), отложенное включение — бейдж «Restart required» и баннер с «Restart now».
 
 ## Словарь
 
-Одно имя на понятие везде (вкладка, плагин, настройка, тосты): **Servers**, **Subscriptions**, **Routing**, **Checks** (проверки серверов и их тестовые URL), **Listeners**, **Auto select**, **Name filters**, **Start at login**. Счётчики через `kit::plural` («1 server», «2 subscriptions»), состояния с заглавной буквы (Running, Done, Failed).
+Одно имя на понятие везде (вкладка, плагин, настройка, тосты): **Servers**, **Subscriptions**, **Routing**, **Checks** (проверки серверов и их тестовые URL), **Proxy ports**, **Auto select**, **Exclude by name**, **Start at login**. Счётчики через `kit::plural` («1 server», «2 subscriptions»), состояния с заглавной буквы (Running, Done, Failed).
 
 ## Проверка
 

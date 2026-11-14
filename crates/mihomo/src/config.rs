@@ -49,6 +49,8 @@ pub enum Rule {
     },
     GeoIp(String, Target),
     InName(String, Target),
+    /// Traffic of one app, by its executable name (`Telegram`, `chrome.exe`).
+    ProcessName(String, Target),
     /// Match a [`RuleProvider`] by name. IP sets resolve domains unless `no_resolve`.
     RuleSet {
         name: String,
@@ -79,6 +81,7 @@ impl Rule {
             }
             Self::GeoIp(c, t) => format!("GEOIP,{c},{}", t.wire()),
             Self::InName(n, t) => format!("IN-NAME,{n},{}", t.wire()),
+            Self::ProcessName(n, t) => format!("PROCESS-NAME,{n},{}", t.wire()),
             Self::RuleSet {
                 name,
                 target,
@@ -100,7 +103,8 @@ impl Rule {
             | Self::DomainKeyword(_, t)
             | Self::DomainRegex(_, t)
             | Self::GeoIp(_, t)
-            | Self::InName(_, t) => t,
+            | Self::InName(_, t)
+            | Self::ProcessName(_, t) => t,
             Self::IpCidr { target, .. } | Self::RuleSet { target, .. } => target,
         }
     }
@@ -400,6 +404,11 @@ pub fn overlaps(a: IpAddr, b: IpAddr) -> bool {
 /// The kernel's own SOCKS listener that follows the ordinary rules, for the
 /// app's downloads that should go where user traffic goes.
 pub const ROUTED: &str = "routed";
+/// Listeners of rproxy itself (checks, its own downloads): their connections
+/// are not the user's traffic.
+pub fn internal_listener(name: &str) -> bool {
+    name == ROUTED || name.starts_with("checks-")
+}
 
 /// Kernel-owned additions: isolated check lanes. Lane `i` is the SOCKS listener
 /// `checks-i` on `check_ports[i]`, routed to the select group `test-i`.
@@ -531,8 +540,11 @@ pub fn render(cfg: &Config, sys: &System<'_>, listeners: &[&Listener]) -> Value 
     );
     // Listeners bound to a non-loopback address are meant for other machines.
     let lan = listeners.iter().any(|l| !l.listen.is_loopback());
+    // Looking up the app of a connection costs time: only with app rules.
+    let apps = cfg.rules.iter().any(|r| matches!(r, Rule::ProcessName(..)));
+    let find_process = if apps { "strict" } else { "off" };
     let mut root = json!({
-        "log-level": log_level(), "mode": "rule", "allow-lan": lan, "find-process-mode": "off",
+        "log-level": log_level(), "mode": "rule", "allow-lan": lan, "find-process-mode": find_process,
         "dns": dns,
         "profile": {"store-selected": false, "store-fake-ip": false},
         "proxies": proxies, "proxy-groups": groups, "listeners": ls, "rules": rules,

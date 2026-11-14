@@ -174,6 +174,15 @@ impl Controller {
             .await
             .map_err(|e| e.to_string())
     }
+    /// The core's live log, one JSON object per line (`{"type":"info","payload":"…"}`);
+    /// the response streams until the core stops.
+    pub async fn logs(&self, level: &str) -> Result<reqwest::Response> {
+        let url = self.url(&format!("logs?level={level}"));
+        // The client's short timeout is for requests; a stream stays open while
+        // the core runs (a day here, then the reader opens a new one).
+        self.send(self.http.get(url).timeout(Duration::from_secs(86_400)))
+            .await
+    }
     pub async fn close_connection(&self, id: &str) -> Result<()> {
         self.send(self.http.delete(self.url(&format!("connections/{id}"))))
             .await
@@ -473,6 +482,14 @@ impl Mihomo {
                 Stdio::null()
             })
             .kill_on_drop(!supervised);
+        // A small Go runtime: two OS threads and a soft memory limit keep the
+        // core near 20–60 MB instead of growing with the CPU count. Values
+        // already in the environment win.
+        for (key, value) in [("GOMAXPROCS", "2"), ("GOGC", "50"), ("GOMEMLIMIT", "64MiB")] {
+            if std::env::var_os(key).is_none() {
+                cmd.env(key, value);
+            }
+        }
         // RPROXY_MIHOMO_LOG=debug|info|warning shows the core's log on stderr.
         if config::log_level() == "silent" {
             cmd.stdout(Stdio::null()).stderr(Stdio::null());

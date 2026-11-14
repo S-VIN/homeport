@@ -54,7 +54,7 @@ pub struct CheckAll;
 impl Op for CheckAll {
     type Reply = ();
     fn job(&self) -> Option<JobSpec> {
-        Some(JobSpec::new("Check servers").page("servers"))
+        Some(JobSpec::new("Test servers").page("servers"))
     }
 }
 /// Fast check without a download, not stored (e.g. a candidate right before

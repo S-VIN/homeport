@@ -71,6 +71,9 @@ impl JobSpec {
 /// An action. Any `Send` type can be one.
 pub trait Op: Send + 'static {
     type Reply: Send + 'static;
+    /// Changes saved data: while a page's [`UiCx::submit`](crate::UiCx::submit)
+    /// runs it, the status bar shows "Saving…", then "Saved".
+    const SAVES: bool = false;
     /// `Some` makes [`Cx::spawn`] and UI buttons run this op as a background job
     /// with progress and cancellation.
     fn job(&self) -> Option<JobSpec> {

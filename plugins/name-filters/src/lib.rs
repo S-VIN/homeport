@@ -6,7 +6,7 @@ use rproxy_kernel::{kit, prelude::*, ui::Column, ui::ListEditor};
 
 pub static PLUGIN: Plugin = Plugin {
     id: "name-filters",
-    name: "Name filters",
+    name: "Exclude by name",
     description: "Hide and never use servers whose names match a pattern, e.g. *test* or RU*.",
     category: categories::SERVERS,
     requires: &["servers"],
@@ -54,7 +54,7 @@ fn setup(p: &mut Setup) -> Result<()> {
             .iter()
             .any(|o| o.pattern.to_lowercase() == f.pattern.to_lowercase())
         {
-            bail!("Name filter already exists.");
+            bail!("This pattern already exists.");
         }
         Ok(())
     });
@@ -63,13 +63,14 @@ fn setup(p: &mut Setup) -> Result<()> {
             .iter()
             .find(|f| wildcard(&f.pattern, &s.name))
             .map(|f| Exclusion {
-                reason: format!("Name filtered by {}", f.pattern),
+                reason: format!("Excluded by name: {}", f.pattern),
+                group: "Excluded by name",
                 disconnect: true,
             })
     });
     let tool = Tool {
         id: "filters",
-        label: "Name filters",
+        label: "Exclude by name",
         icon: Icon::Filter,
         order: 50,
     };
@@ -105,7 +106,7 @@ fn setup(p: &mut Setup) -> Result<()> {
                 .no_headers()
                 .subtitle(move |rows, i| hint(&rows[i].pattern, &names))
                 .add_form(
-                    "Add name filter",
+                    "Add pattern",
                     || Filter {
                         id: Id::random(),
                         pattern: String::new(),
@@ -139,7 +140,11 @@ fn setup(p: &mut Setup) -> Result<()> {
                     })
                     .right(),
                 )
-                .empty(Icon::Filter, "No name filters")
+                .empty(
+                    Icon::Filter,
+                    "No exclusions",
+                    "Hide servers whose names match, like exclude-filter in Clash: e.g. *test*.",
+                )
                 .show(ui, cx);
         },
     );

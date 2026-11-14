@@ -80,6 +80,22 @@ pub const MAIN: &str = "main";
 pub fn main_target() -> Target {
     Target::Group(MAIN.into())
 }
+/// How a core rule reads to the user: the core reports e.g.
+/// `DomainRegex ^.*\.youtube\.com$`, the plugin that made it answers
+/// `*.youtube.com`.
+pub static RULE_LABEL: Hook<str, Option<String>> = Hook::new("servers.rule-label");
+/// The user's words for a core rule (see [`RULE_LABEL`]), else the rule itself.
+pub fn rule_label(snap: &Snapshot, rule: &str) -> String {
+    snap.hooks(&RULE_LABEL, rule)
+        .into_iter()
+        .flatten()
+        .next()
+        .unwrap_or_else(|| match rule {
+            // The core's final rule: whatever no other rule caught.
+            "Match" => "Everything else".to_owned(),
+            rule => rule.to_owned(),
+        })
+}
 /// Where traffic sent "via server" goes. A plugin may answer with another
 /// target, e.g. an exit server dialed through `main` (selected → exit → internet).
 pub static ROUTE: Hook<(), Option<Target>> = Hook::new("servers.route");
@@ -253,9 +269,11 @@ pub struct Excluded {
 // ---- hooks ----------------------------------------------------------------
 
 /// Why a server must not be used. `disconnect` also drops it when selected.
+/// Excluded servers close the list in groups under the caption `group`.
 #[derive(Clone, Debug)]
 pub struct Exclusion {
     pub reason: String,
+    pub group: &'static str,
     pub disconnect: bool,
 }
 pub static EXCLUDE: Hook<Server, Option<Exclusion>> = Hook::new("servers.exclude");
@@ -294,7 +312,7 @@ pub fn source_label(snap: &Snapshot, id: Id) -> String {
         .into_iter()
         .flatten()
         .next()
-        .unwrap_or_else(|| "Source".into())
+        .unwrap_or_else(|| "Subscription".into())
 }
 pub fn source_hue(snap: &Snapshot, id: Id) -> usize {
     snap.hooks(&SOURCE_HUE, &id)
@@ -370,6 +388,8 @@ pub struct Cell {
     /// `None` in the header row.
     pub(crate) server: Option<Server>,
     pub(crate) wide: bool,
+    /// The server can't be used: its cells are muted.
+    pub(crate) excluded: bool,
 }
 
 /// An extra column of the server list (see [`column`]).
@@ -398,7 +418,12 @@ pub fn column(
         }
         kit::cell_right(ui, 60., |ui| match &props.server {
             None => drop(kit::caption(ui, c.title).on_hover_text(c.help)),
-            Some(s) => cell(ui, cx, s),
+            Some(s) => {
+                if props.excluded {
+                    ui.multiply_opacity(0.45);
+                }
+                cell(ui, cx, s)
+            }
         });
     });
 }

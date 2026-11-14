@@ -15,6 +15,9 @@ pub enum Icon {
     Custom(fn(&Painter, Pos2, Color32)),
     More,
     Activity,
+    /// Background tasks (an hourglass).
+    Tasks,
+    Logs,
     Filter,
     Auto,
     Info,
@@ -66,6 +69,8 @@ impl Icon {
             Icon::Custom(_) => return None,
             Icon::More => ('\u{E1FE}', false),
             Icon::Activity => ('\u{E000}', false),
+            Icon::Tasks => ('\u{E2B6}', false),
+            Icon::Logs => ('\u{E2F4}', false),
             Icon::Filter => ('\u{E268}', false),
             Icon::Auto => ('\u{E6B6}', false),
             Icon::Info => ('\u{E2CE}', false),

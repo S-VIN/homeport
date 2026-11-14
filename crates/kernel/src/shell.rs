@@ -185,7 +185,7 @@ pub(crate) fn frame(root: &mut egui::Ui, k: &Arc<Kernel>, s: &mut SessionState) 
         activity(ctx, &mut cx, &p, anchor, wide);
     }
     let animating = cx.s.pending_since().is_some()
-        || cx.s.saved_at.is_some_and(|t| cx.s.now - t < 2.)
+        || cx.s.saved_at().is_some_and(|t| cx.s.now - t < 2.)
         || !cx.s.toasts.is_empty();
     if animating {
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -222,7 +222,7 @@ fn save_state(ui: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette) {
         return;
     }
     let saving = cx.s.pending_since().is_some_and(|t| cx.s.now - t > 0.2);
-    let saved = !saving && cx.s.saved_at.is_some_and(|t| cx.s.now - t < 2.);
+    let saved = !saving && cx.s.saved_at().is_some_and(|t| cx.s.now - t < 2.);
     if saving || saved {
         ui.label(
             RichText::new(if saving { "Saving…" } else { "Saved" })
@@ -235,7 +235,7 @@ fn save_state(ui: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette) {
     }
 }
 
-/// The Activity button: icon and "Activity" or "2 running".
+/// The Tasks button: icon and "Tasks" or "2 running".
 fn activity_button(ui: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette) -> egui::Response {
     let board = cx.k.board();
     let active: Vec<_> = board
@@ -244,13 +244,16 @@ fn activity_button(ui: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette) -> egui::
         .filter(|r| r.phase.active() && !r.quiet)
         .collect();
     let failed = board.runs.iter().any(|r| r.phase == Phase::Failed);
-    let text = if active.is_empty() {
-        "Activity".to_owned()
+    // On a phone an idle Activity is just its icon: the room goes to status chips.
+    let text = if active.is_empty() && kit::phone(ui) {
+        String::new()
+    } else if active.is_empty() {
+        "Tasks".to_owned()
     } else {
         format!("{} running", active.len())
     };
     let tip = if active.is_empty() {
-        String::new()
+        "Background tasks".to_owned()
     } else {
         active
             .iter()
@@ -265,7 +268,7 @@ fn activity_button(ui: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette) -> egui::
     } else {
         p.faint
     };
-    let r = kit::chip(ui, Some(Lead::Icon(Icon::Activity, ink)), &text, &tip);
+    let r = kit::chip(ui, Some(Lead::Icon(Icon::Tasks, ink)), &text, &tip);
     if r.clicked() {
         cx.s.activity_open = !cx.s.activity_open;
         cx.s.panels_open = false;
@@ -289,7 +292,10 @@ fn status_bar(ui: &mut egui::Ui, cx: &mut UiCx) {
                 cx.scoped(None, |cx| cx.toggle_panels_from(&r));
             }
         }
-        let width = ui.available_width() - 150.;
+        // Chips get all but the right block, as wide as it was last frame.
+        let right_key = egui::Id::unique("status-right-width");
+        let right: f32 = ui.data(|d| d.get_temp(right_key)).unwrap_or(150.);
+        let width = ui.available_width() - right - 8.;
         ui.allocate_ui_with_layout(
             vec2(width.max(80.), 24.),
             Layout::left_to_right(Align::Center),
@@ -303,37 +309,88 @@ fn status_bar(ui: &mut egui::Ui, cx: &mut UiCx) {
             cx.s.activity_chip = Some(r.rect);
             ui.add_space(4.);
             save_state(ui, cx, &p);
+            let used = ui.min_rect().width();
+            if (used - right).abs() > 0.5 {
+                ui.data_mut(|d| d.insert_temp(right_key, used));
+                ui.ctx().request_repaint();
+            }
         });
     });
 }
 
 /// The status chips that fit whole, in order; the rest fold into a "+N" chip
-/// that opens all panels. The first chip (the connection) always shows and
-/// shortens its text when needed.
+/// that opens all panels. The first chip (the connection) gives up to 45% of
+/// the bar to the others and shortens its text instead.
 fn status_chips(ui: &mut egui::Ui, cx: &mut UiCx) {
+    const MORE: f32 = 44.;
     let list = cx.k.reg.contributions(&STATUS).to_vec();
-    let mut hidden = 0;
+    let gap = ui.spacing().item_spacing.x;
+    let bar = ui.available_width();
+    // Natural widths, measured off-screen this frame; 0 for a chip that shows nothing.
+    let natural: Vec<f32> = list
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let cap = if i == 0 { bar } else { 240. };
+            let area = Rect::from_min_size(ui.cursor().min, vec2(cap, 24.));
+            let mut probe = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt(("status-probe", c.id.as_str()))
+                    .max_rect(area)
+                    .layout(Layout::left_to_right(Align::Center))
+                    .sizing_pass()
+                    .invisible(),
+            );
+            cx.scoped(Some(c.plugin), |cx| (c.view)(&mut probe, cx, &()));
+            probe.min_rect().width()
+        })
+        .collect();
+    let Some((&first, rest)) = natural.split_first() else {
+        return;
+    };
+    let total: f32 = natural.iter().filter(|w| **w > 0.).map(|w| w + gap).sum();
+    let mut shown = vec![true; natural.len()];
+    let mut first_width = first;
+    if total > bar {
+        // Others fill what the first chip leaves, in order, whole or not at all.
+        let mut used = first.min(bar * 0.55) + gap;
+        for (i, &w) in rest.iter().enumerate() {
+            let left = rest[i + 1..].iter().any(|w| *w > 0.);
+            if w > 0. && used + w + gap > bar - if left { MORE } else { 0. } {
+                shown[i + 1..].fill(false);
+                break;
+            }
+            used += w + gap;
+        }
+        let others: f32 = rest
+            .iter()
+            .zip(&shown[1..])
+            .filter(|(w, on)| **on && **w > 0.)
+            .map(|(w, _)| w + gap)
+            .sum();
+        let hidden = rest.iter().zip(&shown[1..]).any(|(w, on)| !on && *w > 0.);
+        let more = if hidden { MORE } else { 0. };
+        first_width = first.min(bar - others - more - gap).max(0.);
+    }
     for (i, c) in list.iter().enumerate() {
-        let key = egui::Id::unique(("status-chip", c.id.as_str()));
-        // Width from the last frame; 0 for a chip that shows nothing.
-        let last: f32 = ui.data(|d| d.get_temp(key)).unwrap_or(0.);
-        let room = ui.available_width() - if i + 1 < list.len() { 44. } else { 0. };
-        if i > 0 && (hidden > 0 || last > room) {
-            hidden += usize::from(last > 0.);
+        if !shown[i] {
             continue;
         }
-        let max = if i == 0 { room } else { room.min(240.) };
-        let area = Rect::from_min_size(ui.cursor().min, vec2(max.max(0.), 24.));
+        let width = if i == 0 { first_width } else { natural[i] };
+        let area = Rect::from_min_size(ui.cursor().min, vec2(width, 24.));
         let builder = egui::UiBuilder::new()
             .max_rect(area)
             .layout(Layout::left_to_right(Align::Center));
-        let drawn = ui
-            .scope_builder(builder, |ui| {
-                cx.scoped(Some(c.plugin), |cx| (c.view)(ui, cx, &()))
-            })
-            .response;
-        ui.data_mut(|d| d.insert_temp(key, drawn.rect.width()));
+        ui.scope_builder(builder, |ui| {
+            ui.set_clip_rect(area.intersect(ui.clip_rect()));
+            cx.scoped(Some(c.plugin), |cx| (c.view)(ui, cx, &()))
+        });
     }
+    let hidden = natural
+        .iter()
+        .zip(&shown)
+        .filter(|(w, on)| !**on && **w > 0.)
+        .count();
     if hidden > 0 {
         let r = kit::chip(ui, None, &format!("+{hidden}"), "More status");
         if r.clicked() {
@@ -356,12 +413,12 @@ pub fn panel_title(ui: &mut egui::Ui, title: &str, right: impl FnOnce(&mut egui:
     ui.add_space(2.);
 }
 
-/// Panel title with a "Manage" button that opens `page` (hidden on that page).
+/// Panel title with an "Open" button that opens `page` (hidden on that page).
 pub fn panel_title_page(ui: &mut egui::Ui, cx: &mut UiCx, title: &str, page: &'static str) {
     let mut open = false;
     panel_title(ui, title, |ui| {
         if cx.page() != page {
-            open = kit::Button::ghost("Manage")
+            open = kit::Button::ghost("Open")
                 .tone(Tone::Accent)
                 .show(ui)
                 .clicked();
@@ -389,12 +446,28 @@ fn panels(ui: &mut egui::Ui, cx: &mut UiCx, cards: bool, only: Option<usize>) {
                 return;
             }
         } else {
-            if !first {
-                ui.add_space(theme::SPACE_M);
-                kit::separator(ui);
-                ui.add_space(theme::SPACE_M);
+            // A divider above every panel but the first; a panel that draws
+            // nothing leaves no trace.
+            let gap = if first { 0. } else { theme::SPACE_M };
+            let mut frame = egui::Frame::NONE
+                .inner_margin(egui::Margin {
+                    top: (gap * 2.) as i8,
+                    ..Default::default()
+                })
+                .begin(ui);
+            frame
+                .content_ui
+                .set_min_width(frame.content_ui.available_width());
+            add(&mut frame.content_ui);
+            if frame.content_ui.min_rect().height() <= 0. {
+                return;
             }
-            add(ui);
+            let rect = frame.end(ui).rect;
+            if !first {
+                let line = theme::palette(ui).border;
+                ui.painter()
+                    .hline(rect.x_range(), rect.top() + gap + 0.5, (1., line));
+            }
         }
         first = false;
     };
@@ -821,7 +894,7 @@ fn settings(ui: &mut egui::Ui, cx: &mut UiCx) {
         kit::property_with(ui, "Data folder", |ui| {
             let w = ui.available_width() - theme::CONTROL - theme::HORIZONTAL_GAP;
             ui.allocate_ui_with_layout(vec2(w, 20.), Layout::left_to_right(Align::Center), |ui| {
-                kit::truncated(ui, RichText::new(&dir).color(p.foreground), Some(&dir));
+                kit::middle(ui, &dir, p.foreground);
             });
             if kit::icon_button(ui, Icon::Copy, "Copy path", true).clicked() {
                 ui.ctx().copy_text(dir.clone());
@@ -1003,7 +1076,12 @@ fn plugin_manager(ui: &mut egui::Ui, cx: &mut UiCx) {
         kit::section_note(
             ui,
             cat.name,
-            if exclusive { "One at a time" } else { "" },
+            // Only says something when there is a choice.
+            if exclusive && members.len() > 1 {
+                "One at a time"
+            } else {
+                ""
+            },
             None,
         );
         kit::settings_card(ui, |ui| {
@@ -1027,9 +1105,12 @@ fn plugin_manager(ui: &mut egui::Ui, cx: &mut UiCx) {
                     ui,
                     pl.id,
                     |ui| {
-                        let label = ui.label(RichText::new(pl.name).color(p.foreground));
-                        if !matches!(pl.id, "subscriptions" | "connections" | "autostart") {
-                            label.on_hover_text(pl.description);
+                        ui.label(RichText::new(pl.name).color(p.foreground));
+                        if !pl.description.is_empty() {
+                            let what = RichText::new(pl.description)
+                                .size(theme::SMALL)
+                                .color(p.muted);
+                            ui.add(egui::Label::new(what).wrap());
                         }
                         if let Some(only) = &unsupported {
                             ui.label(
@@ -1073,7 +1154,7 @@ fn expire_toasts(cx: &mut UiCx) {
 
 /// Toasts live in their own strip above the navigation (narrow) or under the
 /// page (wide): its room is reserved, so a toast never covers rows. Close with
-/// ×, after 8 s, or with the action (Undo); hover keeps them.
+/// ×, after 8 s, or with its action button; hover keeps them.
 fn toasts(
     root: &mut egui::Ui,
     cx: &mut UiCx,
@@ -1114,6 +1195,8 @@ fn toasts(
             .collect();
     let mut dismiss = None;
     let mut open = None;
+    let mut act = None;
+    let live_actions = cx.k.notice_actions();
     let mut hold = false;
     let titles: Vec<(&'static str, &'static str)> =
         cx.k.reg
@@ -1140,10 +1223,11 @@ fn toasts(
                     continue;
                 };
                 let n = &t.notice;
-                let (icon, tone) = if n.error {
-                    (Icon::Error, p.danger)
-                } else {
-                    (Icon::Connected, p.success)
+                // A toast that offers an action reports a change to undo, not a success.
+                let (icon, tone) = match (n.error, &n.action) {
+                    (true, _) => (Icon::Error, p.danger),
+                    (false, Some(_)) => (Icon::Info, p.accent),
+                    (false, None) => (Icon::Connected, p.success),
                 };
                 let r = egui::Frame::NONE
                     .fill(p.surface)
@@ -1219,6 +1303,17 @@ fn toasts(
                             open = Some(id);
                             dismiss = Some(n.id);
                         }
+                        // Pressed in another window: the button has nothing left to do.
+                        if let Some(action) =
+                            n.action.as_ref().filter(|_| live_actions.contains(&n.id))
+                            && kit::Button::ghost(action.label)
+                                .tone(Tone::Accent)
+                                .show(ui)
+                                .clicked()
+                        {
+                            act = Some(n.id);
+                            dismiss = Some(n.id);
+                        }
                     });
                 hold |= r.response.contains_pointer();
             }
@@ -1239,6 +1334,10 @@ fn toasts(
     }
     if let Some(page) = open {
         cx.s.page = page;
+    }
+    // Every window shows the toast; its action runs once.
+    if let Some(action) = act.and_then(|id| cx.k.take_notice_action(id)) {
+        cx.scoped(action.plugin, |cx| (action.run)(cx));
     }
 }
 
@@ -1286,7 +1385,7 @@ fn activity(ctx: &egui::Context, cx: &mut UiCx, p: &kit::Palette, anchor: Rect, 
             ui.set_width(width - 26.);
             // An area starts at last frame's size: let the content grow.
             ui.set_max_height((bounds.height() - 26.).max(0.));
-            panel_title(ui, "Activity", |_| {});
+            panel_title(ui, "Tasks", |_| {});
             egui::ScrollArea::vertical()
                 .id_salt("activity-scroll")
                 .max_height((bounds.height() - 54.).max(0.))

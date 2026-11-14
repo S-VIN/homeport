@@ -26,7 +26,7 @@ use tokio::{sync::Semaphore, task::JoinSet, time::timeout};
 
 pub static PLUGIN: Plugin = Plugin {
     id: "health-checks",
-    name: "Checks",
+    name: "Tests",
     description: "Measure latency, HTTP tests and download speed of every server and rate it.",
     category: categories::SERVERS,
     requires: &["servers"],
@@ -281,14 +281,15 @@ fn skipped(snap: &Snapshot, s: &Server) -> bool {
     servers::exclusion(snap, s).is_some_and(|e| e.disconnect)
 }
 
-async fn check_all(cx: &Cx) -> Result<()> {
+/// Test every eligible server, or only those in `only`.
+async fn check_all(cx: &Cx, only: Option<&[Id]>) -> Result<()> {
     let snap = cx.snapshot();
     // The connected server first, then the best ones: their results matter most.
     let selected = *snap.get(&servers::SELECTED);
     let mut ids: Vec<(Id, i64)> = snap
         .get(&servers::SERVERS)
         .iter()
-        .filter(|s| !skipped(&snap, s))
+        .filter(|s| !skipped(&snap, s) && only.is_none_or(|ids| ids.contains(&s.id)))
         .map(|s| {
             (
                 s.id,
@@ -330,7 +331,7 @@ async fn check_all(cx: &Cx) -> Result<()> {
     if failures > 0 {
         bail!(
             "{} could not complete.",
-            kit::plural(failures, "server check", "server checks")
+            kit::plural(failures, "server test", "server tests")
         );
     }
     Ok(())
@@ -370,6 +371,8 @@ fn setup(p: &mut Setup) -> Result<()> {
     );
 
     p.handle(check_all_servers);
+    p.handle(|cx: Cx, CheckNew(ids): CheckNew| async move { check_all(&cx, Some(&ids)).await });
+    p.wrap(test_new_servers);
     p.handle(check_server);
     p.handle(quick_check);
     p.every(
@@ -381,7 +384,8 @@ fn setup(p: &mut Setup) -> Result<()> {
     p.hook(&servers::EXCLUDE, |snap, s| {
         let h = health(snap, s.id)?;
         unreachable(&h).then(|| Exclusion {
-            reason: "Unreachable on last check".into(),
+            reason: "Unreachable in the last test".into(),
+            group: "Unavailable",
             disconnect: false,
         })
     });
@@ -430,7 +434,30 @@ async fn check_all_servers(cx: Cx, _: CheckAll) -> Result<()> {
     }
     cx.set_live(&CHECKING, true);
     let _pass = Pass(cx.clone());
-    check_all(&cx).await
+    check_all(&cx, None).await
+}
+
+/// Test the servers a subscription just brought in (job "Test new servers"),
+/// so they show a rating right away instead of at the next scheduled test.
+struct CheckNew(Vec<Id>);
+impl Op for CheckNew {
+    type Reply = ();
+    fn job(&self) -> Option<JobSpec> {
+        Some(JobSpec::new("Test new servers").page("servers"))
+    }
+}
+
+async fn test_new_servers(
+    cx: Cx,
+    op: servers::ReplaceFromSource,
+    next: Next<servers::ReplaceFromSource>,
+) -> Result<servers::Replaced> {
+    let replaced = next.run(&cx, op).await?;
+    // A full pass that is running reaches them anyway.
+    if !replaced.added.is_empty() && !*cx.live(&CHECKING) {
+        cx.spawn(CheckNew(replaced.added.clone()))?;
+    }
+    Ok(replaced)
 }
 
 async fn check_server(cx: Cx, op: CheckServer) -> Result<Option<Health>> {
@@ -550,8 +577,8 @@ pub fn summary(snap: &Snapshot, s: &Server) -> String {
         .cloned()
         .collect();
     match health(snap, s.id) {
-        Some(h) if unreachable(&h) => "Unreachable on last check".into(),
-        _ if results.is_empty() => "Not checked yet".into(),
+        Some(h) if unreachable(&h) => "Unreachable in the last test".into(),
+        _ if results.is_empty() => "Not tested yet".into(),
         _ => format!(
             "{} of {} passed",
             results.iter().filter(|r| r.passed).count(),
@@ -585,7 +612,7 @@ fn host(url: &str) -> String {
 fn ui(p: &mut Setup) {
     p.fill(&servers::TOOLBAR, "check-all", 20, |ui, cx, _| {
         let ok = cx.core_status().running();
-        cx.job_button(ui, Icon::Checks, "Check all", ok, || CheckAll);
+        cx.job_button(ui, Icon::Checks, "Test all", ok, || CheckAll);
     });
     let rating = servers::Column {
         id: "rating",
@@ -596,10 +623,13 @@ fn ui(p: &mut Setup) {
     };
     servers::column(p, rating, |ui, cx, s| {
         if cx.live(&IN_FLIGHT).contains(&s.id) {
-            kit::spinner(ui).on_hover_text("Checking…");
+            kit::spinner(ui).on_hover_text("Testing…");
             return;
         }
-        let rating = health(cx.snapshot(), s.id).and_then(|h| h.rating);
+        // An unreachable server has no rating worth a red 0; its row says why.
+        let rating = health(cx.snapshot(), s.id)
+            .filter(|h| !unreachable(h))
+            .and_then(|h| h.rating);
         let text = rating.map_or_else(|| "—".into(), |n| n.to_string());
         ui.colored_label(kit::rating_color(ui, rating), text)
             .on_hover_text(summary(cx.snapshot(), s));
@@ -626,7 +656,7 @@ fn ui(p: &mut Setup) {
     p.page_fn(
         PageSpec {
             id: "tests",
-            title: "Checks",
+            title: "Tests",
             icon: Icon::Checks,
             order: 40,
         },
@@ -635,7 +665,7 @@ fn ui(p: &mut Setup) {
     p.fill(&SETTINGS_SECTIONS, "interval", 0, |ui, cx, _| {
         cx.setting(
             ui,
-            "Check servers",
+            "Test servers",
             &CONFIG,
             |s| &mut s.check_secs,
             |ui, v| kit::interval(ui, "check", v),
@@ -649,9 +679,9 @@ fn details(ui: &mut egui::Ui, cx: &mut UiCx, s: &Server) {
     let pal = kit::colors(ui);
     let h = health(&snap, s.id);
     if cx.live(&IN_FLIGHT).contains(&s.id) {
-        kit::property_with(ui, "Check", |ui| {
+        kit::property_with(ui, "Test", |ui| {
             kit::spinner(ui);
-            ui.label(egui::RichText::new("Checking…").color(pal.muted));
+            ui.label(egui::RichText::new("Testing…").color(pal.muted));
         });
     }
     let ping = h.as_ref().and_then(|h| h.ping_ms);
@@ -662,7 +692,7 @@ fn details(ui: &mut egui::Ui, cx: &mut UiCx, s: &Server) {
     );
     kit::property(
         ui,
-        "Download",
+        "Speed",
         &h.as_ref()
             .and_then(|h| h.bytes_per_sec)
             .map_or_else(|| "—".into(), kit::rate),
@@ -671,7 +701,7 @@ fn details(ui: &mut egui::Ui, cx: &mut UiCx, s: &Server) {
         .as_ref()
         .and_then(|h| h.checked)
         .map_or_else(|| "Never".into(), kit::age);
-    kit::property_with(ui, "Last check", |ui| {
+    kit::property_with(ui, "Last test", |ui| {
         ui.label(egui::RichText::new(checked).color(pal.foreground));
         // A check of just this server, with its outcome right here.
         let key = ("check", s.id);
@@ -686,7 +716,7 @@ fn details(ui: &mut egui::Ui, cx: &mut UiCx, s: &Server) {
                 kit::tone_text(ui, e, kit::Tone::Danger);
             }
             Request::Idle | Request::Done(Ok(Some(_))) => {
-                if kit::Button::ghost("Check now")
+                if kit::Button::ghost("Test now")
                     .icon(Icon::Checks)
                     .show(ui)
                     .clicked()
@@ -705,7 +735,7 @@ fn details(ui: &mut egui::Ui, cx: &mut UiCx, s: &Server) {
         kit::property_with(ui, &host(&t.url), |ui| {
             ui.spacing_mut().item_spacing.x = 4.;
             let (icon, text, color) = match r {
-                None => (Icon::Info, "Not checked".to_owned(), pal.muted),
+                None => (Icon::Info, "Not tested".to_owned(), pal.muted),
                 Some(r) => (
                     if r.passed {
                         Icon::Connected
@@ -719,6 +749,21 @@ fn details(ui: &mut egui::Ui, cx: &mut UiCx, s: &Server) {
             kit::icon(ui, icon, 14., color);
             ui.colored_label(color, text).on_hover_text(&t.url);
         });
+    }
+}
+
+/// How a test did on the last check: a test that fails on every server is
+/// more likely wrong itself (URL or expected status).
+fn test_note(test: &Test, results: &[Measurement]) -> Option<(String, kit::Tone)> {
+    let mine: Vec<&Measurement> = results.iter().filter(|r| r.test == test.id).collect();
+    let passed = mine.iter().filter(|r| r.passed).count();
+    match (mine.len(), passed) {
+        (0, _) => None,
+        (n, 0) if n > 1 => Some((
+            format!("Failed on all {n} servers: check the URL and the expected status"),
+            kit::Tone::Warning,
+        )),
+        (n, p) => Some((format!("Passed on {p} of {n} servers"), kit::Tone::Neutral)),
     }
 }
 
@@ -758,10 +803,19 @@ fn connection_stats(ui: &mut egui::Ui, cx: &mut UiCx, s: &Server) {
 fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
     let n = cx.get(&TESTS).len();
     let counter = kit::count(n, "test URL", "test URLs");
-    kit::page_header(ui, "Checks", &counter, |_| {});
+    kit::page_header(ui, "Tests", &counter, |ui| {
+        let ok = cx.core_status().running();
+        cx.job_button(ui, Icon::Checks, "Test all", ok, || CheckAll);
+    });
+    kit::page_note(
+        ui,
+        "Each server is tested through these URLs for latency, the expected answer and download speed. Results feed the rating (0–100).",
+    );
+    let results = cx.get(&RESULTS);
 
     ListEditor::new(&TESTS)
         .unordered()
+        .subtitle(move |tests, i| test_note(&tests[i], &results))
         .add_form(
             "Add test URL",
             || Test {
@@ -791,6 +845,10 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
             |t: &mut Test| &mut t.expected,
             Expected::ALL,
         ))
-        .empty(Icon::Checks, "No test URLs")
+        .empty(
+            Icon::Checks,
+            "No test URLs",
+            "Tests use a built-in probe; add sites you care about.",
+        )
         .show(ui, cx);
 }

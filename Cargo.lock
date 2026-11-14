@@ -3406,6 +3406,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin-logs"
+version = "0.1.0"
+dependencies = [
+ "plugin-servers",
+ "reqwest",
+ "rproxy-kernel",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "plugin-name-filters"
 version = "0.2.0"
 dependencies = [
@@ -3437,6 +3448,7 @@ dependencies = [
 name = "plugin-subscriptions"
 version = "0.2.0"
 dependencies = [
+ "base64 0.23.1",
  "flate2",
  "plugin-servers",
  "reqwest",
@@ -3833,6 +3845,7 @@ dependencies = [
  "plugin-format-xray",
  "plugin-health-checks",
  "plugin-inbounds",
+ "plugin-logs",
  "plugin-name-filters",
  "plugin-routing",
  "plugin-servers",

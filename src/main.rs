@@ -179,7 +179,12 @@ fn main() -> LaunchResult {
     let Some(_instance) = instance::Instance::acquire(&instance_dir)? else {
         return Ok(());
     };
-    let rt = Runtime::new()?;
+    // A few workers are plenty (the core does the network work); one per CPU
+    // costs memory (a malloc arena each) for nothing.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()?;
     let listener = listen
         .map(|addr| rt.block_on(tokio::net::TcpListener::bind(addr)))
         .transpose()?;
@@ -584,7 +589,7 @@ fn windows(
                 ..Default::default()
             };
             let window = control.clone();
-            let retained = retained.clone();
+            let slot = retained.clone();
             let host = host.clone();
             eframe::run_native(
                 "rproxy",
@@ -607,18 +612,21 @@ fn windows(
                     if window.quitting.load(Ordering::Acquire) {
                         cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
-                    let state = retained
+                    let state = slot
                         .borrow()
                         .clone()
                         .unwrap_or_else(|| WindowState::new(host.session(&cc.egui_ctx)));
                     state.borrow_mut().session.rebind(&cc.egui_ctx);
-                    *retained.borrow_mut() = Some(state.clone());
+                    *slot.borrow_mut() = Some(state.clone());
                     let mut app = Window::new(state, &cc.egui_ctx, false);
                     app.control = Some(window.clone());
                     Ok(Box::new(app))
                 }),
             )?;
             *control.context.lock().unwrap() = None;
+            if let Some(state) = &*retained.borrow() {
+                state.borrow_mut().session.detach();
+            }
             open = false;
         }
         Ok(())

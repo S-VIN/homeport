@@ -34,6 +34,20 @@ pub struct Notice {
     pub error: bool,
     /// Page with the details; the toast offers to open it.
     pub page: Option<&'static str>,
+    /// A button on the toast, see [`Cx::notify_with`].
+    pub action: Option<NoticeAction>,
+}
+/// A toast button that runs an op of the plugin that showed the toast.
+#[derive(Clone)]
+pub struct NoticeAction {
+    pub label: &'static str,
+    pub(crate) plugin: Option<usize>,
+    pub(crate) run: Arc<dyn Fn(&mut crate::UiCx) + Send + Sync>,
+}
+impl std::fmt::Debug for NoticeAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label)
+    }
 }
 
 /// Interface theme, persisted by the kernel.
@@ -651,10 +665,10 @@ impl Kernel {
 
     // ---- notices ----------------------------------------------------------
     pub fn notify(&self, title: &str, text: &str) {
-        self.push_notice(title, text, false, None);
+        self.push_notice(title, text, false, None, None);
     }
     pub fn notify_error(&self, title: &str, text: &str) {
-        self.push_notice(title, text, true, None);
+        self.push_notice(title, text, true, None, None);
     }
     /// Redraw every window and browser session (state that lives outside `State`).
     pub fn repaint(&self) {
@@ -662,9 +676,16 @@ impl Kernel {
     }
     /// An error whose details live on `page`.
     pub fn notify_error_at(&self, title: &str, text: &str, page: Option<&'static str>) {
-        self.push_notice(title, text, true, page);
+        self.push_notice(title, text, true, page, None);
     }
-    fn push_notice(&self, title: &str, text: &str, error: bool, page: Option<&'static str>) {
+    fn push_notice(
+        &self,
+        title: &str,
+        text: &str,
+        error: bool,
+        page: Option<&'static str>,
+        action: Option<NoticeAction>,
+    ) {
         let id = self.next_notice.fetch_add(1, Ordering::Relaxed);
         let mut n = self.notices.lock().unwrap();
         n.push_back(Notice {
@@ -673,6 +694,7 @@ impl Kernel {
             text: text.into(),
             error,
             page,
+            action,
         });
         while n.len() > 16 {
             n.pop_front();
@@ -690,6 +712,20 @@ impl Kernel {
             .filter(|n| n.id > id)
             .cloned()
             .collect()
+    }
+    /// Notices whose action nobody has run yet.
+    pub(crate) fn notice_actions(&self) -> Vec<u64> {
+        let notices = self.notices.lock().unwrap();
+        notices
+            .iter()
+            .filter(|n| n.action.is_some())
+            .map(|n| n.id)
+            .collect()
+    }
+    /// The action of a notice, for the first window that presses it.
+    pub(crate) fn take_notice_action(&self, id: u64) -> Option<NoticeAction> {
+        let mut notices = self.notices.lock().unwrap();
+        notices.iter_mut().find(|n| n.id == id)?.action.take()
     }
     pub(crate) fn last_notice(&self) -> u64 {
         self.next_notice.load(Ordering::Relaxed) - 1
@@ -1049,6 +1085,22 @@ impl Cx {
     }
     pub fn notify(&self, text: &str) {
         self.k.notify(self.plugin_name(), text)
+    }
+    /// A toast with a button that runs `op()`, e.g. "Undo" or "Turn back on":
+    /// `cx.notify_with("Auto select is off.", "Turn back on", || SetAuto(true))`.
+    pub fn notify_with<O: Op>(
+        &self,
+        text: &str,
+        label: &'static str,
+        op: impl Fn() -> O + Send + Sync + 'static,
+    ) {
+        let action = NoticeAction {
+            label,
+            plugin: self.plugin,
+            run: Arc::new(move |cx| cx.run(op())),
+        };
+        self.k
+            .push_notice(self.plugin_name(), text, false, None, Some(action));
     }
 }
 

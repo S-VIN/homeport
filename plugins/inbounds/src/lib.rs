@@ -58,7 +58,7 @@ fn device_control() -> bool {
 
 pub static PLUGIN: Plugin = Plugin {
     id: "inbounds",
-    name: "Listeners",
+    name: "Proxy ports",
     description: "Local HTTP and SOCKS5 proxy ports for browsers and apps, with optional login.",
     requires: &["servers"],
     setup,
@@ -186,7 +186,7 @@ fn setup(p: &mut Setup) -> Result<()> {
     p.wrap(fetch_via_server);
     p.page::<InboundsPage>(PageSpec {
         id: "inbounds",
-        title: "Listeners",
+        title: "Proxy ports",
         icon: Icon::Listeners,
         order: 50,
     });
@@ -230,7 +230,7 @@ async fn seed_default_listener(cx: Cx, _: Started) -> Result<()> {
     };
     if let Err(e) = seed(true).await {
         seed(false).await?;
-        let text = format!("The default listener 127.0.0.1:20808 is off: {e}");
+        let text = format!("The default proxy port 127.0.0.1:20808 is off: {e}");
         cx.kernel()
             .notify_error_at(cx.plugin_name(), &text, Some("inbounds"));
     }
@@ -273,7 +273,7 @@ async fn system_proxy(cx: Cx, (id, address): (Id, std::net::SocketAddr)) -> Resu
                 if ready {
                     Ok(label)
                 } else {
-                    Err("The selected listener is not running. Previous system proxy settings are restored until it becomes available.".into())
+                    Err("The selected proxy port is not running. Previous system proxy settings are restored until it becomes available.".into())
                 }
             });
             cx.set_live(&SYSTEM_PROXY, Some(result));
@@ -319,7 +319,11 @@ fn fragment(snap: &Snapshot) -> Fragment {
 }
 
 /// Unreachable provider: retry the way user traffic goes, through the selected server.
-async fn fetch_via_server(cx: Cx, f: Fetch, next: Next<Fetch>) -> Result<String> {
+async fn fetch_via_server(
+    cx: Cx,
+    f: Fetch,
+    next: Next<Fetch>,
+) -> Result<plugin_subscriptions::Document> {
     let direct = next.run(&cx, f.clone()).await;
     let Err(e) = &direct else { return direct };
     if e.cancelled()
@@ -345,32 +349,29 @@ fn listeners_chip(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
         .count();
     let pal = kit::colors(ui);
     let (color, text) = match (enabled.first(), failed) {
-        (None, _) => (pal.faint, "No listener".to_owned()),
+        (None, _) => (pal.faint, "No proxy port".to_owned()),
         (_, f) if f > 0 => (
             pal.danger,
-            format!("{} failed", kit::plural(f, "listener", "listeners")),
+            format!("{} failed", kit::plural(f, "port", "ports")),
         ),
         (Some(i), _) if enabled.len() == 1 => (pal.muted, i.address()),
-        (Some(_), _) => (
-            pal.muted,
-            kit::plural(enabled.len(), "listener", "listeners"),
-        ),
+        (Some(_), _) => (pal.muted, kit::plural(enabled.len(), "port", "ports")),
     };
     cx.status_chip(
         ui,
         kit::Lead::Icon(Icon::Listeners, color),
         &text,
-        "Local HTTP / SOCKS5 listeners",
+        "Local proxy ports (HTTP and SOCKS5)",
     );
 }
 
 fn listeners_panel(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
     let pal = kit::colors(ui);
     let status = cx.core_status();
-    rproxy_kernel::shell::panel_title_page(ui, cx, "Listeners · HTTP and SOCKS5", "inbounds");
+    rproxy_kernel::shell::panel_title_page(ui, cx, "Proxy ports · HTTP and SOCKS5", "inbounds");
     let list = cx.get(&INBOUNDS);
     if !list.iter().any(|i| i.enabled) {
-        kit::hint(ui, "No listener is on.");
+        kit::hint(ui, "No proxy port is on.");
     }
     for i in list.iter().filter(|i| i.enabled) {
         kit::row_line(ui, theme::CONTROL, |ui| {
@@ -511,7 +512,9 @@ fn device_card(ui: &mut egui::Ui, cx: &mut UiCx, rows: &[Inbound]) {
             "System proxy and TUN unavailable in Flatpak",
             kit::Tone::Neutral,
         )
-        .on_hover_text("Available in the native package. Apps can still connect to the listeners.");
+        .on_hover_text(
+            "Available in the native package. Apps can still connect to the proxy ports.",
+        );
         return;
     }
     if Platform::is_docker() {
@@ -520,7 +523,7 @@ fn device_card(ui: &mut egui::Ui, cx: &mut UiCx, rows: &[Inbound]) {
             "System proxy and TUN are not used in Docker",
             kit::Tone::Neutral,
         )
-        .on_hover_text("Devices and apps connect to the listeners directly.");
+        .on_hover_text("Devices and apps connect to the proxy ports directly.");
         return;
     }
     let device = (*cx.get(&DEVICE)).clone();
@@ -536,7 +539,7 @@ fn device_card(ui: &mut egui::Ui, cx: &mut UiCx, rows: &[Inbound]) {
         kit::settings_row(
             ui,
             "System proxy",
-            "Requires a listener without authentication. Restores previous proxy settings when disabled.",
+            "Requires a proxy port without a password. Restores previous proxy settings when disabled.",
             |ui| {
                 kit::select(ui, "system-proxy", &label, 170., |ui| {
                     if ui
@@ -564,7 +567,7 @@ fn device_card(ui: &mut egui::Ui, cx: &mut UiCx, rows: &[Inbound]) {
             ) {
                 (_, None) => kit::tone_text(
                     ui,
-                    "The chosen listener is off or needs a login, so the system proxy is not set.",
+                    "The chosen proxy port is off or needs a password, so the system proxy is not set.",
                     kit::Tone::Warning,
                 ),
                 (Some(Err(e)), _) => kit::tone_text(ui, e, kit::Tone::Danger),
@@ -577,7 +580,7 @@ fn device_card(ui: &mut egui::Ui, cx: &mut UiCx, rows: &[Inbound]) {
         let mut tun = device.tun;
         kit::settings_row(
             ui,
-            "Capture all traffic",
+            "TUN mode",
             "Route every app through rproxy with a virtual network interface (TUN)",
             |ui| {
                 if kit::toggle(ui, &mut tun, "").changed() {
@@ -614,8 +617,12 @@ impl Page for InboundsPage {
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.editing.clear();
         }
-        let counter = kit::count(rows.len(), "listener", "listeners");
-        kit::page_header(ui, "Listeners", &counter, |_| {});
+        let counter = kit::count(rows.len(), "port", "ports");
+        kit::page_header(ui, "Proxy ports", &counter, |_| {});
+        kit::page_note(
+            ui,
+            "Apps connect here; each port takes HTTP and SOCKS5 (a mixed port). Address 0.0.0.0 also lets other devices on your network use it.",
+        );
 
         device_card(ui, cx, &rows);
         ui.add_space(theme::SECTION_GAP);
@@ -631,7 +638,7 @@ impl Page for InboundsPage {
         }
         let draft = self.adding.get_or_insert_with(|| Draft::fresh(&rows));
         let busy = cx.pending(add_key);
-        if kit::add_bar(ui, "Add listener", !busy, |ui, width| {
+        if kit::add_bar(ui, "Add port", !busy, |ui, width| {
             let port_w = 84.;
             let ip_w = (width - port_w - theme::HORIZONTAL_GAP).max(80.);
             let a = kit::input(
@@ -668,7 +675,7 @@ impl Page for InboundsPage {
         }
         kit::list_card(ui, |ui| {
             if rows.is_empty() {
-                kit::empty(ui, Icon::Listeners, "No listeners");
+                kit::empty(ui, Icon::Listeners, "No proxy ports");
                 return;
             }
             let actions = 2. * theme::CONTROL;

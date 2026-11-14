@@ -96,15 +96,37 @@ pub fn disclosure(ui: &mut Ui, id: impl egui::AsIdSalt, label: &str, add: impl F
         add(ui);
     }
 }
-/// Labelled metrics side by side: caption above a value.
+/// Labelled metrics side by side: caption above a value. Tiles too narrow
+/// for their caption wrap into even rows (2 × 2 on a phone, never 2 + 1).
 pub fn stats(ui: &mut Ui, items: &[(&str, String, Option<Color32>)]) {
+    const MIN_TILE: f32 = 80.;
     let p = theme::palette(ui);
     if items.is_empty() {
         return;
     }
     let gap = theme::SPACE_S;
-    let width =
-        ((ui.available_width() - gap * (items.len() as f32 - 1.)) / items.len() as f32).floor();
+    let fit = ((ui.available_width() + gap) / (MIN_TILE + gap))
+        .floor()
+        .max(1.) as usize;
+    let per_row = (1..=fit.min(items.len()))
+        .rev()
+        .find(|n| items.len().is_multiple_of(*n))
+        .unwrap_or(1);
+    let width = ((ui.available_width() - gap * (per_row as f32 - 1.)) / per_row as f32).floor();
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = gap;
+        for line in items.chunks(per_row) {
+            stats_row(ui, &p, line, width, gap);
+        }
+    });
+}
+fn stats_row(
+    ui: &mut Ui,
+    p: &crate::Palette,
+    items: &[(&str, String, Option<Color32>)],
+    width: f32,
+    gap: f32,
+) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = gap;
         for (label, value, color) in items {

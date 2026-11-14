@@ -306,6 +306,15 @@ impl CoreApi {
             .await
             .map_err(Error::msg)
     }
+    /// The core's live log (see [`mihomo::Controller::logs`]).
+    pub async fn logs(&self, level: &str) -> Result<reqwest::Response> {
+        self.core
+            .controller()
+            .await?
+            .logs(level)
+            .await
+            .map_err(Error::msg)
+    }
     pub async fn close_connection(&self, id: &str) -> Result<()> {
         self.core
             .controller()

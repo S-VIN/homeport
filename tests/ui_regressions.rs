@@ -518,12 +518,16 @@ async fn popup_review_scenarios() {
                 let mut ui = Ui::new(host.clone(), size, dark);
                 ui.settle();
                 match scenario {
-                    "activity-long"=>ui.click("Activity"),
+                    "activity-long" if ui.text("Tasks").is_some()=>ui.click("Tasks"),
+                    "activity-long"=>{
+                        // On a phone idle Tasks is only its icon, at the right end of the bar.
+                        for pressed in [true,false] { let pos=Pos2::new(size[0]-22.,16.);ui.frame(vec![Event::PointerMoved(pos),Event::PointerButton {pos,button:egui::PointerButton::Primary,pressed,modifiers:Default::default()}]); }
+                    },
                     "connection" if size[0]<960.=>{
                         // A selected server's emoji label is painted by the atlas, so use its chip bounds.
                         for pressed in [true,false] { let pos=Pos2::new(70.,16.);ui.frame(vec![Event::PointerMoved(pos),Event::PointerButton {pos,button:egui::PointerButton::Primary,pressed,modifiers:Default::default()}]); }
                     },
-                    "listeners" if size[0]<960.=>{ if ui.text("No listener").is_some(){ui.click("No listener");}else{continue;} },
+                    "listeners" if size[0]<960.=>{ if ui.text("No proxy port").is_some(){ui.click("No proxy port");}else{continue;} },
                     "more" if ui.text("More").is_some()=>ui.click("More"),
                     "schedule"=>{ui.navigate("Settings");ui.reveal("Every day");ui.click("Every day");},
                     "tooltip"=>{ui.navigate("Settings");ui.hover("Export…");},
@@ -532,10 +536,10 @@ async fn popup_review_scenarios() {
                     "plugins"=>ui.navigate("Plugins"),
                     "settings"=>ui.navigate("Settings"),
                     "connections"=>ui.navigate("Connections"),
-                    "inbounds"=>ui.navigate("Listeners"),
+                    "inbounds"=>ui.navigate("Proxy ports"),
                     "routing"=>ui.navigate("Routing"),
-                    "checks"=>ui.navigate("Checks"),
-                    "system-proxy-help"=>{ui.navigate("Listeners");ui.hover("System proxy");},
+                    "checks"=>ui.navigate("Tests"),
+                    "system-proxy-help"=>{ui.navigate("Proxy ports");ui.hover("System proxy");},
                     "subscription-tooltip"=>{ui.navigate("Subscriptions");let label=if std::env::var_os("RPROXY_TEST_SUBSCRIPTION_URLS").is_some(){"allvsub.cc"}else{"Helsinki ⚡"}; if ui.text(label).is_some(){ui.hover(label);}else{continue;}},
                     "connection-tooltip" if size[0]<960.=>{ui.frame(vec![Event::PointerMoved(Pos2::new(70.,16.))]);for _ in 0..12 { ui.frame(vec![]); }},
                     "server-tooltip"|"server-details"=>{

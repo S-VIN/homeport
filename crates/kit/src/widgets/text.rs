@@ -14,6 +14,15 @@ pub fn hint(ui: &mut Ui, text: impl Into<String>) -> Response {
         false,
     )
 }
+/// One line of help under a page header: what the page does, in plain words.
+/// It wraps, so touch screens (no hover) read it too.
+pub fn page_note(ui: &mut Ui, text: impl Into<String>) {
+    let text = RichText::new(text)
+        .size(theme::SMALL)
+        .color(theme::palette(ui).muted);
+    crate::emoji::text_label(ui, text, true, false);
+    ui.add_space(theme::SPACE_M);
+}
 /// Small muted column caption.
 pub fn caption(ui: &mut Ui, text: impl Into<String>) -> Response {
     crate::emoji::text_label(
@@ -37,12 +46,14 @@ pub fn tone_text(ui: &mut Ui, text: impl Into<String>, tone: Tone) -> Response {
 }
 /// `1 server`, `2 servers`.
 /// `1.2 MB`, `640 KB`, `12 B` (decimal units, like file managers).
+/// Sizes in steps of 1024, like providers' plans and other proxy apps
+/// ("100 GB" is 100 × 1024³ bytes).
 pub fn bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = n as f64;
     let mut unit = 0;
-    while v >= 1000. && unit < UNITS.len() - 1 {
-        v /= 1000.;
+    while v >= 1024. && unit < UNITS.len() - 1 {
+        v /= 1024.;
         unit += 1;
     }
     if unit == 0 || v >= 100. {

@@ -45,8 +45,15 @@ fn connection_card(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
         panel_title(ui, "Connection", |ui| {
             kit::badge(ui, "Not connected", Tone::Neutral);
         });
-        if let Some(status) = snap.hooks(&crate::IDLE, &()).into_iter().flatten().next() {
-            kit::tone_text(ui, status, Tone::Neutral);
+        match snap.hooks(&crate::IDLE, &()).into_iter().flatten().next() {
+            Some(status) => drop(kit::tone_text(ui, status, Tone::Neutral)),
+            None => {
+                let text = "Traffic that should go through the proxy is blocked until you connect a server.";
+                let text = egui::RichText::new(text)
+                    .size(theme::SMALL)
+                    .color(pal.muted);
+                ui.add(egui::Label::new(text).wrap());
+            }
         }
         if cx.page() != "servers" {
             ui.add_space(6.);
@@ -85,6 +92,9 @@ fn connection_card(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
     if Button::secondary("Disconnect")
         .icon(Icon::Disconnect)
         .show(ui)
+        .on_hover_text(
+            "Proxied traffic is blocked until you connect again; direct rules keep working.",
+        )
         .clicked()
     {
         cx.submit("disconnect", Select::manual(None));
@@ -138,12 +148,14 @@ impl Page for ServersPage {
         if self.sort >= sorts.len() {
             self.sort = 0;
         }
-        let mut rows: Vec<&Server> = servers
+        // Each row with why it can't be used, worked out once per frame.
+        let mut rows: Vec<(&Server, Option<Exclusion>)> = servers
             .iter()
             .filter(|s| {
                 self.source.is_none_or(|id| id == s.source)
                     && self.protocol.is_none_or(|p| p == s.protocol)
             })
+            .map(|s| (s, exclusion(&snap, s)))
             .collect();
         let frozen = snap.hooks(&FREEZE, &()).into_iter().any(|f| f) && !self.frozen.is_empty();
         if frozen {
@@ -153,18 +165,18 @@ impl Page for ServersPage {
                 .enumerate()
                 .map(|(i, id)| (*id, i))
                 .collect();
-            rows.sort_by_key(|s| rank.get(&s.id).copied().unwrap_or(usize::MAX));
+            rows.sort_by_key(|(s, _)| rank.get(&s.id).copied().unwrap_or(usize::MAX));
         } else {
             let key = sorts[self.sort].1;
-            rows.sort_by_cached_key(|s| {
+            rows.sort_by_cached_key(|(s, e)| {
                 (
-                    exclusion(&snap, s).is_some(),
+                    e.as_ref().map(|e| e.group),
                     key(&snap, s),
                     natural_key(&s.name),
                     s.id,
                 )
             });
-            self.frozen = rows.iter().map(|s| s.id).collect();
+            self.frozen = rows.iter().map(|(s, _)| s.id).collect();
         }
         if rows.is_empty() {
             kit::list_card(ui, |ui| {
@@ -186,7 +198,15 @@ impl Page for ServersPage {
             kit::list_header(ui, |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     kit::action_cell(ui, ACTION, |_| {});
-                    cx.slot_rev(ui, &COLUMNS, &Cell { server: None, wide });
+                    cx.slot_rev(
+                        ui,
+                        &COLUMNS,
+                        &Cell {
+                            server: None,
+                            wide,
+                            excluded: false,
+                        },
+                    );
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.add_space(CHEVRON + theme::HORIZONTAL_GAP);
                         let caption = if rows.len() == servers.len() {
@@ -202,14 +222,44 @@ impl Page for ServersPage {
                 .id_salt("server-rows")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    for s in rows {
+                    let group = |i: usize| rows[i].1.as_ref().map(|e| e.group);
+                    for (i, (s, excluded)) in rows.iter().enumerate() {
+                        // Servers that can't be used close the list in groups,
+                        // each under its caption (not while a check freezes the order).
+                        if let Some(name) = group(i).filter(|_| !frozen && i > 0)
+                            && group(i - 1) != Some(name)
+                        {
+                            let count = (i..rows.len())
+                                .take_while(|&j| group(j) == Some(name))
+                                .count();
+                            ui.add_space(theme::SPACE_M);
+                            ui.horizontal(|ui| {
+                                ui.add_space(CHEVRON + theme::HORIZONTAL_GAP);
+                                kit::caption(ui, format!("{name} · {count}"));
+                            });
+                        }
+                        let excluded = excluded.clone();
                         ui.push_id(s.id, |ui| {
-                            self.row(ui, cx, &snap, s, selected_id == Some(s.id), core_ok, wide)
+                            let state = RowState {
+                                selected: selected_id == Some(s.id),
+                                excluded,
+                                core_ok,
+                                wide,
+                            };
+                            self.row(ui, cx, &snap, s, state)
                         });
                     }
                 });
         });
     }
+}
+
+/// What a row shows besides the server itself.
+struct RowState {
+    selected: bool,
+    excluded: Option<Exclusion>,
+    core_ok: bool,
+    wide: bool,
 }
 
 fn sort_keys(snap: &Snapshot) -> Vec<SortKey> {
@@ -240,10 +290,10 @@ impl ServersPage {
                 &self
                     .source
                     .map(|id| source_label(snap, id))
-                    .unwrap_or_else(|| "All sources".into()),
+                    .unwrap_or_else(|| "All subscriptions".into()),
                 w,
                 |ui| {
-                    ui.selectable_value(&mut self.source, None, "All sources");
+                    ui.selectable_value(&mut self.source, None, "All subscriptions");
                     for id in &sources {
                         ui.selectable_value(&mut self.source, Some(*id), source_label(snap, *id));
                     }
@@ -289,16 +339,18 @@ impl ServersPage {
         cx: &mut UiCx,
         snap: &Snapshot,
         s: &Server,
-        selected: bool,
-        core_ok: bool,
-        wide: bool,
+        state: RowState,
     ) {
-        let excluded = exclusion(snap, s);
+        let RowState {
+            selected,
+            excluded,
+            core_ok,
+            wide,
+        } = state;
         let mut expanded = self.expanded.contains(&s.id);
         let mut connect = None;
         kit::row(ui, s.id, selected, |ui, row| {
-            let two_lines = excluded.is_some() && !expanded;
-            kit::row_line(ui, if two_lines { 44. } else { theme::ROW }, |ui| {
+            kit::row_line(ui, theme::ROW, |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     kit::action_cell(ui, ACTION, |ui| {
                         connect = connect_button(ui, s, selected, excluded.is_none(), core_ok);
@@ -309,6 +361,7 @@ impl ServersPage {
                         &Cell {
                             server: Some(s.clone()),
                             wide,
+                            excluded: excluded.is_some(),
                         },
                     );
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -316,7 +369,6 @@ impl ServersPage {
                             server: s,
                             excluded: excluded.as_ref(),
                             expanded,
-                            two_lines,
                             hovered: row.hovered,
                             wide,
                         };
@@ -363,7 +415,7 @@ fn details_body(
     }
     // A long name is cut in the row.
     kit::property(ui, "Name", &s.name);
-    kit::property_with(ui, "Source", |ui| {
+    kit::property_with(ui, "Subscription", |ui| {
         source_tag(ui, snap, s.source, 200.);
     });
     kit::property(ui, "Address", &format!("{}:{}", s.address, s.port));
@@ -419,13 +471,12 @@ enum TitleClick {
     /// Double click on the name.
     Connect,
 }
-/// Chevron, name and source tag of a row; an excluded server says why on a
-/// second line. One click target expands the row.
+/// Chevron, name and source tag of a row; an excluded server says why on
+/// hover (and in its details). One click target expands the row.
 struct Title<'a> {
     server: &'a Server,
     excluded: Option<&'a Exclusion>,
     expanded: bool,
-    two_lines: bool,
     hovered: bool,
     wide: bool,
 }
@@ -433,7 +484,7 @@ impl Title<'_> {
     fn show(&self, ui: &mut egui::Ui, snap: &Snapshot) -> Option<TitleClick> {
         let (s, pal) = (self.server, theme::palette(ui));
         let label = source_label(snap, s.source);
-        let tag_w = kit::tag_width(ui, &label, if self.wide { 130. } else { 84. });
+        let tag_w = kit::tag_width(ui, &label, if self.wide { 180. } else { 84. });
         let name_w =
             (ui.available_width() - CHEVRON - tag_w - 2. * theme::HORIZONTAL_GAP - 4.).max(40.);
         let (rect, chevron) =
@@ -465,21 +516,10 @@ impl Title<'_> {
             source_tag(ui, snap, s.source, tag_w);
             name.inner
         };
-        let name = match self.excluded.filter(|_| self.two_lines) {
-            Some(e) => {
-                let layout = egui::Layout::top_down(egui::Align::Min);
-                ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 40.), layout, |ui| {
-                    ui.spacing_mut().item_spacing.y = 0.;
-                    let name = ui.horizontal(name_line).inner;
-                    let why = egui::RichText::new(&e.reason)
-                        .size(theme::SMALL)
-                        .color(pal.warning);
-                    ui.add(egui::Label::new(why).truncate());
-                    name
-                })
-                .inner
-            }
-            None => name_line(ui),
+        let name = name_line(ui);
+        let name = match self.excluded {
+            Some(e) => name.on_hover_text(&e.reason),
+            None => name,
         };
         if name.double_clicked() {
             Some(TitleClick::Connect)

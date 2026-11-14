@@ -19,6 +19,7 @@ pub fn catalog() -> Vec<&'static Plugin> {
         &plugin_exit_server::PLUGIN,
         &plugin_vless_server::PLUGIN,
         &plugin_connections::PLUGIN,
+        &plugin_logs::PLUGIN,
         // Desktop integration (Flatpak uses the Background portal); the plugin
         // itself declares the systems it supports.
         #[cfg(feature = "desktop")]

@@ -26,8 +26,8 @@ use std::time::Duration;
 
 pub static PLUGIN: Plugin = Plugin {
     id: "exit-server",
-    name: "Exit server",
-    description: "Send all traffic through one stable exit server after the selected server.",
+    name: "Proxy chain",
+    description: "Send proxied traffic through the current server, then one stable exit server.",
     // Links are parsed with format-uri's parser; the plugin itself may be off (a node).
     requires: &["servers"],
     setup,
@@ -66,13 +66,13 @@ pub static PROBE: State<Option<(std::result::Result<u32, String>, u64)>> =
     State::new("exit-server.probe");
 
 choices!(pub enum Entry {
-    Selected => "Selected server",
-    Direct => "This machine",
+    Selected => "Current server" | "Selected server",
+    Direct => "Directly" | "This machine",
 });
 choices!(pub enum WarpUse {
     Off => "Off",
-    Backup => "Backup",
-    Only => "Exit",
+    Backup => "If exit fails" | "Backup",
+    Only => "Always" | "Exit",
 });
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
@@ -127,7 +127,7 @@ impl Plan {
         match self {
             Self::Exit(e) => e.name.clone(),
             Self::Warp => "Cloudflare WARP".into(),
-            Self::ExitThenWarp(e) => format!("{} (WARP as backup)", e.name),
+            Self::ExitThenWarp(e) => format!("{} (WARP if it fails)", e.name),
         }
     }
 }
@@ -150,17 +150,14 @@ fn through_entry(snap: &Snapshot) -> bool {
 pub struct Use(pub Option<Id>);
 impl Op for Use {
     type Reply = ();
+    const SAVES: bool = true;
 }
 /// Measure latency through the entry and the exit (job "Check exit").
 pub struct CheckExit;
 impl Op for CheckExit {
     type Reply = u32;
     fn job(&self) -> Option<JobSpec> {
-        Some(
-            JobSpec::new("Check exit server")
-                .quiet()
-                .page("exit-server"),
-        )
+        Some(JobSpec::new("Test proxy chain").quiet().page("exit-server"))
     }
 }
 
@@ -367,7 +364,7 @@ fn route(snap: &Snapshot) -> Option<Target> {
 
 fn latency_text(snap: &Snapshot) -> (String, Tone) {
     match &*snap.live(&PROBE) {
-        None => ("Not checked yet".into(), Tone::Neutral),
+        None => ("Not tested yet".into(), Tone::Neutral),
         Some((Ok(ms), at)) => (
             format!("{ms} ms through both hops · {}", kit::age(*at)),
             Tone::Neutral,
@@ -392,15 +389,7 @@ fn route_line(ui: &mut egui::Ui, snap: &Snapshot, plan: &Plan) {
         let arrow = |ui: &mut egui::Ui| {
             kit::icon(ui, Icon::ChevronRight, 12., pal.faint);
         };
-        step(
-            ui,
-            if direct {
-                "This machine"
-            } else {
-                "This device"
-            },
-            pal.muted,
-        );
+        step(ui, "This device", pal.muted);
         arrow(ui);
         if !direct {
             match &entry {
@@ -419,7 +408,7 @@ fn ui(p: &mut Setup) {
     p.page_fn(
         PageSpec {
             id: "exit-server",
-            title: "Exit server",
+            title: "Proxy chain",
             icon: Icon::Exit,
             order: 45,
         },
@@ -432,17 +421,21 @@ fn ui(p: &mut Setup) {
                 None if exits.is_empty() && snap.get(&WARP_ACCOUNT).is_none() => String::new(),
                 None => "Off".into(),
             };
-            kit::page_header(ui, "Exit server", &counter, |ui| {
+            kit::page_header(ui, "Proxy chain", &counter, |ui| {
                 if current.is_some() {
                     cx.job_button(
                         ui,
                         Icon::Checks,
-                        "Check",
+                        "Test",
                         cx.core_status().running(),
                         || CheckExit,
                     );
                 }
             });
+            kit::page_note(
+                ui,
+                "Proxied traffic goes through your current server, then the exit server, so sites see the exit's address.",
+            );
 
             kit::page_scroll(ui, "exit-server", |ui| {
                 body(ui, cx, &snap, current.as_ref())
@@ -462,19 +455,26 @@ fn body(ui: &mut egui::Ui, cx: &mut UiCx, snap: &Snapshot, current: Option<&Plan
         });
         ui.add_space(theme::SECTION_GAP);
     }
+    // Like every page: the add bar and list first, then the settings.
+    exits(ui, cx);
+    ui.add_space(theme::SECTION_GAP);
+    route_settings(ui, cx, snap, &settings);
+}
+
+fn route_settings(ui: &mut egui::Ui, cx: &mut UiCx, snap: &Snapshot, settings: &Settings) {
     kit::settings_card(ui, |ui| {
         let mut entry = settings.entry;
         kit::settings_row(
             ui,
-            "Entry",
-            "Traffic goes through the entry, then the exit server. If the exit is unavailable, traffic stops.",
+            "Reach the exit",
+            "Through the current server (two hops) or directly from this device. If the exit is unavailable, proxied traffic stops.",
             |ui| {
                 if kit::segmented(
                     ui,
                     &mut entry,
                     &[
-                        (Entry::Selected, "Selected server"),
-                        (Entry::Direct, "This machine"),
+                        (Entry::Selected, "Via current server"),
+                        (Entry::Direct, "Directly"),
                     ],
                 ) {
                     cx.update("entry", &SETTINGS, move |s| s.entry = entry);
@@ -485,7 +485,7 @@ fn body(ui: &mut egui::Ui, cx: &mut UiCx, snap: &Snapshot, current: Option<&Plan
             None => kit::settings_row(
                 ui,
                 "Cloudflare WARP",
-                "A free exit on a Cloudflare address, or a backup when the exit server is down",
+                "A free exit on a Cloudflare address, or a fallback when the exit server is down",
                 |ui| {
                     cx.job_button(ui, Icon::Add, "Set up WARP", true, || SetUpWarp);
                 },
@@ -495,7 +495,7 @@ fn body(ui: &mut egui::Ui, cx: &mut UiCx, snap: &Snapshot, current: Option<&Plan
                 kit::settings_row(
                     ui,
                     "Cloudflare WARP",
-                    "Backup: used when the exit server does not answer. Exit: WARP is the exit",
+                    "If exit fails: used when the exit server does not answer. Always: WARP is the exit",
                     |ui| {
                         if kit::Button::ghost("Remove").show(ui).clicked() {
                             cx.submit("remove-warp", RemoveWarp);
@@ -505,8 +505,8 @@ fn body(ui: &mut egui::Ui, cx: &mut UiCx, snap: &Snapshot, current: Option<&Plan
                             &mut use_warp,
                             &[
                                 (WarpUse::Off, "Off"),
-                                (WarpUse::Backup, "Backup"),
-                                (WarpUse::Only, "Exit"),
+                                (WarpUse::Backup, "If exit fails"),
+                                (WarpUse::Only, "Always"),
                             ],
                         ) {
                             cx.update("warp", &SETTINGS, move |s| s.warp = use_warp);
@@ -516,7 +516,9 @@ fn body(ui: &mut egui::Ui, cx: &mut UiCx, snap: &Snapshot, current: Option<&Plan
             }
         }
     });
-    ui.add_space(theme::SECTION_GAP);
+}
+
+fn exits(ui: &mut egui::Ui, cx: &mut UiCx) {
     ListEditor::new(&EXITS)
         .unordered()
         .add_form(
@@ -531,7 +533,7 @@ fn body(ui: &mut egui::Ui, cx: &mut UiCx, snap: &Snapshot, current: Option<&Plan
                     ui,
                     "link",
                     &mut e.link,
-                    "Exit server link (vless://…)",
+                    "Exit server link (vless://, hysteria2://…)",
                     width,
                     false,
                 );
@@ -566,7 +568,11 @@ fn body(ui: &mut egui::Ui, cx: &mut UiCx, snap: &Snapshot, current: Option<&Plan
             })
             .right(),
         )
-        .empty(Icon::Exit, "No exit server")
+        .empty(
+            Icon::Exit,
+            "No exit server",
+            "Paste the link of a server to leave through, or set up WARP.",
+        )
         .show(ui, cx);
 }
 
@@ -578,7 +584,7 @@ fn status(p: &mut Setup) {
         let pal = kit::colors(ui);
         let failed = matches!(&*cx.live(&PROBE), Some((Err(_), _)));
         let color = if failed { pal.danger } else { pal.accent };
-        let text = format!("Exit · {}", e.name());
+        let text = format!("Chain · {}", e.name());
         cx.status_chip(
             ui,
             kit::Lead::Icon(Icon::Exit, color),
@@ -589,7 +595,7 @@ fn status(p: &mut Setup) {
     p.fill(&PANELS, "exit", 15, |ui, cx, _| {
         let snap = cx.snapshot().clone();
         let Some(e) = plan(&snap) else { return };
-        rproxy_kernel::shell::panel_title_page(ui, cx, "Exit server", "exit-server");
+        rproxy_kernel::shell::panel_title_page(ui, cx, "Proxy chain", "exit-server");
         route_line(ui, &snap, &e);
         let (text, tone) = latency_text(&snap);
         kit::tone_text(ui, text, tone);
@@ -602,7 +608,7 @@ fn status(p: &mut Setup) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.;
             kit::icon(ui, Icon::Exit, 14., pal.accent);
-            let text = format!("Then exit {}", e.name());
+            let text = format!("Then via {}", e.name());
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(text)

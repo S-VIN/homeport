@@ -107,7 +107,8 @@ async fn requests_send_hwid_and_report_provider_device_limits() {
     assert_eq!(
         plugin_subscriptions::fetch_http(&host.kernel().cx_for("subscriptions"), &client, &url)
             .await
-            .unwrap(),
+            .unwrap()
+            .body,
         "ok"
     );
     let error =
@@ -197,7 +198,8 @@ async fn real_hwid_subscriptions_return_servers() {
     for (index, url) in urls.lines().enumerate() {
         let body = plugin_subscriptions::http_get(&client, url, &id)
             .await
-            .unwrap_or_else(|e| panic!("subscription {}: {}", index + 1, e.message));
+            .unwrap_or_else(|e| panic!("subscription {}: {}", index + 1, e.message))
+            .body;
         let proxies = host
             .kernel()
             .cx_for("subscriptions")

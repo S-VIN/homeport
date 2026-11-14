@@ -273,6 +273,27 @@ impl Session {
     /// Reattach a retained desktop session when the OS needs a new native window.
     /// Plugin drafts, current page and pending configuration dialogs stay intact.
     pub fn rebind(&mut self, ctx: &egui::Context) {
+        self.move_to(ctx);
+        let mut contexts = self.host.contexts.lock().unwrap();
+        match contexts.iter_mut().find(|(id, _)| *id == self.id) {
+            Some((_, context)) => *context = ctx.clone(),
+            None => contexts.push((self.id, ctx.clone())),
+        }
+        drop(contexts);
+        style(ctx);
+    }
+    /// The native window closed but the session waits for the next one: free
+    /// the old context (fonts, atlas, GPU handles) and stop repainting it, so
+    /// plugins see no open UI while rproxy sits in the tray.
+    pub fn detach(&mut self) {
+        self.move_to(&egui::Context::default());
+        self.host
+            .contexts
+            .lock()
+            .unwrap()
+            .retain(|(id, _)| *id != self.id);
+    }
+    fn move_to(&mut self, ctx: &egui::Context) {
         let mut data = self.ctx.data(Clone::clone);
         // Drafts and widget state survive; GPU handles belong to the old renderer.
         data.remove_by_type::<egui::TextureHandle>();
@@ -283,17 +304,6 @@ impl Session {
             state.ctx = ctx.clone();
             state.theme = None;
         }
-        if let Some((_, context)) = self
-            .host
-            .contexts
-            .lock()
-            .unwrap()
-            .iter_mut()
-            .find(|(id, _)| *id == self.id)
-        {
-            *context = ctx.clone();
-        }
-        style(ctx);
     }
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = &ui.ctx().clone();
@@ -301,6 +311,7 @@ impl Session {
             ctx.request_repaint();
             return;
         }
+        crate::kit::theme::fit_pointer(ctx);
         let Some(k) = self.host.try_kernel() else {
             let failure = self.host.failure.lock().unwrap().clone();
             egui::CentralPanel::default().show(ui, |ui| {

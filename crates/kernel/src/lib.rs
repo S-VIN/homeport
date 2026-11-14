@@ -40,7 +40,7 @@ pub mod updates;
 pub use board::{Phase, Run, RunId};
 pub use host::{Host, Session};
 pub use id::{Id, hex, now, random_bytes};
-pub use kernel::{Cx, Input, Kernel, LiveMark, Notice, Started};
+pub use kernel::{Cx, Input, Kernel, LiveMark, Notice, NoticeAction, Started};
 pub use op::{Claim, JobSpec, Next, Op, Rank};
 pub use plugin::{Category, Platform, Plugin, Policy, categories};
 pub use rproxy_derive::Table;
@@ -61,6 +61,7 @@ pub struct Set<T: 'static> {
 }
 impl<T: Send + Sync + 'static> Op for Set<T> {
     type Reply = ();
+    const SAVES: bool = true;
 }
 /// Change some fields of a setting registered with [`Setup::editable_setting`]
 /// (other fields keep their current values). See [`UiCx::update`].
@@ -70,6 +71,7 @@ pub struct Update<T: 'static> {
 }
 impl<T: Send + Sync + 'static> Op for Update<T> {
     type Reply = ();
+    const SAVES: bool = true;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

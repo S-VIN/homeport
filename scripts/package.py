@@ -222,7 +222,8 @@ def linux(arch, name):
     manifest = {
         'app-id': APP_ID, 'runtime': 'org.freedesktop.Platform', 'runtime-version': '26.08',
         'sdk': 'org.freedesktop.Sdk', 'command': 'rproxy',
-        'finish-args': ['--filesystem=xdg-run/rproxy:create', '--share=network', '--share=ipc', '--socket=wayland', '--socket=fallback-x11',
+        # Fewer malloc arenas: the default one per thread wastes memory in a tray app.
+        'finish-args': ['--env=MALLOC_ARENA_MAX=2', '--filesystem=xdg-run/rproxy:create', '--share=network', '--share=ipc', '--socket=wayland', '--socket=fallback-x11',
                         '--device=dri', '--talk-name=org.kde.StatusNotifierWatcher'],
         # Cargo already stripped debuginfo; this also avoids a host eu-strip (elfutils).
         'modules': [{'name': 'rproxy', 'buildsystem': 'simple', 'build-options': {'no-debuginfo': True},

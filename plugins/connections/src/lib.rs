@@ -90,6 +90,10 @@ impl Traffic {
             .map(Vec::as_slice)
             .unwrap_or_default()
             .iter()
+            .filter(|c| {
+                let inbound = c["metadata"]["inboundName"].as_str().unwrap_or("");
+                !rproxy_kernel::mihomo::config::internal_listener(inbound)
+            })
             .map(|c| {
                 let m = &c["metadata"];
                 let host = m["host"]
@@ -302,7 +306,11 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
     let mut rows: Vec<(Conn, String)> = t
         .conns
         .iter()
-        .map(|c| (c.clone(), route(&snap, &c.chain)))
+        .map(|c| {
+            // Rules in the user's words ("*.youtube.com"), not the core's.
+            let rule = servers::rule_label(&snap, &c.rule);
+            (Conn { rule, ..c.clone() }, route(&snap, &c.chain))
+        })
         .filter(|(c, r)| matches(c, r))
         .collect();
     drop(t);
@@ -387,11 +395,12 @@ fn connection_row(ui: &mut egui::Ui, cx: &mut UiCx, c: &Conn, via: &str, online:
                             egui::RichText::new(&c.target).color(pal.foreground),
                             Some(&c.target),
                         );
+                        // Least telling last: a narrow row cuts the protocol first.
                         let detail = format!(
-                            "{} · {via} · {} · Seen {}",
-                            c.network,
+                            "{via} · {} · {} ago · {}",
                             c.rule,
-                            age(c.started)
+                            age(c.started),
+                            c.network
                         );
                         kit::truncated(
                             ui,

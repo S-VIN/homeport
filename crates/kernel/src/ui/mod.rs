@@ -31,10 +31,14 @@ impl<F: FnMut(&mut egui::Ui, &mut UiCx) + Send> Page for F {
 }
 
 pub(crate) enum Ticket {
-    /// Generation of the request; a newer submit under the same key wins.
-    Pending(u64),
+    /// `generation`: a newer submit under the same key wins. `save`: the op
+    /// changes saved data ([`Op::SAVES`]), shown as "Saving…", then "Saved".
+    Pending { generation: u64, save: bool },
     /// The op's reply (its `Op::Reply`) or error text.
-    Done(Result<Box<dyn std::any::Any + Send>, String>),
+    Done {
+        result: Result<Box<dyn std::any::Any + Send>, String>,
+        save: bool,
+    },
 }
 
 /// What became of an op started with [`UiCx::submit`] (see [`UiCx::request`]).
@@ -73,7 +77,6 @@ pub(crate) struct SessionState {
     pub page: &'static str,
     pub pages: HashMap<&'static str, Box<dyn Page>>,
     pub tickets: Arc<Mutex<HashMap<egui::Id, (Ticket, f64)>>>,
-    pub saved_at: Option<f64>,
     pub toasts: Vec<Toast>,
     pub last_notice: u64,
     pub panels_open: bool,
@@ -86,6 +89,8 @@ pub(crate) struct SessionState {
     pub toast_height: f32,
     /// Where the Activity chip was drawn (the popover anchors to it).
     pub activity_chip: Option<egui::Rect>,
+    /// A save whose outcome a page already took keeps "Saved" on screen.
+    last_saved: Option<f64>,
 }
 impl SessionState {
     pub fn new(ctx: egui::Context, k: &Kernel) -> Self {
@@ -100,7 +105,6 @@ impl SessionState {
             page: k.reg.pages.first().map_or("settings", |p| p.spec.id),
             pages: HashMap::new(),
             tickets: Arc::default(),
-            saved_at: None,
             toasts: Vec::new(),
             last_notice: k.last_notice(),
             panels_open: false,
@@ -111,14 +115,30 @@ impl SessionState {
             wide: false,
             toast_height: 0.,
             activity_chip: None,
+            last_saved: None,
         }
+    }
+    /// When the last op that changed saved state finished ("Saved").
+    pub fn saved_at(&self) -> Option<f64> {
+        let tickets = self.tickets.lock().unwrap();
+        let saves = tickets.values().filter_map(|(t, at)| {
+            matches!(
+                t,
+                Ticket::Done {
+                    result: Ok(_),
+                    save: true
+                }
+            )
+            .then_some(*at)
+        });
+        saves.chain(self.last_saved).reduce(f64::max)
     }
     pub fn pending_since(&self) -> Option<f64> {
         self.tickets
             .lock()
             .unwrap()
             .values()
-            .filter(|(t, _)| matches!(t, Ticket::Pending(_)))
+            .filter(|(t, _)| matches!(t, Ticket::Pending { save: true, .. }))
             .map(|(_, at)| *at)
             .reduce(f64::min)
     }
@@ -196,10 +216,14 @@ impl<'a> UiCx<'a> {
         let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let id = self.ticket(key);
         let tickets = self.s.tickets.clone();
-        tickets
-            .lock()
-            .unwrap()
-            .insert(id, (Ticket::Pending(generation), self.s.now));
+        let save = O::SAVES;
+        {
+            let mut t = tickets.lock().unwrap();
+            // Finished tickets nobody read (e.g. setting changes) expire.
+            let now = self.s.now;
+            t.retain(|_, (ticket, at)| matches!(ticket, Ticket::Pending { .. }) || now - *at < 60.);
+            t.insert(id, (Ticket::Pending { generation, save }, now));
+        }
         let cx = self.cx();
         let ctx = self.s.ctx.clone();
         let call = cx.call(op);
@@ -208,22 +232,15 @@ impl<'a> UiCx<'a> {
             let r = crate::kernel::caught(call).await;
             let now = ctx.input(|i| i.time);
             let mut t = tickets.lock().unwrap();
-            if matches!(t.get(&id), Some((Ticket::Pending(g), _)) if *g == generation) {
+            if matches!(t.get(&id), Some((Ticket::Pending { generation: g, .. }, _)) if *g == generation) {
                 match r {
                     // Overtaken (a stale result, a newer request): nothing to show.
                     Err(e) if e.cancelled() => drop(t.remove(&id)),
-                    r => drop(
-                        t.insert(
-                            id,
-                            (
-                                Ticket::Done(
-                                    r.map(|reply| Box::new(reply) as Box<dyn std::any::Any + Send>)
-                                        .map_err(|e| e.message),
-                                ),
-                                now,
-                            ),
-                        ),
-                    ),
+                    r => {
+                        let reply = r.map(|reply| Box::new(reply) as Box<dyn std::any::Any + Send>);
+                        let result = reply.map_err(|e| e.message);
+                        t.insert(id, (Ticket::Done { result, save }, now));
+                    }
                 }
             }
             drop(t);
@@ -272,7 +289,7 @@ impl<'a> UiCx<'a> {
     pub fn pending(&self, key: impl Hash + std::fmt::Debug) -> bool {
         matches!(
             self.s.tickets.lock().unwrap().get(&self.ticket(key)),
-            Some((Ticket::Pending(_), _))
+            Some((Ticket::Pending { .. }, _))
         )
     }
     /// The state of the op submitted under `key`, with its typed reply
@@ -282,9 +299,14 @@ impl<'a> UiCx<'a> {
         let label = format!("{key:?}");
         match self.s.tickets.lock().unwrap().get(&self.ticket(key)) {
             None => Request::Idle,
-            Some((Ticket::Pending(_), _)) => Request::Pending,
-            Some((Ticket::Done(Err(e)), _)) => Request::Done(Err(e.clone())),
-            Some((Ticket::Done(Ok(reply)), _)) => match reply.downcast_ref::<R>() {
+            Some((Ticket::Pending { .. }, _)) => Request::Pending,
+            Some((Ticket::Done { result: Err(e), .. }, _)) => Request::Done(Err(e.clone())),
+            Some((
+                Ticket::Done {
+                    result: Ok(reply), ..
+                },
+                _,
+            )) => match reply.downcast_ref::<R>() {
                 Some(r) => Request::Done(Ok(r.clone())),
                 // A bug in the page; it must not take the window down.
                 None => Request::Done(Err(format!(
@@ -299,16 +321,16 @@ impl<'a> UiCx<'a> {
     pub fn outcome(&mut self, key: impl Hash + std::fmt::Debug) -> Option<Result<(), String>> {
         let id = self.ticket(key);
         let mut t = self.s.tickets.lock().unwrap();
-        if !matches!(t.get(&id), Some((Ticket::Done(_), _))) {
+        if !matches!(t.get(&id), Some((Ticket::Done { .. }, _))) {
             return None;
         }
-        let Some((Ticket::Done(r), _)) = t.remove(&id) else {
+        let Some((Ticket::Done { result, save }, at)) = t.remove(&id) else {
             return None;
         };
-        if r.is_ok() {
-            self.s.saved_at = Some(self.s.now);
+        if save && result.is_ok() {
+            self.s.last_saved = Some(self.s.last_saved.map_or(at, |last| last.max(at)));
         }
-        Some(r.map(drop))
+        Some(result.map(drop))
     }
 
     /// The active job that `op` would join, if any.

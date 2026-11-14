@@ -4,6 +4,7 @@ use super::*;
 /// The counter hides when the actions need its room.
 pub fn page_header(ui: &mut Ui, title: &str, counter: &str, actions: impl FnOnce(&mut Ui)) {
     let p = theme::palette(ui);
+    let mut below = false;
     let id = ui.scope_id().with(("page-header", title));
     let actions_width: f32 = ui.data(|d| d.get_temp(id)).unwrap_or(0.);
     let width = ui.available_width();
@@ -16,9 +17,9 @@ pub fn page_header(ui: &mut Ui, title: &str, counter: &str, actions: impl FnOnce
             let title =
                 ui.add(egui::Label::new(bold(title, theme::TITLE).color(p.foreground)).truncate());
             let room = width - title.rect.width() - actions_width - 3. * theme::HORIZONTAL_GAP;
-            // Long counter, then its first part ("83 servers"), then the number alone.
+            // Long counter, then its first part ("83 servers"); otherwise the
+            // counter goes on a line of its own below.
             let first = counter.split(" · ").next().unwrap_or(counter);
-            let number = first.split(' ').next().unwrap_or(first);
             let fits = |text: &str| {
                 ui.painter()
                     .layout_no_wrap(text.to_owned(), FontId::proportional(theme::SMALL), p.muted)
@@ -26,7 +27,8 @@ pub fn page_header(ui: &mut Ui, title: &str, counter: &str, actions: impl FnOnce
                     .x
                     <= room
             };
-            if let Some(text) = [counter, first, number]
+            below = !counter.is_empty() && !fits(first);
+            if let Some(text) = [counter, first]
                 .into_iter()
                 .find(|t| !t.is_empty() && fits(t))
             {
@@ -51,6 +53,11 @@ pub fn page_header(ui: &mut Ui, title: &str, counter: &str, actions: impl FnOnce
             }
         },
     );
+    if below {
+        let first = counter.split(" · ").next().unwrap_or(counter);
+        ui.add(egui::Label::new(RichText::new(first).size(theme::SMALL).color(p.muted)).truncate())
+            .on_hover_text(counter);
+    }
     ui.add_space(theme::SPACE_S);
 }
 
@@ -414,6 +421,34 @@ pub fn edit_actions(ui: &mut Ui, can_save: bool) -> Option<bool> {
 
 /// A truncated one-line label with exactly one tooltip: `tooltip` when given,
 /// otherwise the full text when it is cut off.
+/// `text` shortened in the middle to fit the row ("/home/…/rproxy"): for
+/// paths and addresses whose ends matter. The full text is the tooltip.
+pub fn middle(ui: &mut Ui, text: &str, color: Color32) -> Response {
+    let font = FontId::proportional(theme::BODY);
+    let room = ui.available_width();
+    let fits = |t: &str| {
+        ui.painter()
+            .layout_no_wrap(t.to_owned(), font.clone(), color)
+            .size()
+            .x
+            <= room
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let mut shown = text.to_owned();
+    let mut keep = chars.len();
+    while !fits(&shown) && keep > 2 {
+        keep -= 1;
+        let head: String = chars[..keep / 2].iter().collect();
+        let tail: String = chars[chars.len() - (keep - keep / 2)..].iter().collect();
+        shown = format!("{head}…{tail}");
+    }
+    let r = ui.add(egui::Label::new(RichText::new(&shown).color(color)));
+    if shown != text {
+        r.on_hover_text(text)
+    } else {
+        r
+    }
+}
 pub fn truncated(
     ui: &mut Ui,
     text: impl Into<egui::WidgetText>,
@@ -492,6 +527,10 @@ pub fn action_item(ui: &mut Ui, icon: Icon, label: &str, enabled: bool, menu: bo
 
 /// Compact empty state; callers can add the relevant action below.
 pub fn empty(ui: &mut Ui, icon: Icon, title: &str) {
+    empty_with(ui, icon, title, "");
+}
+/// [`empty`] with the next step under the title ("Paste a link above.").
+pub fn empty_with(ui: &mut Ui, icon: Icon, title: &str, next: &str) {
     let p = theme::palette(ui);
     ui.add_space(theme::SPACE_XL);
     ui.vertical_centered(|ui| {
@@ -504,6 +543,9 @@ pub fn empty(ui: &mut Ui, icon: Icon, title: &str) {
         );
         ui.add_space(30.);
         ui.label(bold(title, theme::BODY).color(p.foreground));
+        if !next.is_empty() {
+            ui.add(egui::Label::new(RichText::new(next).size(theme::SMALL).color(p.muted)).wrap());
+        }
     });
     ui.add_space(theme::SPACE_XL);
 }

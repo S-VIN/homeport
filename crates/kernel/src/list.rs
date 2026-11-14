@@ -71,18 +71,23 @@ impl<T> Remove<T> {
 }
 impl<T: Record> Op for Add<T> {
     type Reply = Id;
+    const SAVES: bool = true;
 }
 impl<T: Record> Op for Save<T> {
     type Reply = ();
+    const SAVES: bool = true;
 }
 impl<T: Record> Op for Edit<T> {
     type Reply = ();
+    const SAVES: bool = true;
 }
 impl<T: Record> Op for Move<T> {
     type Reply = ();
+    const SAVES: bool = true;
 }
 impl<T: Record> Op for Remove<T> {
     type Reply = ();
+    const SAVES: bool = true;
 }
 
 /// Events emitted by the default handlers after commit. Observers of a type

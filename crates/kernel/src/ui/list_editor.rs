@@ -133,7 +133,7 @@ pub struct ListEditor<'s, T: Record> {
     columns: Vec<Column<'s, T>>,
     add: Option<(&'s str, Box<dyn Fn() -> T + 's>, Fields<'s, T>)>,
     ordered: bool,
-    empty: Option<(Icon, &'s str)>,
+    empty: Option<(Icon, &'s str, &'s str)>,
     subtitle: Option<Subtitle<'s, T>>,
     leading: Option<Leading<'s, T>>,
     headers: bool,
@@ -177,8 +177,8 @@ impl<'s, T: Record> ListEditor<'s, T> {
         self
     }
     /// Compact empty state: icon and title.
-    pub fn empty(mut self, icon: Icon, title: &'s str) -> Self {
-        self.empty = Some((icon, title));
+    pub fn empty(mut self, icon: Icon, title: &'s str, next: &'s str) -> Self {
+        self.empty = Some((icon, title, next));
         self
     }
     /// A second line under the first column: status, errors, warnings.
@@ -209,8 +209,8 @@ impl<'s, T: Record> ListEditor<'s, T> {
                 self.header(ui, &layout);
             }
             if rows.is_empty() {
-                if let Some((icon, title)) = self.empty {
-                    kit::empty(ui, icon, title);
+                if let Some((icon, title, next)) = self.empty {
+                    kit::empty_with(ui, icon, title, next);
                 }
                 return;
             }
@@ -373,9 +373,11 @@ impl<'s, T: Record> ListEditor<'s, T> {
                 } else {
                     Emphasis::Quiet
                 };
-                let two_lines = row.subtitle.is_some() && !row.editing;
+                let lines = self.subtitle_lines(ui, row, layout);
+                let two_lines = lines > 0;
+                let height = [theme::ROW, 44., 58.][lines];
                 ui.add_enabled_ui(!cx.pending(key), |ui| {
-                    kit::row_line(ui, if two_lines { 44. } else { theme::ROW }, |ui| {
+                    kit::row_line(ui, height, |ui| {
                         self.marker(ui, cx, row, two_lines);
                         self.cells(ui, cx, row, &mut draft, &mut save, layout, Line::Main);
                         if self.ordered
@@ -473,6 +475,24 @@ impl<'s, T: Record> ListEditor<'s, T> {
         true
     }
 
+    /// Lines of a row's subtitle (0: none). On a phone, which has no hover to
+    /// read a cut text, a long one takes two.
+    fn subtitle_lines(&self, ui: &Ui, row: &RowView<'_, T>, layout: &Layout) -> usize {
+        let Some((text, _)) = row.subtitle.as_ref().filter(|_| !row.editing) else {
+            return 0;
+        };
+        let long = |c: &Column<'_, T>| {
+            let font = egui::FontId::proportional(theme::SMALL);
+            let galley =
+                ui.fonts_mut(|f| f.layout_no_wrap(text.clone(), font, egui::Color32::WHITE));
+            galley.size().x > layout.width(c)
+        };
+        if kit::phone(ui) && self.columns.first().is_some_and(long) {
+            2
+        } else {
+            1
+        }
+    }
     fn marker(&self, ui: &mut Ui, cx: &mut UiCx, row: &RowView<'_, T>, two_lines: bool) {
         let Some((width, f)) = &self.leading else {
             return;
@@ -506,7 +526,7 @@ impl<'s, T: Record> ListEditor<'s, T> {
         line: Line,
     ) {
         let item = row.item;
-        let two_lines = row.subtitle.is_some() && !row.editing;
+        let lines = self.subtitle_lines(ui, row, layout);
         for (ci, c) in self
             .columns
             .iter()
@@ -516,21 +536,31 @@ impl<'s, T: Record> ListEditor<'s, T> {
             let width = layout.width(c);
             // The subtitle lives under the first column's text.
             let text_cell = |ui: &mut Ui, draw: &dyn Fn(&mut Ui)| match &row.subtitle {
-                Some((text, tone)) if ci == 0 && two_lines => {
+                Some((text, tone)) if ci == 0 && lines > 0 => {
                     let ink = theme::palette(ui).tone(*tone);
                     ui.allocate_ui_with_layout(
-                        egui::vec2(width, 40.),
+                        egui::vec2(width, if lines > 1 { 54. } else { 40. }),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
                             ui.set_width(width);
                             ui.spacing_mut().item_spacing.y = 2.;
                             ui.add_space(3.);
                             draw(ui);
-                            kit::truncated(
-                                ui,
-                                egui::RichText::new(text).size(theme::SMALL).color(ink),
-                                None,
-                            );
+                            let small = egui::RichText::new(text).size(theme::SMALL).color(ink);
+                            if lines > 1 {
+                                let mut job = egui::text::LayoutJob::single_section(
+                                    text.clone(),
+                                    egui::TextFormat::simple(
+                                        egui::FontId::proportional(theme::SMALL),
+                                        ink,
+                                    ),
+                                );
+                                job.wrap.max_width = width;
+                                job.wrap.max_rows = 2;
+                                ui.label(job);
+                            } else {
+                                kit::truncated(ui, small, None);
+                            }
                         },
                     );
                 }

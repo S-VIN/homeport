@@ -35,6 +35,7 @@ plugin-autostart = { path = "plugins/autostart", optional = true }
 plugin-exit-server = { path = "plugins/exit-server" }
 plugin-vless-server = { path = "plugins/vless-server" }
 plugin-connections = { path = "plugins/connections" }
+plugin-logs = { path = "plugins/logs" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3.7", optional = true }

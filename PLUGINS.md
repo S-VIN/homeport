@@ -56,7 +56,7 @@ fn setup(p: &mut Setup) -> Result<()> {
 Правила для автора:
 - имя состояния начинается с `id` плагина и точки (`routing.rules`); писать в чужое состояние нельзя, только вызывать op владельца;
 - `cx.write(|w| …)` синхронный и короткий; сеть — вне него;
-- в UI нет клиента и сервера: `cx.get(&STATE)` читает снимок, `cx.submit(key, op)` выполняет действие и сам показывает «Saving…/Saved»; `cx.request::<Reply>(key)` даёт состояние запроса с типизированным ответом (`Request::Idle | Pending | Done(Ok(reply) | Err(text))`), `cx.outcome(key)` забирает только успех или ошибку (для черновиков); ключи локальны для плагина;
+- в UI нет клиента и сервера: `cx.get(&STATE)` читает снимок, `cx.submit(key, op)` выполняет действие; если op меняет сохранённые данные, в нём `const SAVES: bool = true`, и статус-бар сам показывает «Saving…/Saved» (у `Set`/`Update`/`Add`/`Edit`… уже так); `cx.notify_with(text, "Undo", || op)` — тост с кнопкой; `cx.request::<Reply>(key)` даёт состояние запроса с типизированным ответом (`Request::Idle | Pending | Done(Ok(reply) | Err(text))`), `cx.outcome(key)` забирает только успех или ошибку (для черновиков); ключи локальны для плагина;
 - размеры экрана плагин не учитывает: kit сам сжимает строки на телефоне;
 - размеры и цвета только из `kit::theme` и `kit::colors(ui)`; готовые виджеты — `kit::*`, редактор списка — `ui::ListEditor`;
 - страница строится одинаково: `kit::page_header` (заголовок · счётчик … действия) → строка добавления (`ListEditor::add_form` или `kit::add_bar`) → `kit::list_card` / `kit::card` (подробно — [DESIGN.md](DESIGN.md#анатомия-страницы));
@@ -106,14 +106,14 @@ p.wrap(|cx, f: Fetch, next: Next<Fetch>| async move {
 | `shell::PANELS` | ядро | Карточка с подробностями и быстрыми действиями; первая строка — `shell::panel_title` | Connection, Listeners |
 | `shell::SETTINGS_SECTIONS` | ядро | Строка `kit::settings_row` в карточке General; подпись называет настройку | интервалы, Start at login |
 | страница (`p.page`, `p.page_fn`) | ядро | Экран плагина в нижней навигации; лишние уходят в More | Subscriptions, Routing |
-| `servers::TOOLBAR` | servers | Действия в заголовке страницы (справа) | Auto select, Check all, Name filters |
+| `servers::TOOLBAR` | servers | Действия в заголовке страницы (справа) | Auto select, Test all, Exclude by name |
 | `servers::TOOLS` | servers | Блок во всю ширину под тулбаром | редактор фильтров |
 | `servers::COLUMNS` | servers | Колонка списка серверов через `servers::column(p, Column { id, order, title, help, secondary }, \|ui, cx, server\| …)`: ширину, подпись и скрытие второстепенных колонок на телефоне берёт на себя servers | Rating, Latency |
 | `servers::DETAILS` | servers | Строки `kit::property` раскрытого сервера (общая колонка подписей) | задержка, скорость, тесты |
 | `servers::CONNECTION` | servers | Блок в карточке подключения (`kit::stats`, строка с иконкой) | Latency / Rating / Tests, причина Auto select |
 | `subscriptions::SECTIONS` | subscriptions | Секция под списком подписок | — |
 
-Хуки для синхронных вопросов: `servers::ROUTE` (куда идёт трафик «через сервер»; по умолчанию группа `main`, Exit server отвечает своим выходом), `servers::EXCLUDE` (почему сервер нельзя использовать), `servers::FAILOVER` (резервы подключённого сервера: группа `main` становится `fallback` `[выбранный, резервы…]`), `servers::IDLE` (почему ничего не подключено — текст в карточке подключения), `SOURCE_LABEL`, `SOURCE_HUE` (цвет тега источника; рисует `servers::source_tag`), `SORT_KEYS`, `FREEZE`, `subscriptions::LINK` (принять прямую ссылку), `shell::TRAY` (цвет иконки трея, побеждает худший ответ).
+Хуки для синхронных вопросов: `servers::ROUTE` (куда идёт трафик «через сервер»; по умолчанию группа `main`, Proxy chain отвечает своим выходом), `servers::EXCLUDE` (почему сервер нельзя использовать), `servers::FAILOVER` (резервы подключённого сервера: группа `main` становится `fallback` `[выбранный, резервы…]`), `servers::IDLE` (почему ничего не подключено — текст в карточке подключения), `SOURCE_LABEL`, `SOURCE_HUE` (цвет тега источника; рисует `servers::source_tag`), `SORT_KEYS`, `FREEZE`, `subscriptions::LINK` (принять прямую ссылку), `shell::TRAY` (цвет иконки трея, побеждает худший ответ).
 
 **Живое состояние** — `p.live(&S, init)`: значения в памяти, которые часто меняются и не сохраняются (трафик, что проверяется сейчас, статус сертификата). Без транзакции: `cx.set_live(&S, v)` / `cx.update_live(&S, |v| …)` заменяют значение и перерисовывают UI, если оно изменилось; читают `cx.live(&S)` и `snap.live(&S)`. Для списка «что сейчас занято» есть `let _busy = cx.mark_live(&BUSY, id);` — элемент уходит из списка, когда guard удаляется (в том числе при ошибке или отмене). В `p.core` живое состояние недоступно: конфиг ядра строится только из сохранённых данных.
 
@@ -146,7 +146,7 @@ cx.write(move |w| { input.check(w)?; /* сохранить */ Ok(()) }).await  /
 
 **Готовые элементы интерфейса.**
 - Строка настройки, связанная с полем: `cx.setting(ui, "Check servers", &CONFIG, |s| &mut s.check_secs, |ui, v| kit::interval(ui, "check", v))`.
-- Инструмент с кнопкой в тулбаре и панелью: `p.tool(&servers::TOOLBAR, &servers::TOOLS, Tool { id: "filters", label: "Name filters", icon: Icon::Filter, order: 50 }, |snap| count(snap), |ui, cx| { … })` — состояние «открыт», заголовок, закрытие и узкий экран берёт на себя ядро.
+- Инструмент с кнопкой в тулбаре и панелью: `p.tool(&servers::TOOLBAR, &servers::TOOLS, Tool { id: "filters", label: "Exclude by name", icon: Icon::Filter, order: 50 }, |snap| count(snap), |ui, cx| { … })` — состояние «открыт», заголовок, закрытие и узкий экран берёт на себя ядро.
 - Кнопка задачи с прогрессом и остановкой (ширину считает сама): `cx.job_button(ui, Icon::Refresh, "Refresh all", enabled, || RefreshAll)`.
 - Ответ операции рядом с кнопкой: `cx.submit(key, op)`, затем `match cx.request::<Reply>(key) { Request::Pending => …, Request::Done(Ok(reply)) => …, … }` (пример — «Check now» в подробностях сервера).
 - Счётчик в заголовке страницы: `kit::count(n, "rule", "rules")` (пусто при нуле).
@@ -160,14 +160,15 @@ cx.write(move |w| { input.check(w)?; /* сохранить */ Ok(()) }).await  /
 |---|---|---|---|
 | servers — «Servers» (обязательный) | Servers | Каталог серверов, ручной выбор, группа `main` | — |
 | subscriptions — «Subscriptions» | Servers | Подписки, загрузка, расписание | `servers::SOURCE_LABEL`, `SOURCE_HUE` |
-| name-filters — «Name filters» | Servers | Исключение по имени | `servers::EXCLUDE`, `TOOLBAR`, `TOOLS` |
+| name-filters — «Exclude by name» | Servers | Исключение по имени | `servers::EXCLUDE`, `TOOLBAR`, `TOOLS` |
 | health-checks — «Checks» | Servers | Задержка и тесты через delay API mihomo, скорость через полосы проверок, рейтинг (`Rate`) | колонки, детали, сортировки, трей |
 | format-uri, format-xray, format-clash | Subscription formats | Разбор документов | `subscriptions::Parse`, `LINK` |
 | auto-select — «Auto select» | Server selection (exclusive) | Автовыбор сервера, резервы для fallback, проверка текущего сервера каждые 10 с | обёртка `servers::Select`, `servers::FAILOVER`, `IDLE`, события |
 | routing — «Routing» | Network & system | Правила маршрутизации, гео-списки `geosite:`/`geoip:` (rule-providers ядра) | конфиг mihomo |
 | inbounds — «Listeners» | Network & system | HTTP/SOCKS5 слушатели, системный прокси (`p.service`, возврат при остановке), TUN | конфиг mihomo, обёртка `subscriptions::Fetch` |
-| exit-server — «Exit server» | Network & system | Второй хоп после выбранного сервера или напрямую; WARP как резерв или выход | `servers::ROUTE`, CONNECTION, STATUS, PANELS |
+| exit-server — «Proxy chain» | Network & system | Второй хоп после выбранного сервера или напрямую; WARP как резерв или выход | `servers::ROUTE`, CONNECTION, STATUS, PANELS |
 | connections — «Connections» | Network & system | Открытые соединения и трафик, закрытие | `p.service`, STATUS, `servers::DETAILS` |
+| logs — «Logs» | Network & system | Живой лог mihomo, пока открыто окно; имена серверов вместо id, служебные строки скрыты | `p.service`, `cx.core().logs`, `cx.ui_open()` |
 | vless-server — «VLESS server» (выкл. по умолчанию) | Network & system | VLESS-вход с REALITY self-steal и XHTTP, сайт-приманка с Let's Encrypt, клиенты и ссылки | конфиг mihomo, `p.service`, STATUS |
 | autostart — «Start at login» (`Platform::DESKTOP`) | Network & system | Запуск при входе: XDG autostart, Background portal во Flatpak, `HKCU\…\Run` в Windows, LaunchAgent в macOS; устаревший путь в записи переписывается при запуске | Settings |
 
