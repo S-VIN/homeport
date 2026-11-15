@@ -33,6 +33,8 @@ pub struct Conn {
     /// Host name or address with port.
     pub target: String,
     pub network: String,
+    /// The app that opened it, when the core looks apps up (app rules exist).
+    pub process: String,
     pub rule: String,
     /// The outbound names from mihomo (server ids, DIRECT, exit …), outermost first.
     pub chain: Vec<String>,
@@ -51,12 +53,25 @@ pub struct Traffic {
     /// Bytes per server this session: closed connections plus open ones.
     closed: HashMap<Id, (u64, u64)>,
     last: HashMap<String, (Option<Id>, u64, u64)>,
-    sampled: Option<Instant>,
+    /// Anything open or moving now or in the last few seconds, so bursts
+    /// don't make the chip and the panel blink.
+    active: bool,
     pub online: bool,
+}
+/// When the last sample was taken and the last traffic seen. Kept by the
+/// poller, outside [`Traffic`]: a new time alone must not repaint the windows.
+#[derive(Clone, Copy, Debug, Default)]
+struct Clock {
+    sampled: Option<Instant>,
+    busy: Option<Instant>,
 }
 pub static TRAFFIC: State<Traffic> = State::new("connections.traffic");
 
 impl Traffic {
+    /// Traffic now or in the last few seconds.
+    pub fn active(&self) -> bool {
+        self.active
+    }
     pub fn by_server(&self, id: Id) -> (u64, u64) {
         let (mut up, mut down) = self.closed.get(&id).copied().unwrap_or_default();
         for (server, u, d) in self.last.values() {
@@ -67,18 +82,18 @@ impl Traffic {
         }
         (up, down)
     }
-    fn update(&mut self, v: &Value) {
+    fn update(&mut self, v: &Value, clock: &mut Clock) {
         let now = Instant::now();
         let (up_total, down_total) = (
             v["uploadTotal"].as_u64().unwrap_or(0),
             v["downloadTotal"].as_u64().unwrap_or(0),
         );
-        if let Some(at) = self.sampled {
+        if let Some(at) = clock.sampled {
             let secs = now.duration_since(at).as_secs_f64().max(0.1);
             self.up_rate = (up_total.saturating_sub(self.up_total) as f64 / secs) as u64;
             self.down_rate = (down_total.saturating_sub(self.down_total) as f64 / secs) as u64;
         }
-        (self.up_total, self.down_total, self.sampled) = (up_total, down_total, Some(now));
+        (self.up_total, self.down_total, clock.sampled) = (up_total, down_total, Some(now));
         let old: HashMap<String, Instant> = self
             .conns
             .iter()
@@ -117,6 +132,7 @@ impl Traffic {
                         _ => host.to_owned(),
                     },
                     network: m["network"].as_str().unwrap_or("").to_uppercase(),
+                    process: m["process"].as_str().unwrap_or("").to_owned(),
                     rule: match (
                         c["rule"].as_str().unwrap_or(""),
                         c["rulePayload"].as_str().unwrap_or(""),
@@ -145,6 +161,12 @@ impl Traffic {
         }
         self.last = seen;
         self.conns.sort_by_key(|c| std::cmp::Reverse(c.started));
+        if !self.conns.is_empty() || self.up_rate + self.down_rate > 0 {
+            clock.busy = Some(now);
+        }
+        self.active = clock
+            .busy
+            .is_some_and(|t| now.duration_since(t) < Duration::from_secs(10));
     }
 }
 
@@ -161,7 +183,7 @@ fn setup(p: &mut Setup) -> Result<()> {
         |_| Some(()),
         |cx: Cx, ()| async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
-            let mut idle = 0;
+            let (mut idle, mut clock) = (0, Clock::default());
             loop {
                 tick.tick().await;
                 // Nobody watching (a server without an open browser tab): sample
@@ -172,15 +194,17 @@ fn setup(p: &mut Setup) -> Result<()> {
                 }
                 match cx.core().connections().await {
                     Ok(v) => cx.update_live(&TRAFFIC, |t| {
-                        t.update(&v);
+                        t.update(&v, &mut clock);
                         t.online = true;
                     }),
-                    Err(_) => cx.update_live(&TRAFFIC, |t| {
-                        t.online = false;
-                        t.up_rate = 0;
-                        t.down_rate = 0;
-                        t.sampled = None;
-                    }),
+                    Err(_) => {
+                        clock.sampled = None;
+                        cx.update_live(&TRAFFIC, |t| {
+                            t.online = false;
+                            t.up_rate = 0;
+                            t.down_rate = 0;
+                        })
+                    }
                 }
             }
         },
@@ -396,8 +420,14 @@ fn connection_row(ui: &mut egui::Ui, cx: &mut UiCx, c: &Conn, via: &str, online:
                             Some(&c.target),
                         );
                         // Least telling last: a narrow row cuts the protocol first.
+                        // Not twice when an app rule matched it.
+                        let app = match format!("app:{}", c.process) {
+                            _ if c.process.is_empty() => String::new(),
+                            app if app == c.rule => String::new(),
+                            app => format!("{app} · "),
+                        };
                         let detail = format!(
-                            "{via} · {} · {} ago · {}",
+                            "{app}{via} · {} · {} ago · {}",
                             c.rule,
                             age(c.started),
                             c.network
@@ -419,8 +449,7 @@ fn connection_row(ui: &mut egui::Ui, cx: &mut UiCx, c: &Conn, via: &str, online:
 fn traffic_chip(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
     let t = cx.live(&TRAFFIC);
     let (down, up) = (t.down_rate, t.up_rate);
-    // Shown while anything is open, also at 0 B/s, so the bar doesn't flicker.
-    if t.conns.is_empty() && down + up == 0 {
+    if !t.active() {
         return;
     }
     let pal = kit::colors(ui);
@@ -435,7 +464,8 @@ fn traffic_chip(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
 
 fn traffic_panel(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
     let t = cx.live(&TRAFFIC);
-    if !t.online || (t.conns.is_empty() && t.down_rate + t.up_rate == 0) {
+    // The Connections page shows the same numbers in its own tiles.
+    if !t.online || !t.active() || cx.page() == "connections" {
         return;
     }
     panel_title(ui, "Traffic", |ui| {
@@ -452,15 +482,13 @@ fn traffic_panel(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
             kit::bytes(t.up_total)
         ),
     );
-    if cx.page() != "connections" {
-        ui.add_space(6.);
-        if kit::Button::secondary("Open Connections")
-            .icon(Icon::Activity)
-            .show(ui)
-            .clicked()
-        {
-            cx.navigate("connections");
-        }
+    ui.add_space(6.);
+    if kit::Button::secondary("Open Connections")
+        .icon(Icon::Activity)
+        .show(ui)
+        .clicked()
+    {
+        cx.navigate("connections");
     }
 }
 
@@ -474,10 +502,11 @@ mod tests {
             serde_json::json!({"id": id, "upload": 1, "download": down, "chains": [server.to_string(), "main"], "rule": "Match",
             "metadata": {"host": "example.org", "destinationPort": "443", "network": "tcp"}})
         };
-        let mut t = Traffic::default();
-        t.update(&serde_json::json!({"uploadTotal": 2, "downloadTotal": 300, "connections": [conn("a", 100), conn("b", 200)]}));
+        let (mut t, mut clock) = (Traffic::default(), Clock::default());
+        t.update(&serde_json::json!({"uploadTotal": 2, "downloadTotal": 300, "connections": [conn("a", 100), conn("b", 200)]}), &mut clock);
         assert_eq!(t.by_server(server), (2, 300));
-        t.update(&serde_json::json!({"uploadTotal": 3, "downloadTotal": 450, "connections": [conn("b", 350)]}));
+        t.update(&serde_json::json!({"uploadTotal": 3, "downloadTotal": 450, "connections": [conn("b", 350)]}), &mut clock);
+        assert!(t.active());
         assert_eq!(
             t.by_server(server),
             (2, 450),

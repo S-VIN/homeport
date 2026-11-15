@@ -76,7 +76,7 @@ fn restore(changes: &mut Vec<Change>) -> Result<(), String> {
 /// file that survives a crash; a journal left by an earlier run is restored first.
 pub fn apply(journal: &Path, address: Option<SocketAddr>) -> Result<String, String> {
     if rproxy_kernel::Platform::is_flatpak() || rproxy_kernel::Platform::is_docker() {
-        return Err("System proxy control requires the native package.".into());
+        return Err("System proxy control is unavailable in Flatpak and Docker.".into());
     }
     let mut changes = CHANGES.lock().map_err(|_| "System proxy lock failed.")?;
     if changes.is_empty() {

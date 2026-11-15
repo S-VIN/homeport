@@ -1,0 +1,227 @@
+name: release
+# Manual only. Every package becomes its own artifact (one zip each);
+# the Docker image is published to GHCR only when asked.
+on:
+  workflow_dispatch:
+    inputs:
+      docker:
+        description: Publish the Docker image to GHCR
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Never cancel a run halfway through publishing an image.
+  cancel-in-progress: ${{ !inputs.docker }}
+env:
+  IMAGE_NAME: ghcr.io/s-vin/rproxy
+
+jobs:
+  # The browser client, built only when its sources change. It reaches the other
+  # jobs through the cache, so it never shows up among the artifacts.
+  web:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    outputs:
+      key: ${{ steps.key.outputs.key }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !/assets/mihomo/*/*/
+      # Hashed here once: Windows checkouts have CRLF line endings and would hash differently.
+      - id: key
+        run: echo "key=web-${{ hashFiles('crates/remote/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}" >> "$GITHUB_OUTPUT"
+      - id: cache
+        uses: actions/cache@v6
+        with:
+          path: web/pkg
+          key: ${{ steps.key.outputs.key }}
+          enableCrossOsArchive: true
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: rustup toolchain install && python3 scripts/build.py --web-only
+
+  packages:
+    needs: web
+    name: ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux stays on 24.04: its glibc 2.39 is the binaries' minimum.
+          - {os: linux, arch: x64, runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu}
+          - {os: linux, arch: arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu}
+          - {os: win32, arch: x64, runner: windows-2025, target: x86_64-pc-windows-msvc}
+          - {os: win32, arch: arm64, runner: windows-11-arm, target: aarch64-pc-windows-msvc}
+          # Both macOS builds run on Apple Silicon; Intel is a cross-compile.
+          - {os: darwin, arch: x64, runner: macos-26, target: x86_64-apple-darwin}
+          - {os: darwin, arch: arm64, runner: macos-26, target: aarch64-apple-darwin}
+    env:
+      # Read by Cargo and by package.py: the binary lands in target/<target>/release.
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Only this platform's mihomo binary.
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !/assets/mihomo/*/*/
+            /assets/mihomo/${{ matrix.os }}/${{ matrix.arch }}/
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.15'
+      - run: rustup toolchain install && rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Both macOS builds share a host toolchain; the target keeps their caches apart.
+          key: ${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - uses: actions/cache/restore@v6
+        with:
+          path: web/pkg
+          key: ${{ needs.web.outputs.key }}
+          enableCrossOsArchive: true
+          fail-on-cache-miss: true
+
+      - name: Linux packaging tools
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          # Flatpak needs the GdkPixbuf SVG loader to export the scalable icon.
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder librsvg2-common
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          # Flatpak's bubblewrap needs unprivileged user namespaces.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Windows installer tools
+        if: matrix.os == 'win32'
+        # upgrade also replaces an older preinstalled NSIS (windows-11-arm ships 3.10).
+        run: choco upgrade nsis --version 3.13.0 --no-progress -y
+
+      - run: python scripts/build.py --native-only --release
+      - id: package
+        run: python scripts/package.py --os ${{ matrix.os }} --arch ${{ matrix.arch }}
+
+      # One artifact per package (each OS makes one or two). Packages are compressed already.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.package-1 }}
+          path: dist/${{ steps.package.outputs.package-1 }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+      - if: steps.package.outputs.package-2
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.package-2 }}
+          path: dist/${{ steps.package.outputs.package-2 }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  # The server binary is built on the runner with a warm cache; the image only copies it.
+  docker:
+    needs: web
+    if: inputs.docker
+    name: docker-${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    # Matrix outputs are merged: each leg sets the digest named after its platform.
+    outputs:
+      amd64: ${{ steps.image.outputs.digest-amd64 }}
+      arm64: ${{ steps.image.outputs.digest-arm64 }}
+    strategy:
+      matrix:
+        include:
+          # 24.04's glibc 2.39 is older than Debian trixie's, so the binary runs in the image.
+          - {platform: amd64, core: x64, runner: ubuntu-24.04}
+          - {platform: arm64, core: arm64, runner: ubuntu-24.04-arm}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !/assets/mihomo/*/*/
+            /assets/mihomo/linux/${{ matrix.core }}/
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - uses: actions/cache/restore@v6
+        with:
+          path: web/pkg
+          key: ${{ needs.web.outputs.key }}
+          enableCrossOsArchive: true
+          fail-on-cache-miss: true
+      - name: Server binary and core
+        run: |
+          cargo build --locked --release --bin rproxy --no-default-features
+          mkdir -p dist/docker
+          cp target/release/rproxy dist/docker/rproxy
+          python3 scripts/mihomo.py --os linux --arch ${{ matrix.core }} --output dist/docker/core
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: docker
+          file: docker/Dockerfile
+          # Replaces the Dockerfile's `build` stage with the files above.
+          build-contexts: build=dist/docker
+          platforms: linux/${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=docker-${{ matrix.platform }}
+          cache-to: type=gha,scope=docker-${{ matrix.platform }}
+      - id: image
+        run: echo "digest-${{ matrix.platform }}=${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+
+  # One multi-platform tag: :latest from the default branch, the version for a v* tag,
+  # the branch name otherwise, plus sha-<commit>.
+  docker-publish:
+    needs: docker
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=sha
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the tags
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          AMD64: ${{ needs.docker.outputs.amd64 }}
+          ARM64: ${{ needs.docker.outputs.arm64 }}
+        run: |
+          args=()
+          while read -r tag; do [ -z "$tag" ] || args+=(--tag "$tag"); done <<< "$TAGS"
+          docker buildx imagetools create "${args[@]}" "$IMAGE_NAME@$AMD64" "$IMAGE_NAME@$ARM64"

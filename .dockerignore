@@ -22,6 +22,7 @@ web/pkg
 /.dockerignore
 /*.md
 /scripts/package.py
+/scripts/packaging/
 /scripts/test-docker-auth.py
 # Tests are not built into the image; editing them must not invalidate the build layer.
 /tests/

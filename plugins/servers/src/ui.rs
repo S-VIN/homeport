@@ -1,7 +1,7 @@
 use crate::*;
 use rproxy_kernel::{
     Page, PageSpec, UiCx,
-    kit::{self, Button, Lead, Tone, emoji, theme},
+    kit::{self, Button, Lead, Tone, theme},
     shell::{PANELS, STATUS, panel_title},
 };
 use std::collections::{HashMap, HashSet};
@@ -78,7 +78,7 @@ fn connection_card(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
     });
     ui.scope(|ui| {
         ui.set_max_width(ui.available_width());
-        emoji::label(ui, &s.name, theme::bold(theme::TITLE), true);
+        kit::label(ui, &s.name, theme::bold(theme::TITLE), true);
     });
     ui.add_space(4.);
     ui.horizontal_wrapped(|ui| {
@@ -144,7 +144,33 @@ impl Page for ServersPage {
             });
             return;
         }
-        let sorts = sort_keys(&snap);
+        let (rows, frozen) = self.rows(&snap, &servers);
+        if rows.is_empty() {
+            kit::list_card(ui, |ui| {
+                kit::empty(ui, Icon::Filter, "No matching servers");
+                ui.vertical_centered(|ui| {
+                    if Button::secondary("Reset filters").show(ui).clicked() {
+                        self.source = None;
+                        self.protocol = None;
+                    }
+                });
+                ui.add_space(theme::SPACE_XL);
+            });
+            return;
+        }
+        self.list(ui, cx, &snap, &rows, servers.len(), frozen);
+    }
+}
+
+impl ServersPage {
+    /// The rows the filters keep, each with why it can't be used, in display
+    /// order; `true` while a check holds the order still.
+    fn rows<'a>(
+        &mut self,
+        snap: &Snapshot,
+        servers: &'a [Server],
+    ) -> (Vec<(&'a Server, Option<Exclusion>)>, bool) {
+        let sorts = sort_keys(snap);
         if self.sort >= sorts.len() {
             self.sort = 0;
         }
@@ -155,7 +181,7 @@ impl Page for ServersPage {
                 self.source.is_none_or(|id| id == s.source)
                     && self.protocol.is_none_or(|p| p == s.protocol)
             })
-            .map(|s| (s, exclusion(&snap, s)))
+            .map(|s| (s, exclusion(snap, s)))
             .collect();
         let frozen = snap.hooks(&FREEZE, &()).into_iter().any(|f| f) && !self.frozen.is_empty();
         if frozen {
@@ -171,26 +197,25 @@ impl Page for ServersPage {
             rows.sort_by_cached_key(|(s, e)| {
                 (
                     e.as_ref().map(|e| e.group),
-                    key(&snap, s),
+                    key(snap, s),
                     natural_key(&s.name),
                     s.id,
                 )
             });
             self.frozen = rows.iter().map(|(s, _)| s.id).collect();
         }
-        if rows.is_empty() {
-            kit::list_card(ui, |ui| {
-                kit::empty(ui, Icon::Filter, "No matching servers");
-                ui.vertical_centered(|ui| {
-                    if Button::secondary("Reset filters").show(ui).clicked() {
-                        self.source = None;
-                        self.protocol = None;
-                    }
-                });
-                ui.add_space(theme::SPACE_XL);
-            });
-            return;
-        }
+        (rows, frozen)
+    }
+
+    fn list(
+        &mut self,
+        ui: &mut egui::Ui,
+        cx: &mut UiCx,
+        snap: &Snapshot,
+        rows: &[(&Server, Option<Exclusion>)],
+        total: usize,
+        frozen: bool,
+    ) {
         let wide = ui.available_width() >= 500.;
         let selected_id = *snap.get(&SELECTED);
         let core_ok = cx.core_status().running();
@@ -209,10 +234,10 @@ impl Page for ServersPage {
                     );
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.add_space(CHEVRON + theme::HORIZONTAL_GAP);
-                        let caption = if rows.len() == servers.len() {
+                        let caption = if rows.len() == total {
                             "Server".to_owned()
                         } else {
-                            format!("Server · {} of {}", rows.len(), servers.len())
+                            format!("Server · {} of {}", rows.len(), total)
                         };
                         kit::caption(ui, caption);
                     });
@@ -246,7 +271,7 @@ impl Page for ServersPage {
                                 core_ok,
                                 wide,
                             };
-                            self.row(ui, cx, &snap, s, state)
+                            self.row(ui, cx, snap, s, state)
                         });
                     }
                 });
@@ -484,9 +509,20 @@ impl Title<'_> {
     fn show(&self, ui: &mut egui::Ui, snap: &Snapshot) -> Option<TitleClick> {
         let (s, pal) = (self.server, theme::palette(ui));
         let label = source_label(snap, s.source);
-        let tag_w = kit::tag_width(ui, &label, if self.wide { 180. } else { 84. });
-        let name_w =
-            (ui.available_width() - CHEVRON - tag_w - 2. * theme::HORIZONTAL_GAP - 4.).max(40.);
+        let room = ui.available_width() - CHEVRON - 2. * theme::HORIZONTAL_GAP - 4.;
+        // A wide row gives the tag what the name leaves, up to a limit.
+        let max_tag = if self.wide {
+            let font = egui::FontId::proportional(theme::BODY);
+            let name = ui
+                .fonts_mut(|f| f.layout_no_wrap(s.name.clone(), font, pal.foreground))
+                .size()
+                .x;
+            (room - name).clamp(180., 320.)
+        } else {
+            84.
+        };
+        let tag_w = kit::tag_width(ui, &label, max_tag);
+        let name_w = (room - tag_w).max(40.);
         let (rect, chevron) =
             ui.allocate_exact_size(egui::vec2(CHEVRON, theme::CONTROL), egui::Sense::click());
         let ink = if chevron.hovered() || self.hovered {
@@ -511,7 +547,7 @@ impl Title<'_> {
                     if self.excluded.is_some() {
                         ui.visuals_mut().override_text_color = Some(pal.muted);
                     }
-                    emoji::label(ui, &s.name, egui::FontId::proportional(theme::BODY), true)
+                    kit::label(ui, &s.name, egui::FontId::proportional(theme::BODY), true)
                 });
             source_tag(ui, snap, s.source, tag_w);
             name.inner

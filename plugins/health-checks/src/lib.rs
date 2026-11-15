@@ -281,15 +281,15 @@ fn skipped(snap: &Snapshot, s: &Server) -> bool {
     servers::exclusion(snap, s).is_some_and(|e| e.disconnect)
 }
 
-/// Test every eligible server, or only those in `only`.
-async fn check_all(cx: &Cx, only: Option<&[Id]>) -> Result<()> {
+/// Test every eligible server, or only those without a result yet.
+async fn check_all(cx: &Cx, untested: bool) -> Result<()> {
     let snap = cx.snapshot();
     // The connected server first, then the best ones: their results matter most.
     let selected = *snap.get(&servers::SELECTED);
     let mut ids: Vec<(Id, i64)> = snap
         .get(&servers::SERVERS)
         .iter()
-        .filter(|s| !skipped(&snap, s) && only.is_none_or(|ids| ids.contains(&s.id)))
+        .filter(|s| !skipped(&snap, s) && !(untested && health(&snap, s.id).is_some()))
         .map(|s| {
             (
                 s.id,
@@ -371,7 +371,7 @@ fn setup(p: &mut Setup) -> Result<()> {
     );
 
     p.handle(check_all_servers);
-    p.handle(|cx: Cx, CheckNew(ids): CheckNew| async move { check_all(&cx, Some(&ids)).await });
+    p.handle(check_new_servers);
     p.wrap(test_new_servers);
     p.handle(check_server);
     p.handle(quick_check);
@@ -433,18 +433,35 @@ async fn check_all_servers(cx: Cx, _: CheckAll) -> Result<()> {
         }
     }
     cx.set_live(&CHECKING, true);
-    let _pass = Pass(cx.clone());
-    check_all(&cx, None).await
+    let result = {
+        let _pass = Pass(cx.clone());
+        check_all(&cx, false).await
+    };
+    // Servers loaded while it ran: the loads saw a pass running and left them.
+    let snap = cx.snapshot();
+    let untested = |s: &Server| !skipped(&snap, s) && health(&snap, s.id).is_none();
+    // Not after Stop: that would test what the user just stopped.
+    let stopped = result.as_ref().is_err_and(|e| e.cancelled());
+    if !stopped && snap.get(&servers::SERVERS).iter().any(untested) {
+        let _ = cx.spawn(CheckNew);
+    }
+    result
 }
 
-/// Test the servers a subscription just brought in (job "Test new servers"),
+/// Test the servers subscriptions just brought in (job "Test new servers"),
 /// so they show a rating right away instead of at the next scheduled test.
-struct CheckNew(Vec<Id>);
+/// It tests every server without a result, so one waiting run covers any
+/// number of loads.
+struct CheckNew;
 impl Op for CheckNew {
     type Reply = ();
     fn job(&self) -> Option<JobSpec> {
-        Some(JobSpec::new("Test new servers").page("servers"))
+        Some(JobSpec::new("Test new servers").queued().page("servers"))
     }
+}
+
+async fn check_new_servers(cx: Cx, _: CheckNew) -> Result<()> {
+    check_all(&cx, true).await
 }
 
 async fn test_new_servers(
@@ -453,9 +470,9 @@ async fn test_new_servers(
     next: Next<servers::ReplaceFromSource>,
 ) -> Result<servers::Replaced> {
     let replaced = next.run(&cx, op).await?;
-    // A full pass that is running reaches them anyway.
+    // A running full pass starts this run itself when it ends.
     if !replaced.added.is_empty() && !*cx.live(&CHECKING) {
-        cx.spawn(CheckNew(replaced.added.clone()))?;
+        cx.spawn(CheckNew)?;
     }
     Ok(replaced)
 }

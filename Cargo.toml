@@ -92,8 +92,13 @@ debug = 0
 opt-level = 2
 
 [profile.release]
-strip = "debuginfo"
+# Smaller binary means less code resident in RAM.
+lto = "fat"
+codegen-units = 1
+strip = true
 
 [profile.web]
 inherits = "release"
 opt-level = "s"
+# wasm-bindgen reads the target_features section that `strip = true` removes.
+strip = "debuginfo"

@@ -7,6 +7,6 @@ description = "rproxy design system for egui: tokens, palette, fonts, icons, wid
 
 [dependencies]
 egui = { workspace = true }
-image = { workspace = true }
-unicode-segmentation = "1.13"
+# Only enables color glyphs (emoji) in egui's own text rendering.
+epaint = { version = "0.37.0", default-features = false, features = ["color_fonts"] }
 qrcode = { version = "0.14.1", default-features = false }

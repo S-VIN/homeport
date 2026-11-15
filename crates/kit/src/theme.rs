@@ -72,6 +72,8 @@ pub const TITLE: f32 = 15.0;
 /// Bold family name.
 pub const BOLD: &str = "Ubuntu Bold";
 
+const EMOJI: &str = "Noto Color Emoji";
+
 /// Call once during app initialization, not on every frame.
 pub fn install_fonts(ctx: &Context) {
     let mut fonts = FontDefinitions::default();
@@ -93,6 +95,10 @@ pub fn install_fonts(ctx: &Context) {
             include_bytes!("../../../assets/fonts/SourceCodePro-Regular.otf").as_slice(),
         ),
         (
+            EMOJI,
+            include_bytes!("../../../assets/emoji/NotoColorEmoji.ttf").as_slice(),
+        ),
+        (
             crate::icons::REGULAR,
             include_bytes!("../../../assets/fonts/Phosphor.ttf").as_slice(),
         ),
@@ -105,12 +111,11 @@ pub fn install_fonts(ctx: &Context) {
             .font_data
             .insert(name.into(), Arc::new(FontData::from_static(data)));
     }
+    // Emoji go before Symbols, which also has a few (❤, 🔒) in monochrome.
     let proportional = fonts.families.entry(FontFamily::Proportional).or_default();
-    proportional.insert(0, "Ubuntu".into());
-    proportional.insert(1, "Symbols".into());
+    proportional.splice(0..0, ["Ubuntu".into(), EMOJI.into(), "Symbols".into()]);
     let monospace = fonts.families.entry(FontFamily::Monospace).or_default();
-    monospace.insert(0, "Ubuntu Mono".into());
-    monospace.insert(1, "Symbols".into());
+    monospace.splice(0..0, ["Ubuntu Mono".into(), EMOJI.into(), "Symbols".into()]);
     let mut bold = fonts.families[&FontFamily::Proportional].clone();
     bold.insert(0, BOLD.into());
     fonts.families.insert(FontFamily::Name(BOLD.into()), bold);

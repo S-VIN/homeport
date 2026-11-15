@@ -223,6 +223,16 @@ fn save_state(ui: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette) {
     }
     let saving = cx.s.pending_since().is_some_and(|t| cx.s.now - t > 0.2);
     let saved = !saving && cx.s.saved_at().is_some_and(|t| cx.s.now - t < 2.);
+    if kit::phone(ui) {
+        // Just the mark, in room kept for it: status chips don't jump or fold.
+        let (rect, response) = ui.allocate_exact_size(vec2(16., 16.), egui::Sense::hover());
+        if saving || saved {
+            let ink = if saving { p.faint } else { p.success };
+            kit::icons::paint_sized(ui.painter(), rect.center(), Icon::Check, 13., ink);
+            response.on_hover_text(if saving { "Saving…" } else { "Saved" });
+        }
+        return;
+    }
     if saving || saved {
         ui.label(
             RichText::new(if saving { "Saving…" } else { "Saved" })
@@ -386,17 +396,50 @@ fn status_chips(ui: &mut egui::Ui, cx: &mut UiCx) {
             cx.scoped(Some(c.plugin), |cx| (c.view)(ui, cx, &()))
         });
     }
-    let hidden = natural
-        .iter()
-        .zip(&shown)
-        .filter(|(w, on)| !**on && **w > 0.)
-        .count();
-    if hidden > 0 {
+    cx.s.folded = (0..list.len())
+        .filter(|&i| !shown[i] && natural[i] > 0.)
+        .collect();
+    if !cx.s.folded.is_empty() {
+        let hidden = cx.s.folded.len();
         let r = kit::chip(ui, None, &format!("+{hidden}"), "More status");
         if r.clicked() {
             cx.scoped(None, |cx| cx.toggle_panels_from(&r));
         }
     }
+}
+
+/// The status chips the bar had no room for, at the top of the "+N" popover
+/// (those with a panel there show it instead).
+fn folded_chips(ui: &mut egui::Ui, cx: &mut UiCx) {
+    let list = cx.k.reg.contributions(&STATUS).to_vec();
+    // A chip whose plugin has a panel here would say the same thing twice.
+    let panels: Vec<usize> =
+        cx.k.reg
+            .contributions(&PANELS)
+            .iter()
+            .map(|c| c.plugin)
+            .collect();
+    let folded: Vec<_> =
+        cx.s.folded
+            .iter()
+            .filter_map(|&i| list.get(i))
+            .filter(|c| !panels.contains(&c.plugin))
+            .collect();
+    if folded.is_empty() {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        for c in folded {
+            ui.push_id(c.id.as_str(), |ui| {
+                cx.scoped(Some(c.plugin), |cx| (c.view)(ui, cx, &()))
+            });
+        }
+    });
+    ui.add_space(theme::SPACE_M);
+    let line = theme::palette(ui).border;
+    let y = ui.cursor().top() + 0.5;
+    ui.painter().hline(ui.max_rect().x_range(), y, (1., line));
+    ui.add_space(theme::SPACE_M);
 }
 
 /// Title row of a panel card: caption on the left, optional content on the right.
@@ -548,7 +591,12 @@ fn panels_popover(ctx: &egui::Context, cx: &mut UiCx, p: &kit::Palette, status: 
                 egui::ScrollArea::vertical()
                     .id_salt("panels-popover-scroll")
                     .max_height((bounds.height() - 26.).max(0.))
-                    .show(ui, |ui| panels(ui, cx, false, only));
+                    .show(ui, |ui| {
+                        if only.is_none() {
+                            folded_chips(ui, cx);
+                        }
+                        panels(ui, cx, false, only)
+                    });
             });
         });
     let outside = ctx.input(|i| {
@@ -1223,99 +1271,27 @@ fn toasts(
                     continue;
                 };
                 let n = &t.notice;
-                // A toast that offers an action reports a change to undo, not a success.
-                let (icon, tone) = match (n.error, &n.action) {
-                    (true, _) => (Icon::Error, p.danger),
-                    (false, Some(_)) => (Icon::Info, p.accent),
-                    (false, None) => (Icon::Connected, p.success),
-                };
-                let r = egui::Frame::NONE
-                    .fill(p.surface)
-                    .stroke(Stroke::new(
-                        1_f32,
-                        if n.error {
-                            p.tint(p.danger, 0.45)
-                        } else {
-                            p.border
-                        },
-                    ))
-                    .corner_radius(theme::RADIUS)
-                    .shadow(egui::epaint::Shadow {
-                        offset: [0, 2],
-                        blur: 8,
-                        spread: 0,
-                        color: p.shadow.gamma_multiply(0.6),
-                    })
-                    .inner_margin(egui::Margin {
-                        left: 10,
-                        right: 4,
-                        top: 6,
-                        bottom: 6,
-                    })
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        // No "Open X" on page X itself.
-                        let link = n
-                            .page
-                            .filter(|id| *id != cx.s.page)
-                            .and_then(|id| titles.iter().find(|(pid, _)| *pid == id).copied());
-                        kit::row_line(ui, theme::CONTROL, |ui| {
-                            kit::icon(ui, icon, 16., tone);
-                            let width =
-                                (ui.available_width() - theme::CONTROL - theme::HORIZONTAL_GAP)
-                                    .max(0.);
-                            kit::cell(ui, width, |ui| {
-                                kit::truncated(
-                                    ui,
-                                    kit::bold(&n.title, theme::BODY).color(p.foreground),
-                                    None,
-                                );
-                            });
-                            if kit::icon_button(ui, Icon::Close, "Dismiss", true).clicked() {
-                                dismiss = Some(n.id);
-                            }
-                        });
-                        if !n.text.is_empty() {
-                            let mut text = (*egui::WidgetText::from(
-                                RichText::new(&n.text).size(theme::SMALL).color(p.muted),
-                            )
-                            .into_layout_job(
-                                ui.style(),
-                                egui::FontSelection::Default,
-                                Align::Min,
-                            ))
-                            .clone();
-                            text.wrap.max_rows = 3;
-                            let (response, elided) =
-                                kit::emoji::text_label_with_elision(ui, text, true, false);
-                            if elided {
-                                response.on_hover_ui(|ui| {
-                                    kit::emoji::text_label(ui, &n.text, true, false);
-                                });
-                            }
-                        }
-                        if let Some((id, title)) = link
-                            && kit::Button::ghost(&format!("Open {title}"))
-                                .tone(Tone::Accent)
-                                .show(ui)
-                                .clicked()
-                        {
-                            open = Some(id);
-                            dismiss = Some(n.id);
-                        }
-                        // Pressed in another window: the button has nothing left to do.
-                        if let Some(action) =
-                            n.action.as_ref().filter(|_| live_actions.contains(&n.id))
-                            && kit::Button::ghost(action.label)
-                                .tone(Tone::Accent)
-                                .show(ui)
-                                .clicked()
-                        {
-                            act = Some(n.id);
-                            dismiss = Some(n.id);
-                        }
-                    });
-                hold |= r.response.contains_pointer();
+                // No "Open X" on page X itself.
+                let link = n
+                    .page
+                    .filter(|id| *id != cx.s.page)
+                    .and_then(|id| titles.iter().find(|(pid, _)| *pid == id).copied());
+                // Pressed in another window: the button has nothing left to do.
+                let action = n.action.as_ref().filter(|_| live_actions.contains(&n.id));
+                let (clicked, hovered) = toast(ui, p, n, link, action.map(|a| a.label));
+                hold |= hovered;
+                match clicked {
+                    Some(ToastClick::Dismiss) => dismiss = Some(n.id),
+                    Some(ToastClick::Open) => {
+                        open = link.map(|(id, _)| id);
+                        dismiss = Some(n.id);
+                    }
+                    Some(ToastClick::Act) => {
+                        act = Some(n.id);
+                        dismiss = Some(n.id);
+                    }
+                    None => {}
+                }
             }
         });
     let height = used.response.rect.height().ceil();
@@ -1339,6 +1315,104 @@ fn toasts(
     if let Some(action) = act.and_then(|id| cx.k.take_notice_action(id)) {
         cx.scoped(action.plugin, |cx| (action.run)(cx));
     }
+}
+
+enum ToastClick {
+    Dismiss,
+    Open,
+    Act,
+}
+
+/// One toast card: what was pressed, and whether the pointer rests on it.
+fn toast(
+    ui: &mut egui::Ui,
+    p: &kit::Palette,
+    n: &crate::kernel::Notice,
+    link: Option<(&'static str, &'static str)>,
+    action: Option<&str>,
+) -> (Option<ToastClick>, bool) {
+    let mut clicked = None;
+    // A toast that offers an action reports a change to undo, not a success.
+    let (icon, tone) = match (n.error, &n.action) {
+        (true, _) => (Icon::Error, p.danger),
+        (false, Some(_)) => (Icon::Info, p.accent),
+        (false, None) => (Icon::Connected, p.success),
+    };
+    let r = egui::Frame::NONE
+        .fill(p.surface)
+        .stroke(Stroke::new(
+            1_f32,
+            if n.error {
+                p.tint(p.danger, 0.45)
+            } else {
+                p.border
+            },
+        ))
+        .corner_radius(theme::RADIUS)
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 2],
+            blur: 8,
+            spread: 0,
+            color: p.shadow.gamma_multiply(0.6),
+        })
+        .inner_margin(egui::Margin {
+            left: 10,
+            right: 4,
+            top: 6,
+            bottom: 6,
+        })
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            kit::row_line(ui, theme::CONTROL, |ui| {
+                kit::icon(ui, icon, 16., tone);
+                let width = (ui.available_width() - theme::CONTROL - theme::HORIZONTAL_GAP).max(0.);
+                kit::cell(ui, width, |ui| {
+                    kit::truncated(
+                        ui,
+                        kit::bold(&n.title, theme::BODY).color(p.foreground),
+                        None,
+                    );
+                });
+                if kit::icon_button(ui, Icon::Close, "Dismiss", true).clicked() {
+                    clicked = Some(ToastClick::Dismiss);
+                }
+            });
+            if !n.text.is_empty() {
+                let mut text = (*egui::WidgetText::from(
+                    RichText::new(&n.text).size(theme::SMALL).color(p.muted),
+                )
+                .into_layout_job(
+                    ui.style(),
+                    egui::FontSelection::Default,
+                    Align::Min,
+                ))
+                .clone();
+                text.wrap.max_rows = 3;
+                let (response, elided) = kit::text_label_with_elision(ui, text, true, false);
+                if elided {
+                    response.on_hover_ui(|ui| {
+                        kit::text_label(ui, &n.text, true, false);
+                    });
+                }
+            }
+            if let Some((_, title)) = link
+                && kit::Button::ghost(&format!("Open {title}"))
+                    .tone(Tone::Accent)
+                    .show(ui)
+                    .clicked()
+            {
+                clicked = Some(ToastClick::Open);
+            }
+            if let Some(label) = action
+                && kit::Button::ghost(label)
+                    .tone(Tone::Accent)
+                    .show(ui)
+                    .clicked()
+            {
+                clicked = Some(ToastClick::Act);
+            }
+        });
+    (clicked, r.response.contains_pointer())
 }
 
 /// One line of Activity: equal consecutive runs collapse into "× n".

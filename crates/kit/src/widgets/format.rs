@@ -1,6 +1,7 @@
 use super::*;
 
 /// Relative age of a Unix timestamp.
+/// "5 min ago"; the number never wraps away from its unit.
 pub fn age(time: u64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -11,12 +12,12 @@ pub fn age(time: u64) -> String {
             if s < 5 {
                 "just now".into()
             } else {
-                format!("{s} s ago")
+                format!("{s}\u{a0}s ago")
             }
         }
-        s @ 60..=3599 => format!("{} min ago", s / 60),
-        s @ 3600..=86399 => format!("{} h ago", s / 3600),
-        s => format!("{} d ago", s / 86400),
+        s @ 60..=3599 => format!("{}\u{a0}min ago", s / 60),
+        s @ 3600..=86399 => format!("{}\u{a0}h ago", s / 3600),
+        s => format!("{}\u{a0}d ago", s / 86400),
     }
 }
 

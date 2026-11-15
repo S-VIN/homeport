@@ -1,6 +1,6 @@
 use super::*;
 
-/// Single-line text input. Emoji are drawn from the bundled atlas.
+/// Single-line text input.
 pub fn input(
     ui: &mut Ui,
     id: impl egui::AsIdSalt,
@@ -10,18 +10,14 @@ pub fn input(
     secret: bool,
 ) -> Response {
     ui.push_id(id, |ui| {
-        if secret {
-            ui.add(
-                egui::TextEdit::singleline(value)
-                    .desired_width(width.max(24.))
-                    .min_size(vec2(0., CONTROL))
-                    .hint_text(placeholder)
-                    .password(true)
-                    .margin(egui::Margin::symmetric(8, 5)),
-            )
-        } else {
-            crate::emoji::edit(ui, value, width.max(24.), placeholder)
-        }
+        ui.add(
+            egui::TextEdit::singleline(value)
+                .desired_width(width.max(24.))
+                .min_size(vec2(0., CONTROL))
+                .hint_text(placeholder)
+                .password(secret)
+                .margin(egui::Margin::symmetric(8, 5)),
+        )
     })
     .inner
 }

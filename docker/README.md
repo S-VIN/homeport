@@ -107,21 +107,23 @@ docker compose up -d
 
 ## Публикация образа
 
-**Actions → docker → Run workflow** из основной ветки публикует
+**Actions → release → Run workflow** с флажком **Publish the Docker image**
+из основной ветки публикует
 `ghcr.io/s-vin/rproxy:latest` для `linux/amd64` и `linux/arm64`.
 Workflow запускается только вручную; push, pull request и создание тега
 его не запускают. Ручной запуск для Git-тега `v0.2.0` публикует версию `0.2.0`
 (и `latest`), для другой ветки — тег с её именем. Каждый образ содержит свой
 проверенный бинарник mihomo из Git; скачивания mihomo при сборке нет.
-Архитектуры собираются параллельно на нативных x64/ARM64 runners с отдельными
-кэшами слоёв. После успеха обеих сборок публикуется общий multi-platform тег.
-Оба workflow, `desktop` и `docker`, собирают без тестов и Clippy.
+Серверный бинарник (`--no-default-features`) собирают задачи `docker` на нативных
+x64/ARM64 runners с Rust-кэшем, и он подставляется
+в Dockerfile вместо этапа `build` (`--build-context build=…`): в CI образ только
+копирует готовые файлы. После успеха обеих архитектур публикуется общий
+multi-platform тег. Workflow собирает без тестов и Clippy.
 
-`docker/Dockerfile` собирает в одном build-этапе WASM-клиент и серверный бинарник
+Локально `docker/Dockerfile` собирает в одном build-этапе WASM-клиент и серверный бинарник
 (`--no-default-features`, без символов), выбирает ядро по `TARGETARCH` и копирует
 в `debian:trixie-slim` только бинарник, ядро и его лицензию. Cache mounts хранят
-реестр Cargo, `target/` и wasm-bindgen между локальными сборками; в GitHub Actions
-переиспользуются только слои из кэша `gha`.
+реестр Cargo, `target/` и wasm-bindgen между локальными сборками.
 
 Для скачивания образа без входа сделайте пакет публичным в GitHub Packages.
 Для приватного пакета выполните на VDS `docker login ghcr.io` с токеном,

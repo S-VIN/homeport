@@ -456,13 +456,13 @@ pub fn truncated(
 ) -> Response {
     let text = text.into();
     let full = text.text().to_owned();
-    let (r, elided) = crate::emoji::text_label_with_elision(ui, text, false, false);
+    let (r, elided) = text_label_with_elision(ui, text, false, false);
     match tooltip {
         Some(t) if !t.is_empty() && (elided || t != full) => r.on_hover_ui(|ui| {
-            crate::emoji::text_label(ui, t, true, false);
+            text_label(ui, t, true, false);
         }),
         None if elided => r.on_hover_ui(|ui| {
-            crate::emoji::text_label(ui, full, true, false);
+            text_label(ui, full, true, false);
         }),
         _ => r,
     }

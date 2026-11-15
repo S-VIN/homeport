@@ -391,6 +391,71 @@ async fn health_checks_use_the_isolated_route() {
     host.shutdown().await;
 }
 
+/// With a window open, Logs shows the user's traffic in the user's words.
+#[tokio::test(flavor = "multi_thread")]
+async fn logs_follow_traffic_while_a_window_is_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let (host, inbound) = start(dir.path()).await;
+    let k = host.kernel();
+    let (origin, _) = fixture(Arc::new(RwLock::new("from origin".into())), 200).await;
+    let _window = host.session(&egui::Context::default());
+    let url = format!("http://127.0.0.1:{origin}/probe");
+    let _ = proxy_client(inbound.port).get(&url).send().await;
+    until(&k, "a log line for the request", |k| {
+        k.snapshot()
+            .live(&plugin_logs::LINES)
+            .iter()
+            .any(|l| !l.internal && l.text.contains(&format!("127.0.0.1:{origin}")))
+    })
+    .await;
+    host.shutdown().await;
+}
+
+/// Two subscriptions that load together each get their new servers tested.
+#[tokio::test(flavor = "multi_thread")]
+async fn new_servers_of_every_subscription_are_tested() {
+    let dir = tempfile::tempdir().unwrap();
+    let (host, _) = start(dir.path()).await;
+    let k = host.kernel();
+    let load = |name: &'static str| {
+        let k = k.clone();
+        async move {
+            let source = Id::random();
+            // Nothing listens on port 1: the test fails fast but leaves a result.
+            let body =
+                format!("proxies:\n  - {{name: {name}, type: socks5, server: 127.0.0.1, port: 1}}");
+            let proxies = k
+                .cx_for("subscriptions")
+                .call(Parse { source, body })
+                .await
+                .unwrap();
+            k.cx_for("subscriptions")
+                .call(plugin_servers::ReplaceFromSource {
+                    source,
+                    proxies,
+                    still_current: None,
+                })
+                .await
+                .unwrap();
+        }
+    };
+    tokio::join!(load("First"), load("Second"));
+    // A source that loads while a full pass runs is tested after it.
+    let pass = k.cx_for("health-checks").call(health::CheckAll);
+    let (passed, ()) = tokio::join!(pass, load("Third"));
+    passed.unwrap();
+    until(&k, "every server tested", |k| {
+        let snap = k.snapshot();
+        let servers = snap.get(&SERVERS);
+        servers.len() == 3
+            && servers
+                .iter()
+                .all(|s| health::health(&snap, s.id).is_some_and(|h| h.checked.is_some()))
+    })
+    .await;
+    host.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn missing_dependencies_disable_dependents() {
     let dir = tempfile::tempdir().unwrap();

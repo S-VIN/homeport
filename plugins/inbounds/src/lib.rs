@@ -485,17 +485,11 @@ const AUTH: f32 = 84.;
 /// TUN hint: what to do when the tunnel cannot start on this platform.
 fn tun_hint(core: &std::path::Path) -> String {
     if Platform::appimage().is_some() {
-        "The AppImage filesystem is read-only. Install the native package, or extract the AppImage to a writable folder before granting the core network-admin rights.".into()
+        "The AppImage filesystem is read-only. Extract the AppImage to a writable folder (--appimage-extract) before granting the core network-admin rights.".into()
     } else if cfg!(windows) {
         "The tunnel needs administrator rights: start rproxy as administrator.".into()
     } else if cfg!(target_os = "macos") {
         "The tunnel needs administrator rights for the core.".into()
-    } else if core.starts_with("/opt/rproxy") {
-        // The pacman package grants them on install; an update or a manual copy loses them.
-        format!(
-            "The tunnel needs network admin rights. Reinstall the package, or run once: sudo setcap cap_net_admin,cap_net_bind_service+ep {}",
-            core.display()
-        )
     } else {
         format!(
             "The tunnel needs network admin rights. Run once: sudo setcap cap_net_admin,cap_net_bind_service+ep {}",
@@ -512,9 +506,7 @@ fn device_card(ui: &mut egui::Ui, cx: &mut UiCx, rows: &[Inbound]) {
             "System proxy and TUN unavailable in Flatpak",
             kit::Tone::Neutral,
         )
-        .on_hover_text(
-            "Available in the native package. Apps can still connect to the proxy ports.",
-        );
+        .on_hover_text("Available in the AppImage. Apps can still connect to the proxy ports.");
         return;
     }
     if Platform::is_docker() {

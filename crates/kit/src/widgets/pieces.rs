@@ -37,12 +37,17 @@ pub fn tag_width(ui: &Ui, text: &str, max_width: f32) -> f32 {
     if compact_row(ui) {
         return 10.;
     }
-    let galley = ui.painter().layout_no_wrap(
-        text.to_owned(),
-        FontId::proportional(theme::CAPTION),
-        Color32::PLACEHOLDER,
-    );
-    (galley.size().x + 12.).min(max_width)
+    let width = ui
+        .fonts_mut(|f| {
+            f.layout_no_wrap(
+                text.to_owned(),
+                FontId::proportional(theme::CAPTION),
+                Color32::PLACEHOLDER,
+            )
+        })
+        .size()
+        .x;
+    (width + 12.).min(max_width)
 }
 /// The dot that stands for a tag color.
 pub fn tag_dot(ui: &mut Ui, hue: usize) -> Response {
@@ -57,7 +62,7 @@ pub(crate) fn pill(
     max_width: f32,
 ) -> Response {
     let font = FontId::proportional(theme::CAPTION);
-    let (mut job, icons) = crate::emoji::layout(text, font, ink);
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, ink);
     job.wrap = egui::text::TextWrapping::truncate_at_width((max_width - 12.).max(12.));
     let galley = ui.fonts_mut(|f| f.layout_job(job));
     let (rect, r) = ui.allocate_exact_size(vec2(galley.size().x + 12., 18.), Sense::hover());
@@ -65,10 +70,9 @@ pub(crate) fn pill(
     let elided = galley.elided;
     let pos = rect.center() - galley.size() / 2.;
     ui.painter().galley(pos, galley.clone(), ink);
-    crate::emoji::paint(ui, ui.painter(), pos, &galley, &icons);
     if elided {
         r.on_hover_ui(|ui| {
-            crate::emoji::text_label(ui, text, true, false);
+            text_label(ui, text, true, false);
         })
     } else {
         r
@@ -102,8 +106,11 @@ pub enum Lead {
 /// Status-bar chip: dot or icon, short text; click opens details.
 pub fn chip(ui: &mut Ui, lead: Option<Lead>, text: &str, tooltip: &str) -> Response {
     let p = theme::palette(ui);
-    let (mut job, icons) =
-        crate::emoji::layout(text, FontId::proportional(theme::SMALL), p.foreground);
+    let mut job = egui::text::LayoutJob::simple_singleline(
+        text.to_owned(),
+        FontId::proportional(theme::SMALL),
+        p.foreground,
+    );
     let lead_w = match lead {
         None => 0.,
         Some(Lead::Dot(_)) => 14.,
@@ -132,7 +139,6 @@ pub fn chip(ui: &mut Ui, lead: Option<Lead>, text: &str, tooltip: &str) -> Respo
     }
     let pos = pos2(x, rect.center().y - galley.size().y / 2.);
     ui.painter().galley(pos, galley.clone(), p.foreground);
-    crate::emoji::paint(ui, ui.painter(), pos, &galley, &icons);
     if response.has_focus() {
         ui.painter().rect_stroke(
             rect,
@@ -144,11 +150,11 @@ pub fn chip(ui: &mut Ui, lead: Option<Lead>, text: &str, tooltip: &str) -> Respo
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, text));
     if !tooltip.is_empty() && (tooltip != text || galley.elided) {
         response.on_hover_ui(|ui| {
-            crate::emoji::text_label(ui, tooltip, true, false);
+            text_label(ui, tooltip, true, false);
         })
     } else if galley.elided {
         response.on_hover_ui(|ui| {
-            crate::emoji::text_label(ui, text, true, false);
+            text_label(ui, text, true, false);
         })
     } else {
         response

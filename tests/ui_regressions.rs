@@ -66,6 +66,7 @@ impl Ui {
                     id: i.to_string(),
                     target: format!("{host}:443"),
                     network: "TCP".into(),
+                    process: String::new(),
                     rule: "DomainSuffix example".into(),
                     chain: vec![server.clone()],
                     up: 3400 + i as u64,
@@ -243,7 +244,7 @@ async fn shell_navigation_connections_and_configuration_fit_supported_sizes() {
                         "connection rows must be compact: {a:?}, {b:?}"
                     );
                     assert!(a.right() < size[0] && b.right() < size[0]);
-                    assert!(ui.shapes.iter().any(|s| matches!(&s.shape,Shape::Mesh(m) if m.texture_id != egui::TextureId::Managed(0))),"emoji atlas should be rendered");
+                    assert!(ui.shapes.iter().any(|s| matches!(&s.shape,Shape::Text(t) if t.galley.rows.iter().any(|r| r.glyphs.iter().any(|g| g.is_color)))),"emoji should be drawn in color");
                 }
                 if page == "Settings" {
                     assert!(ui.text("Backups").is_none());
@@ -524,7 +525,7 @@ async fn popup_review_scenarios() {
                         for pressed in [true,false] { let pos=Pos2::new(size[0]-22.,16.);ui.frame(vec![Event::PointerMoved(pos),Event::PointerButton {pos,button:egui::PointerButton::Primary,pressed,modifiers:Default::default()}]); }
                     },
                     "connection" if size[0]<960.=>{
-                        // A selected server's emoji label is painted by the atlas, so use its chip bounds.
+                        // The selected server's chip leads the status bar.
                         for pressed in [true,false] { let pos=Pos2::new(70.,16.);ui.frame(vec![Event::PointerMoved(pos),Event::PointerButton {pos,button:egui::PointerButton::Primary,pressed,modifiers:Default::default()}]); }
                     },
                     "listeners" if size[0]<960.=>{ if ui.text("No proxy port").is_some(){ui.click("No proxy port");}else{continue;} },

@@ -5,7 +5,7 @@ pub fn bold(text: impl Into<String>, size: f32) -> RichText {
 }
 /// Muted secondary text (counters, short notes). Does not wrap.
 pub fn hint(ui: &mut Ui, text: impl Into<String>) -> Response {
-    crate::emoji::text_label(
+    text_label(
         ui,
         RichText::new(text)
             .size(theme::SMALL)
@@ -20,12 +20,12 @@ pub fn page_note(ui: &mut Ui, text: impl Into<String>) {
     let text = RichText::new(text)
         .size(theme::SMALL)
         .color(theme::palette(ui).muted);
-    crate::emoji::text_label(ui, text, true, false);
+    text_label(ui, text, true, false);
     ui.add_space(theme::SPACE_M);
 }
 /// Small muted column caption.
 pub fn caption(ui: &mut Ui, text: impl Into<String>) -> Response {
-    crate::emoji::text_label(
+    text_label(
         ui,
         RichText::new(text)
             .size(theme::CAPTION)
@@ -37,12 +37,73 @@ pub fn caption(ui: &mut Ui, text: impl Into<String>) -> Response {
 /// Small text in a status tone (row subtitles, inline errors). Wraps.
 pub fn tone_text(ui: &mut Ui, text: impl Into<String>, tone: Tone) -> Response {
     let ink = theme::palette(ui).tone(tone);
-    crate::emoji::text_label(
+    text_label(
         ui,
         RichText::new(text).size(theme::SMALL).color(ink),
         true,
         false,
     )
+}
+/// A name (server, subscription) on one line; when cut, hovering shows it whole.
+pub fn label(ui: &mut Ui, text: &str, font: FontId, clickable: bool) -> Response {
+    let (response, elided) =
+        text_label_with_elision(ui, RichText::new(text).font(font), !clickable, clickable);
+    if elided {
+        response.on_hover_ui(|ui| {
+            text_label(ui, text, true, false);
+        })
+    } else {
+        response
+    }
+}
+/// Shared text renderer, preserving rich text styles and the original accessible label.
+pub fn text_label(
+    ui: &mut Ui,
+    text: impl Into<egui::WidgetText>,
+    wrap: bool,
+    clickable: bool,
+) -> Response {
+    text_label_with_elision(ui, text, wrap, clickable).0
+}
+/// Also reports whether layout actually hid part of the text.
+pub fn text_label_with_elision(
+    ui: &mut Ui,
+    text: impl Into<egui::WidgetText>,
+    wrap: bool,
+    clickable: bool,
+) -> (Response, bool) {
+    let text = text.into();
+    let original = text.text().to_owned();
+    let job = text.into_layout_job(ui.style(), egui::FontSelection::Default, Align::Center);
+    let mut label = egui::Label::new(job)
+        .selectable(false)
+        .show_tooltip_when_elided(false);
+    label = if wrap { label.wrap() } else { label.truncate() };
+    if clickable {
+        label = label.sense(Sense::click());
+    }
+    let (pos, galley, response) = label.layout_in_ui(ui);
+    if ui.is_rect_visible(response.rect) {
+        ui.painter()
+            .galley(pos, galley.clone(), ui.visuals().text_color());
+    }
+    if clickable && response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect.expand(1.),
+            RADIUS_CONTROL,
+            Stroke::new(2_f32, theme::palette(ui).accent),
+            egui::StrokeKind::Outside,
+        );
+    }
+    response.widget_info(|| {
+        let role = if clickable {
+            egui::Role::Button
+        } else {
+            egui::Role::Label
+        };
+        egui::WidgetInfo::labeled(role, ui.is_enabled(), &original)
+    });
+    (response, galley.elided)
 }
 /// `1 server`, `2 servers`.
 /// `1.2 MB`, `640 KB`, `12 B` (decimal units, like file managers).

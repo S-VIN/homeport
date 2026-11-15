@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1
 # Build from the repository root: docker build -f docker/Dockerfile .
+# CI builds the binaries on the runner and replaces the `build` stage with
+# `--build-context build=<dir>` holding rproxy, core/mihomo and core/LICENSE.
 # rust-toolchain.toml is the source of truth for Rust: rustup installs that
 # version automatically if this image tag ever falls behind it.
 FROM rust:1.100.0-trixie AS build

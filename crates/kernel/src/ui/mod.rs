@@ -89,6 +89,9 @@ pub(crate) struct SessionState {
     pub toast_height: f32,
     /// Where the Activity chip was drawn (the popover anchors to it).
     pub activity_chip: Option<egui::Rect>,
+    /// Status chips that didn't fit the bar (by contribution index): the "+N"
+    /// popover shows them above the panels.
+    pub folded: Vec<usize>,
     /// A save whose outcome a page already took keeps "Saved" on screen.
     last_saved: Option<f64>,
 }
@@ -110,6 +113,7 @@ impl SessionState {
             panels_open: false,
             panel_anchor: None,
             activity_open: false,
+            folded: Vec::new(),
             theme: None,
             now: 0.,
             wide: false,

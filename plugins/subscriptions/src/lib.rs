@@ -588,7 +588,7 @@ fn plan(s: &Source) -> Option<(String, bool)> {
     // Providers put a far-away date for "no end"; past ten years it is that.
     let left = s
         .expires
-        .map(|end| end as i64 - now() as i64)
+        .map(|end| i64::try_from(end).unwrap_or(i64::MAX) - now() as i64)
         .filter(|left| *left < 10 * 365 * 86_400);
     let term = left.map(|left| match (left + 43_200) / 86_400 {
         _ if left <= 0 => "expired".to_owned(),
@@ -606,7 +606,13 @@ fn status(s: &Source, loading: bool) -> (String, Tone) {
     match plan(s).filter(|_| !loading) {
         Some((plan, alarming)) => {
             let tone = if alarming { Tone::Warning } else { tone };
-            (format!("{text} · {plan}"), tone)
+            // The plan first, so a narrow row cuts "updated …" instead;
+            // a failed refresh still leads.
+            let text = match s.error {
+                Some(_) => format!("{text} · {plan}"),
+                None => format!("{plan} · {}", text.to_lowercase()),
+            };
+            (text, tone)
         }
         None => (text, tone),
     }
@@ -655,10 +661,13 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
             || RefreshAll,
         );
     });
-    kit::page_note(
-        ui,
-        "Auto select prefers servers from subscriptions higher in the list.",
-    );
+    // On a phone the order arrows come with the editor.
+    let note = if kit::phone(ui) {
+        "Auto select prefers servers from subscriptions higher in the list. Tap the pencil to move one."
+    } else {
+        "Auto select prefers servers from subscriptions higher in the list."
+    };
+    kit::page_note(ui, note);
 
     let loading = cx.live(&LOADING);
     ListEditor::new(&SOURCES)

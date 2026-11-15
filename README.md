@@ -8,10 +8,11 @@
   заполнения `.env` запуск — `docker compose up -d`. Образы скачиваются из GHCR;
   сборка на VDS не нужна. Для публичного HTTPS нужны два DNS-имени на IP сервера.
 - **Desktop:** [платформы, пакеты и сборка](#сборки-приложения). Windows setup и
-  portable, Linux AppImage/Flatpak/pacman, macOS DMG; везде x64 и ARM64.
-- **GitHub Actions:** только ручной запуск через **Run workflow**. `desktop`
-  собирает три артефакта: Windows, Linux и macOS, каждый с x64 и ARM64.
-  `docker` публикует образ amd64/arm64 в GHCR. Тесты в workflows не запускаются.
+  portable-папка, Linux AppImage/Flatpak, macOS DMG; везде x64 и ARM64.
+- **GitHub Actions:** только ручной запуск workflow `release` через **Run workflow**.
+  Каждый пакет (Windows, Linux, macOS; x64 и ARM64) — отдельный артефакт-zip.
+  Флажок **Publish the Docker image** дополнительно публикует образ amd64/arm64
+  в GHCR. Тесты в workflow не запускаются.
 
 ## Запуск
 
@@ -127,46 +128,42 @@ CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=$PWD/.cache/wasm-bindgen/bin/wasm-bin
 
 ## Сборки приложения
 
-**Actions → desktop → Run workflow** собирает WASM один раз, затем параллельно
+**Actions → release → Run workflow** собирает WASM один раз, затем параллельно
 запускает шесть нативных сборок. Workflow запускается только вручную;
-push, pull request и создание тега сборку не запускают. Тесты, Clippy
-и проверки готовых пакетов остаются локальными командами.
-После успешного завершения в Artifacts остаются ровно три архива:
-`rproxy-windows`, `rproxy-linux` и `rproxy-macos`. Каждый содержит пакеты
-обеих архитектур и SHA256SUMS; промежуточные артефакты удаляются.
-Публикация GitHub Release автоматически не выполняется.
+push, pull request и создание тега сборку не запускают. Тесты и Clippy
+остаются локальными командами. Публикация GitHub Release не выполняется.
 
-WASM и нативные сборки используют `sccache` с хранилищем GitHub Actions:
-результаты компиляции неизменившихся Rust-библиотек переиспользуются между запусками.
-Нативная сборка идёт для архитектуры runner без явного `--target`. В CI используется
-короткий `CARGO_TARGET_DIR`: `C:\b` на Windows и `/tmp/rproxy-build` на Linux/macOS.
-Сборка, упаковка и Rust-кэш используют один каталог; это сокращает аргументы rustc
-и уменьшает риск ошибки Windows 206 при работе sccache.
-Обычный Rust-кэш зависимостей тоже сохранён; его сохранение при ошибке выключено.
-Статистика попаданий в `sccache` выводится после сборки. Первый запуск с пустым
-кэшем всё ещё требует компиляции, а финальная линковка не кэшируется.
+В Artifacts все пакеты лежат одним списком, каждый — отдельным zip с именем
+пакета: `rproxy-<версия>-linux-x64.AppImage`, `rproxy-<версия>-windows-arm64-setup.exe`,
+`rproxy-<версия>-windows-x64-portable` (папка portable-версии) и т. д.
+Промежуточных артефактов нет: WASM передаётся между jobs через кэш.
+
+Кэши: WASM кэшируется по хешу `crates/remote`, `Cargo.lock`, `Cargo.toml` и
+`rust-toolchain.toml` — если они не менялись, WASM не пересобирается. Зависимости
+Rust кэширует `Swatinem/rust-cache` отдельно для каждой целевой платформы; кэш
+сохраняют только запуски из `master`, чтобы не переполнять лимит кэша GitHub.
+Финальная линковка (fat LTO) не кэшируется. wasm-bindgen ставится готовым
+бинарником той же версии, что в `Cargo.lock`.
 
 | ОС | Архитектуры | Пакеты |
 | --- | --- | --- |
-| Windows | x64, ARM64 | NSIS setup.exe, portable.exe, portable.zip |
-| Linux | x64, ARM64 | AppImage, Flatpak, pacman (.pkg.tar.zst) |
+| Windows | x64, ARM64 | NSIS setup.exe, portable-папка |
+| Linux | x64, ARM64 | AppImage, Flatpak |
 | macOS | Intel x64, Apple Silicon ARM64 | DMG |
 
 Версия берётся из корневого Cargo.toml, Rust — из rust-toolchain.toml, версия
 wasm-bindgen — из Cargo.lock, mihomo — из `assets/mihomo/manifest.json`.
-Браузерный WASM собирается один раз и передаётся всем jobs. Каждый job сборки
-берёт **свой** бинарник mihomo из `assets/mihomo/<os>/<arch>/`, проверяет его
-SHA-256 по `manifest.json`, компилирует программу и упаковывает её. Checkout
-получает только ядро выбранной платформы. Затем пакеты загружаются в Artifacts
-и объединяются по ОС без повторного сжатия. Для каждого набора файлов создаётся
-SHA256SUMS. Сборки Linux используют Ubuntu
-24.04 для совместимости с glibc 2.39+; Flatpak использует runtime 26.08.
+Каждый job сборки берёт **свой** бинарник mihomo из `assets/mihomo/<os>/<arch>/`,
+проверяет его SHA-256 по `manifest.json`, компилирует программу для
+`CARGO_BUILD_TARGET` и упаковывает её. Checkout получает только ядро выбранной
+платформы. Обе сборки macOS идут на Apple Silicon runner, Intel — кросс-компиляцией.
+Сборки Linux используют Ubuntu 24.04 для совместимости с glibc 2.39+;
+Flatpak использует runtime 26.08.
 AppImage использует графические библиотеки установленного Linux-десктопа
 (X11/Wayland, xkbcommon, EGL/OpenGL); Flatpak получает их из runtime.
 
 Windows setup устанавливается текущему пользователю без администратора.
-Portable EXE распаковывается во временный каталог и хранит профиль в
-`rproxy-data` рядом с EXE; portable ZIP хранит `data` рядом с бинарником
+Portable-папка хранит `data` рядом с бинарником
 (маркер `portable.txt`). Переносите portable-профиль вместе с программой.
 
 Во всех готовых сборках, включая Docker, `rproxy` и `mihomo` лежат рядом
@@ -185,8 +182,8 @@ DMG содержит приложение для переноса в Application
 Системный прокси и TUN. Изменённые системные настройки записываются в `<профиль>/plugins/inbounds/system-proxy.json`;
 после аварии, выхода из сеанса или принудительного завершения следующий запуск возвращает значения, которые всё ещё
 равны записанным rproxy. На Windows используется WinINet `INTERNET_OPTION_PER_CONNECTION_OPTION` (обновляет и
-`Connections\DefaultConnectionSettings`). TUN требует прав: пакет pacman выдаёт ядру `cap_net_admin,cap_net_bind_service`
-скриптом `.INSTALL`, для остальных Linux-сборок подсказка в Listeners показывает команду `setcap` для точного файла ядра;
+`Connections\DefaultConnectionSettings`). TUN требует прав: на Linux подсказка в Listeners показывает команду `setcap cap_net_admin,cap_net_bind_service`
+для точного файла ядра (AppImage для этого нужно распаковать: его файловая система только для чтения);
 на macOS кнопка **Grant access** один раз запрашивает пароль администратора и устанавливает setuid-копию ядра
 `<профиль>/core/bin/mihomo-tun` (после обновления ядра кнопка появляется снова); на Windows rproxy запускают от
 администратора. В Docker и Flatpak системный прокси и TUN не используются. Установщик и деинсталлятор Windows
@@ -229,21 +226,21 @@ python3 scripts/build.py --release
 
 Скрипт `scripts/package.py` запускается **на целевой ОС и архитектуре** после
 release-сборки. Нужные инструменты упаковки (Linux: flatpak, flatpak-builder,
-librsvg2-bin, librsvg2-common, zstd; Windows: NSIS) устанавливает desktop.yml.
-`librsvg2-bin` создаёт PNG, а `librsvg2-common` нужен Flatpak для чтения SVG при экспорте.
-Проверка готовых пакетов —
-`python scripts/package.py --check --os <ОС> --arch <архитектура>`.
-Полная проверка каждой платформы требует соответствующего
-runner, локальная проверка Linux её не заменяет.
+librsvg2-common; Windows: NSIS) устанавливает release.yml.
+`librsvg2-common` нужен Flatpak для чтения SVG-иконки при экспорте; PNG-иконка
+512 px (`assets/logos/rproxy-blue-512.png`) отрендерена заранее из
+`rproxy-blue.svg` — после правки SVG её нужно обновить:
+`magick -density 384 -background none RSVG:assets/logos/rproxy-blue.svg PNG32:assets/logos/rproxy-blue-512.png`.
 
 Вся сборочная логика находится в четырёх Python-файлах:
 
-- `scripts/build.py` — компиляция WASM и приложения. Утилита wasm-bindgen хранится
-  в `.cache/wasm-bindgen`, отдельно от очищаемого Cargo-кэша, и сохраняется между
-  запусками CI.
-- `scripts/package.py` — создание и проверка установщиков и переносимых пакетов.
-  Шаблоны NSIS, Linux desktop entry, Flatpak и macOS metadata находятся здесь;
-  промежуточные файлы генерируются в игнорируемом `dist/`. linuxdeploy закреплён
+- `scripts/build.py` — компиляция WASM и приложения. Локально утилита wasm-bindgen
+  ставится в `.cache/wasm-bindgen`, отдельно от очищаемого Cargo-кэша; в CI она
+  уже лежит в PATH.
+- `scripts/package.py` — создание пакетов, по одной функции на ОС. Шаблоны
+  установщика NSIS и Linux desktop entry лежат в `scripts/packaging/`; манифест
+  Flatpak и macOS Info.plist собираются в коде; промежуточные файлы генерируются
+  в игнорируемом `dist/`. linuxdeploy закреплён
   на релизе `1-alpha-20251107-1` и проверяется по SHA-256.
 - `scripts/mihomo.py` — проверка и выбор комплектного ядра; `--update` обновляет
   бинарники по закреплённым URL и хешам в `assets/mihomo/manifest.json`.

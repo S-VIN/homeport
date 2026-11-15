@@ -2,7 +2,6 @@
 //!
 //! The kit knows nothing about proxies or plugins. The kernel builds its shell and
 //! plugin helpers (list editors, settings bound to state) on top of it.
-pub mod emoji;
 pub mod icons;
 pub mod palette;
 pub mod theme;

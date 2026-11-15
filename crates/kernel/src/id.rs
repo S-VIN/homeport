@@ -162,3 +162,30 @@ macro_rules! choices {
         }
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::store::rusqlite::Connection;
+
+    crate::choices! {
+        enum Route { Proxy => "Proxy" | "Via server" }
+    }
+
+    #[test]
+    fn choices_save_the_name_and_read_old_labels() {
+        let read = |json: &str| serde_json::from_str::<Route>(json).unwrap();
+        assert_eq!(read("\"Via server\""), Route::Proxy);
+        assert_eq!(read("\"Proxy\""), Route::Proxy);
+        assert_eq!(Route::ALL, [Route::Proxy]);
+        assert_eq!(serde_json::to_string(&Route::Proxy).unwrap(), "\"Proxy\"");
+        let db = Connection::open_in_memory().unwrap();
+        let old: Route = db
+            .query_row("SELECT 'Via server'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(old, Route::Proxy);
+        let saved: String = db
+            .query_row("SELECT ?1", [Route::Proxy], |r| r.get(0))
+            .unwrap();
+        assert_eq!(saved, "Proxy");
+    }
+}

@@ -251,6 +251,12 @@ pub fn rule_pattern(pattern: &str) -> Result<(String, Option<IpNet>)> {
     // An app by its executable name; names keep their case.
     if let Some(app) = pattern.strip_prefix("app:") {
         let app = app.trim();
+        // The sandbox hides other processes from the core.
+        if Platform::is_flatpak() || Platform::is_docker() {
+            return Err(Error::msg(
+                "App rules need the regular install: Flatpak and Docker hide other apps.",
+            ));
+        }
         if app.is_empty() || app.contains([',', '\n']) {
             return Err(Error::msg(
                 "Enter an app name, for example app:Telegram or app:chrome.exe.",
@@ -361,6 +367,7 @@ fn setup(p: &mut Setup) -> Result<()> {
         let mode = *cx.get(&MODE);
         if mode != Mode::Rule {
             kit::tone_text(ui, mode_help(mode), kit::Tone::Warning);
+            ui.add_space(kit::theme::SPACE_M);
         }
     });
     p.fill(&rproxy_kernel::shell::STATUS, "mode", 3, |ui, cx, _| {
@@ -487,21 +494,17 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
     kit::page_note(
         ui,
         if mode == Mode::Rule {
-            "Rules are checked from the top; the first match wins. Traffic no rule matches goes through the proxy."
+            "Rules are checked from the top; the first match wins. Traffic that no rule matches goes through the proxy."
         } else {
             mode_help(mode)
         },
     );
 
-    // Paused rules stay editable but look it.
-    if mode != Mode::Rule {
-        ui.multiply_opacity(0.5);
-    }
     ListEditor::new(&RULES)
         .add_form("Add routing rule", || Rule { id: Id::random(), pattern: String::new(), action: Route::Proxy }, |ui, r, width| {
             kit::Fields::new(width)
                 .input("pattern", &mut r.pattern, "Domain, IP, network or app:Name")
-                .help("example.org also covers its subdomains; =example.org only that name; *tube* any name containing tube. Also 10.0.0.0/8, geosite:category-ru, geoip:ru, app:Telegram (an app's traffic), or a pasted link.")
+                .help("example.org also covers its subdomains; =example.org only that name; *tube* any name containing tube. Also 10.0.0.0/8, geosite:category-ru, geoip:ru, app:Telegram (an app by its process name, as Logs and Connections show it), or a pasted link.")
                 .choice("route", &mut r.action, Route::ALL)
                 .show(ui)
                 && !r.pattern.trim().is_empty()
@@ -513,6 +516,7 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
         .column(Column::choice("Route", 120., |r: &mut Rule| &mut r.action, Route::ALL))
         .subtitle(move |rows, i| rule_note(rows, i, &geo_status))
         .empty(Icon::Routing, "No routing rules", "Everything goes through the proxy.")
+        .paused(mode != Mode::Rule)
         .show(ui, cx);
 }
 
@@ -526,6 +530,13 @@ fn rule_note(
     if rows[..i].iter().any(|r| r.pattern == "*") {
         return Some((
             "Never used: the * rule above matches everything first".into(),
+            kit::Tone::Warning,
+        ));
+    }
+    // Say, imported from a desktop install.
+    if rows[i].pattern.starts_with("app:") && (Platform::is_flatpak() || Platform::is_docker()) {
+        return Some((
+            "Never used: Flatpak and Docker hide other apps".into(),
             kit::Tone::Warning,
         ));
     }
