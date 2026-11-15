@@ -23,6 +23,8 @@ pub struct CoreStatus {
     pub version: Option<String>,
     /// Listener name → why it is not running.
     pub listener_errors: BTreeMap<String, String>,
+    /// Saved TUN could not be authorized at startup; ordinary proxies still run.
+    pub tun_error: Option<String>,
 }
 impl CoreStatus {
     pub fn running(&self) -> bool {
@@ -82,18 +84,16 @@ impl Core {
             old.stop().await;
         }
         self.set(|s| *s = CoreStatus::default());
-        let result: Result<(Mihomo, mihomo::ApplyReport)> = async {
-            let cfg = compose(reg, snap)?;
-            let ports: Vec<u16> = cfg.listeners.iter().map(|l| l.port).collect();
-            let mut m = Mihomo::start(&ports, &self.home)
-                .await
-                .map_err(Error::msg)?;
-            match m.apply(&cfg).await {
-                Ok(report) => Ok((m, report)),
-                Err(e) => {
-                    m.stop().await;
-                    Err(Error::msg(e))
+        let mut tun_error = None;
+        let result = async {
+            let mut cfg = compose(reg, snap)?;
+            match self.launch(&cfg).await {
+                Err(e) if cfg.tun.is_some() => {
+                    tun_error = Some(e.message);
+                    cfg.tun = None;
+                    self.launch(&cfg).await
                 }
+                result => result,
             }
         }
         .await;
@@ -105,6 +105,7 @@ impl Core {
                     s.state = CoreState::Running;
                     s.version = version;
                     s.listener_errors = report.listener_errors;
+                    s.tun_error = tun_error;
                 });
                 Ok(())
             }
@@ -114,16 +115,60 @@ impl Core {
             }
         }
     }
+    async fn launch(&self, cfg: &Config) -> Result<(Mihomo, mihomo::ApplyReport)> {
+        let ports: Vec<u16> = cfg.listeners.iter().map(|l| l.port).collect();
+        let mut m = Mihomo::start_with_tun(&ports, &self.home, cfg.tun.is_some())
+            .await
+            .map_err(Error::msg)?;
+        match m.apply(cfg).await {
+            Ok(report) => Ok((m, report)),
+            Err(e) => {
+                m.stop().await;
+                Err(Error::msg(e))
+            }
+        }
+    }
     /// Apply the configuration of `snap` if the core runs. While it is offline
     /// configuration stays editable and is applied on the next start.
     pub async fn sync(&self, reg: &Registry, snap: &Snapshot) -> Result<()> {
-        let cfg = compose(reg, snap)?;
+        let mut cfg = compose(reg, snap)?;
+        if cfg.tun.is_none() {
+            if self.status.read().unwrap().tun_error.is_some() {
+                self.set(|s| s.tun_error = None);
+            }
+        } else if self.status.read().unwrap().tun_error.is_some() {
+            // A cancelled startup prompt is retried only on explicit restart or
+            // off/on, never by unrelated settings writes or background polling.
+            cfg.tun = None;
+        }
+        // A privilege transition replaces the process and its check lanes.
+        // Obtain authorization before stopping the existing proxy: cancellation
+        // must leave its listeners and the saved setting untouched.
+        let transition = self
+            .proc
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|m| m.elevated() != cfg.tun.is_some());
+        let _lanes = if transition {
+            Some(self.lanes.acquire_many(mihomo::CHECK_LANES as u32).await)
+        } else {
+            None
+        };
         let mut proc = self.proc.lock().await;
         let Some(m) = proc.as_mut() else {
             return Ok(());
         };
         if m.applied() == Some(&cfg) {
             return Ok(());
+        }
+        if m.elevated() != cfg.tun.is_some() {
+            let ports: Vec<u16> = cfg.listeners.iter().map(|l| l.port).collect();
+            let next = Mihomo::start_with_tun(&ports, &self.home, cfg.tun.is_some())
+                .await
+                .map_err(Error::msg)?;
+            m.stop().await;
+            *m = next;
         }
         let report = m.apply(&cfg).await.map_err(Error::msg)?;
         if self.status.read().unwrap().listener_errors != report.listener_errors {

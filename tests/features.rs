@@ -296,26 +296,29 @@ async fn configuration_round_trip_preserves_settings_without_automatic_backups()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_tunnel_reports_when_it_cannot_start() {
-    use plugin_inbounds::TUN_UP;
-    if std::env::var("USER").as_deref() == Ok("root") {
-        return;
-    }
+async fn failed_tunnel_authorization_keeps_the_saved_setting_and_proxy() {
     let dir = tempfile::tempdir().unwrap();
     let host = start(dir.path()).await;
     let k = host.kernel();
-    k.cx_for("inbounds")
+    // Library hosts do not configure a supervisor, so they cannot open OS dialogs.
+    let error = k
+        .cx_for("inbounds")
         .call(rproxy_kernel::Update {
             state: &plugin_inbounds::DEVICE,
             change: Box::new(|d| d.tun = true),
         })
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(
+        error.message.contains("authorization is unavailable"),
+        "{error}"
+    );
     assert!(k.core_status().running(), "the rest keeps working");
-    until(&k, "tunnel status", 15, |k| {
-        k.snapshot().live(&TUN_UP).is_some()
-    })
-    .await;
-    assert_eq!(*k.snapshot().live(&TUN_UP), Some(false), "no rights here");
+    assert!(!k.snapshot().get(&plugin_inbounds::DEVICE).tun);
+    assert!(
+        !k.core_api().configs().await.unwrap()["tun"]["enable"]
+            .as_bool()
+            .unwrap_or(false)
+    );
     host.shutdown().await;
 }

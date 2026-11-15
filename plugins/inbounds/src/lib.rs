@@ -51,9 +51,14 @@ pub fn system_proxy_address(snap: &Snapshot) -> Option<std::net::SocketAddr> {
         .map(|i| mihomo::local_address(i.listen.0, i.port))
 }
 
-/// System proxy and TUN need the host system: not inside Flatpak or Docker.
+/// System proxy integration is unavailable inside Flatpak and Docker.
 fn device_control() -> bool {
     !Platform::is_flatpak() && !Platform::is_docker()
+}
+
+/// Flatpak runs its authorized tunnel worker on the host.
+fn tun_control() -> bool {
+    !Platform::is_docker()
 }
 
 pub static PLUGIN: Plugin = Plugin {
@@ -145,15 +150,6 @@ async fn apply_system_proxy(
     .map_err(|e| e.to_string())?
 }
 
-/// macOS: install the setuid copy of the core that can create the tunnel.
-struct GrantTun;
-impl Op for GrantTun {
-    type Reply = ();
-    fn job(&self) -> Option<JobSpec> {
-        Some(JobSpec::new("Grant tunnel access").page("inbounds"))
-    }
-}
-
 fn setup(p: &mut Setup) -> Result<()> {
     p.list(&INBOUNDS)
         .validate(|_, i, prev, others| validate(i, prev, others));
@@ -163,10 +159,10 @@ fn setup(p: &mut Setup) -> Result<()> {
     p.live(&TUN_UP, || None);
     p.live(&SYSTEM_PROXY, || None);
     p.handle(read_tun);
-    p.handle(|cx: Cx, _: GrantTun| async move { cx.kernel().grant_core_access().await });
+
     p.every(
         "tun",
-        |s| (s.get(&DEVICE).tun && device_control()).then_some(Duration::from_secs(3)),
+        |s| (s.get(&DEVICE).tun && tun_control()).then_some(Duration::from_secs(3)),
         || ReadTun,
     );
     if device_control() {
@@ -287,7 +283,7 @@ async fn system_proxy(cx: Cx, (id, address): (Id, std::net::SocketAddr)) -> Resu
 /// The listeners, and the tunnel with its DNS when traffic capture is on.
 fn fragment(snap: &Snapshot) -> Fragment {
     let device = snap.get(&DEVICE);
-    let tunnel = (device.tun && device_control()).then_some(mihomo::Tun {
+    let tunnel = (device.tun && tun_control()).then_some(mihomo::Tun {
         strict_route: false,
     });
     let inbounds = snap.get(&INBOUNDS);
@@ -482,33 +478,8 @@ struct InboundsPage {
 const TOGGLE: f32 = 30.;
 const AUTH: f32 = 84.;
 
-/// TUN hint: what to do when the tunnel cannot start on this platform.
-fn tun_hint(core: &std::path::Path) -> String {
-    if Platform::appimage().is_some() {
-        "The AppImage filesystem is read-only. Extract the AppImage to a writable folder (--appimage-extract) before granting the core network-admin rights.".into()
-    } else if cfg!(windows) {
-        "The tunnel needs administrator rights: start rproxy as administrator.".into()
-    } else if cfg!(target_os = "macos") {
-        "The tunnel needs administrator rights for the core.".into()
-    } else {
-        format!(
-            "The tunnel needs network admin rights. Run once: sudo setcap cap_net_admin,cap_net_bind_service+ep {}",
-            core.display()
-        )
-    }
-}
-
 /// System proxy and TUN: how this computer itself uses rproxy.
 fn device_card(ui: &mut egui::Ui, cx: &mut UiCx, rows: &[Inbound]) {
-    if Platform::is_flatpak() {
-        kit::tone_text(
-            ui,
-            "System proxy and TUN unavailable in Flatpak",
-            kit::Tone::Neutral,
-        )
-        .on_hover_text("Available in the AppImage. Apps can still connect to the proxy ports.");
-        return;
-    }
     if Platform::is_docker() {
         kit::tone_text(
             ui,
@@ -524,50 +495,54 @@ fn device_card(ui: &mut egui::Ui, cx: &mut UiCx, rows: &[Inbound]) {
         .filter(|i| i.enabled && i.login.is_none())
         .collect();
     kit::settings_card(ui, |ui| {
-        let current = device
-            .system_proxy
-            .and_then(|id| rows.iter().find(|i| i.id == id));
-        let label = current.map_or_else(|| "Off".to_owned(), |i| i.address());
-        kit::settings_row(
-            ui,
-            "System proxy",
-            "Requires a proxy port without a password. Restores previous proxy settings when disabled.",
-            |ui| {
-                kit::select(ui, "system-proxy", &label, 170., |ui| {
-                    if ui
-                        .selectable_label(device.system_proxy.is_none(), "Off")
-                        .clicked()
-                    {
-                        cx.update("system-proxy", &DEVICE, |d| d.system_proxy = None);
-                    }
-                    for i in &eligible {
-                        let id = i.id;
+        if !Platform::is_flatpak() {
+            let current = device
+                .system_proxy
+                .and_then(|id| rows.iter().find(|i| i.id == id));
+            let label = current.map_or_else(|| "Off".to_owned(), |i| i.address());
+            kit::settings_row(
+                ui,
+                "System proxy",
+                "Requires a proxy port without a password. Restores previous proxy settings when disabled.",
+                |ui| {
+                    kit::select(ui, "system-proxy", &label, 170., |ui| {
                         if ui
-                            .selectable_label(device.system_proxy == Some(id), i.address())
+                            .selectable_label(device.system_proxy.is_none(), "Off")
                             .clicked()
                         {
-                            cx.update("system-proxy", &DEVICE, move |d| d.system_proxy = Some(id));
+                            cx.update("system-proxy", &DEVICE, |d| d.system_proxy = None);
                         }
+                        for i in &eligible {
+                            let id = i.id;
+                            if ui
+                                .selectable_label(device.system_proxy == Some(id), i.address())
+                                .clicked()
+                            {
+                                cx.update("system-proxy", &DEVICE, move |d| {
+                                    d.system_proxy = Some(id)
+                                });
+                            }
+                        }
+                    });
+                },
+            );
+            if device.system_proxy.is_some() {
+                match (
+                    &*cx.live(&SYSTEM_PROXY),
+                    system_proxy_address(cx.snapshot()),
+                ) {
+                    (_, None) => kit::tone_text(
+                        ui,
+                        "The chosen proxy port is off or needs a password, so the system proxy is not set.",
+                        kit::Tone::Warning,
+                    ),
+                    (Some(Err(e)), _) => kit::tone_text(ui, e, kit::Tone::Danger),
+                    (Some(Ok(what)), _) => {
+                        kit::tone_text(ui, format!("Active · {what}"), kit::Tone::Neutral)
                     }
-                });
-            },
-        );
-        if device.system_proxy.is_some() {
-            match (
-                &*cx.live(&SYSTEM_PROXY),
-                system_proxy_address(cx.snapshot()),
-            ) {
-                (_, None) => kit::tone_text(
-                    ui,
-                    "The chosen proxy port is off or needs a password, so the system proxy is not set.",
-                    kit::Tone::Warning,
-                ),
-                (Some(Err(e)), _) => kit::tone_text(ui, e, kit::Tone::Danger),
-                (Some(Ok(what)), _) => {
-                    kit::tone_text(ui, format!("Active · {what}"), kit::Tone::Neutral)
-                }
-                (None, _) => kit::tone_text(ui, "Applying…", kit::Tone::Neutral),
-            };
+                    (None, _) => kit::tone_text(ui, "Applying…", kit::Tone::Neutral),
+                };
+            }
         }
         let mut tun = device.tun;
         kit::settings_row(
@@ -575,27 +550,33 @@ fn device_card(ui: &mut egui::Ui, cx: &mut UiCx, rows: &[Inbound]) {
             "TUN mode",
             "Route every app through rproxy with a virtual network interface (TUN)",
             |ui| {
-                if kit::toggle(ui, &mut tun, "").changed() {
-                    cx.update("tun", &DEVICE, move |d| d.tun = tun);
-                }
+                ui.add_enabled_ui(!cx.pending("tun"), |ui| {
+                    if kit::toggle(ui, &mut tun, "").changed() {
+                        cx.update("tun", &DEVICE, move |d| d.tun = tun);
+                    }
+                });
             },
         );
-        if device.tun {
+        if cx.pending("tun") {
+            kit::tone_text(
+                ui,
+                "Applying TUN mode… Confirm the system authorization dialog if prompted.",
+                kit::Tone::Neutral,
+            );
+        } else if let rproxy_kernel::ui::Request::Done(Err(e)) = cx.request::<()>("tun") {
+            kit::tone_text(ui, e, kit::Tone::Danger);
+        } else if device.tun {
+            if let Some(error) = cx.core_status().tun_error {
+                kit::tone_text(ui, error, kit::Tone::Danger);
+                return;
+            }
             match *cx.live(&TUN_UP) {
                 Some(true) => kit::tone_text(ui, "Tunnel active", kit::Tone::Neutral),
-                Some(false) => {
-                    let core = cx.core().executable();
-                    // The setuid copy already runs: rights are not what is missing.
-                    let grant = cfg!(target_os = "macos") && !core.ends_with("mihomo-tun");
-                    let hint = kit::tone_text(ui, tun_hint(&core), kit::Tone::Danger);
-                    if grant {
-                        let busy = cx.pending("grant-tun");
-                        if kit::Button::secondary("Grant access").enabled(!busy).show(ui).on_hover_text("Asks for an administrator password once, so the core can create the tunnel.").clicked() {
-                            cx.submit("grant-tun", GrantTun);
-                        }
-                    }
-                    hint
-                }
+                Some(false) => kit::tone_text(
+                    ui,
+                    "The tunnel could not start. Check the core log, then turn TUN off and on to retry.",
+                    kit::Tone::Danger,
+                ),
                 None => kit::tone_text(ui, "Starting the tunnel…", kit::Tone::Neutral),
             };
         }

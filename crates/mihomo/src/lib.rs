@@ -3,18 +3,19 @@
 //! * [`config`] — fragments that plugins contribute and the composer that merges them;
 //! * [`process`] — the supervised child process and its controller API.
 pub mod config;
+mod elevation;
 pub mod process;
 pub mod supervisor;
 pub use config::*;
 pub use ipnet;
 pub use process::{
     ApplyReport, BINARY, CHECK_LANES, Controller, Delay, Mihomo, bundled, bundled_version,
-    executable, grant_tun_script, installed, installed_update, installed_version_file,
-    local_address, newer, privileged, unprivileged, version_of,
+    executable, installed, installed_update, installed_version_file, local_address, newer,
+    unprivileged, version_of,
 };
 
 #[cfg(windows)]
-mod windows_job;
+use rproxy_core_helper::windows_job;
 
 /// Every HTTP client of the app starts here: TLS uses ring (installed once).
 pub fn http() -> reqwest::ClientBuilder {

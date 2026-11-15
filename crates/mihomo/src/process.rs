@@ -229,6 +229,7 @@ impl Controller {
 pub struct Mihomo {
     child: Child,
     supervised: bool,
+    lease: Option<TcpStream>,
     #[cfg(windows)]
     _job: Option<crate::windows_job::Job>,
     _dir: TempDir,
@@ -290,54 +291,13 @@ pub fn newer(candidate: &str, current: &str) -> bool {
     matches!((version_of(candidate), version_of(current)), (Some(a), Some(b)) if a > b)
 }
 
-/// macOS: a root-owned setuid copy of the core that may create a utun
-/// interface (`<home>/bin/mihomo-tun`). See [`grant_tun_script`].
-pub fn privileged(home: &Path) -> PathBuf {
-    home.join("bin").join("mihomo-tun")
-}
-/// The setuid copy is used only while it is a copy of the current core:
-/// `cp -p` keeps size and modification time, so a core update shows the
-/// Grant access button again.
-#[cfg(target_os = "macos")]
-fn privileged_copy_of(copy: &Path, core: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let (Ok(c), Ok(o)) = (fs::metadata(copy), fs::metadata(core)) else {
-        return false;
-    };
-    c.uid() == 0 && c.mode() & 0o4000 != 0 && c.len() == o.len() && c.mtime() == o.mtime()
-}
-/// The shell commands that make [`privileged`] a setuid-root copy of `core`;
-/// macOS runs them with `osascript … with administrator privileges`.
-pub fn grant_tun_script(core: &Path, target: &Path) -> String {
-    let q = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
-    let tmp = target.with_extension("tmp");
-    let commands = format!(
-        "mkdir -p {dir} && rm -f {tmp} && cp -p {core} {tmp} && chown root:wheel {tmp} && chmod 4755 {tmp} && mv -f {tmp} {target}",
-        dir = q(target.parent().unwrap_or(Path::new("."))),
-        core = q(core),
-        tmp = q(&tmp),
-        target = q(target),
-    );
-    // AppleScript string literal: escape backslashes and quotes.
-    format!(
-        "do shell script \"{}\" with administrator privileges",
-        commands.replace('\\', "\\\\").replace('"', "\\\"")
-    )
-}
-
-/// The core without the macOS setuid copy: an installed update newer than the
-/// bundled core, otherwise the bundled one.
+/// An installed update newer than the bundled core, otherwise the bundled one.
 pub fn unprivileged(home: &Path) -> PathBuf {
     installed_update(home).unwrap_or_else(bundled)
 }
-/// The core to run: [`unprivileged`], or on macOS its setuid copy once the user granted it.
+/// The core binary; TUN authorization belongs to the worker's lifetime.
 pub fn executable(home: &Path) -> PathBuf {
-    let core = unprivileged(home);
-    #[cfg(target_os = "macos")]
-    if privileged_copy_of(&privileged(home), &core) {
-        return privileged(home);
-    }
-    core
+    unprivileged(home)
 }
 
 /// The core shipped with this build.
@@ -379,16 +339,20 @@ pub fn local_address(listen: IpAddr, port: u16) -> SocketAddr {
 impl Mihomo {
     /// Start the core. `home` keeps files between runs (rule sets, an updated core);
     /// the control socket and generated config live in a private temporary folder.
-    /// A core that cannot start is skipped: the macOS setuid copy, then an
-    /// installed update, then the bundled core. A broken update is removed so
-    /// Settings and the next start agree on which core runs.
+    /// A core that cannot start is skipped: an installed update, then the bundled
+    /// core. A broken update is removed so Settings and the next start agree.
     pub async fn start(reserved_ports: &[u16], home: &Path) -> Result<Self> {
-        let mut cores = vec![executable(home), unprivileged(home), bundled()];
+        Self::start_with_tun(reserved_ports, home, false).await
+    }
+    /// TUN uses a separate, OS-authorized worker; ordinary listeners stay unprivileged.
+    pub async fn start_with_tun(reserved_ports: &[u16], home: &Path, tun: bool) -> Result<Self> {
+        let mut cores = vec![unprivileged(home), bundled()];
         cores.dedup();
         let mut error = String::new();
         for core in cores {
-            match Self::launch(reserved_ports, home, &core).await {
+            match Self::launch(reserved_ports, home, &core, tun).await {
                 Ok(m) => return Ok(m),
+                Err(e) if tun => return Err(e), // Never repeat a dismissed authorization dialog.
                 Err(e) => error = e,
             }
             // Only a core that could not run at all is removed, not a slow start.
@@ -407,13 +371,19 @@ impl Mihomo {
         }
         Err(error)
     }
-    async fn launch(reserved_ports: &[u16], home: &Path, core: &Path) -> Result<Self> {
+    async fn launch(reserved_ports: &[u16], home: &Path, core: &Path, tun: bool) -> Result<Self> {
         fs::create_dir_all(home).map_err(|e| format!("Cannot create {}: {e}", home.display()))?;
+        let home = fs::canonicalize(home).map_err(|e| e.to_string())?;
         let mut builder = tempfile::Builder::new();
         builder.prefix("rproxy-");
         #[cfg(unix)]
         builder.permissions(fs::Permissions::from_mode(0o700));
-        let dir = builder.tempdir().map_err(|e| e.to_string())?;
+        let dir = if tun {
+            builder.tempdir_in(&home)
+        } else {
+            builder.tempdir()
+        }
+        .map_err(|e| e.to_string())?;
         #[cfg(unix)]
         let socket = dir.path().join("control.sock");
         // Keep every probe socket open until all lanes have distinct ports.
@@ -430,14 +400,10 @@ impl Mihomo {
         drop(probes);
         let routed_port = check_ports.pop().expect("one port for the routed listener");
         let http = crate::http().no_proxy().timeout(Duration::from_secs(4));
-        #[cfg(unix)]
-        let (http, base, endpoint) = (
-            http.unix_socket(socket.clone()),
-            "http://localhost".to_owned(),
-            json!({"external-controller-unix": socket}),
-        );
-        #[cfg(windows)]
-        let (http, base, endpoint) = {
+        // Root creates Unix sockets inaccessible to the ordinary user. An
+        // authenticated loopback controller works across privilege/sandbox boundaries.
+        let use_tcp = cfg!(windows) || tun;
+        let (http, base, endpoint) = if use_tcp {
             let listener =
                 TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|e| e.to_string())?;
             let addr = listener.local_addr().map_err(|e| e.to_string())?;
@@ -452,6 +418,19 @@ impl Mihomo {
                 format!("http://{addr}"),
                 json!({"external-controller": addr.to_string(), "secret": secret}),
             )
+        } else {
+            #[cfg(unix)]
+            {
+                (
+                    http.unix_socket(socket),
+                    "http://localhost".to_owned(),
+                    json!({"external-controller-unix": dir.path().join("control.sock")}),
+                )
+            }
+            #[cfg(windows)]
+            {
+                unreachable!()
+            }
         };
         let http = http
             .build()
@@ -473,9 +452,9 @@ impl Mihomo {
             Command::new(core)
         };
         cmd.arg("-d")
-            .arg(home)
+            .arg(&home)
             .arg("-f")
-            .arg(path)
+            .arg(&path)
             .stdin(if supervised {
                 Stdio::piped()
             } else {
@@ -515,11 +494,18 @@ impl Mihomo {
         }
         #[cfg(windows)]
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("Cannot start mihomo: {e}"))?;
+        let (child, lease) = if tun {
+            let (child, lease) = crate::elevation::start(core, &path, dir.path()).await?;
+            (child, Some(lease))
+        } else {
+            (
+                cmd.spawn()
+                    .map_err(|e| format!("Cannot start mihomo: {e}"))?,
+                None,
+            )
+        };
         #[cfg(windows)]
-        let job = if supervised {
+        let job = if supervised || tun {
             None
         } else {
             Some(
@@ -532,6 +518,7 @@ impl Mihomo {
         let mut core = Self {
             child,
             supervised,
+            lease,
             #[cfg(windows)]
             _job: job,
             _dir: dir,
@@ -559,8 +546,13 @@ impl Mihomo {
     pub fn alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
+    pub fn elevated(&self) -> bool {
+        self.lease.is_some()
+    }
     pub async fn stop(&mut self) {
-        if self.supervised {
+        if let Some(lease) = self.lease.take() {
+            drop(lease); // Privileged worker kills and reaps before exiting.
+        } else if self.supervised {
             // Never kill the guard first: closing the pipe asks it to kill+reap.
             drop(self.child.stdin.take());
         } else {
@@ -777,6 +769,12 @@ impl Mihomo {
                     .json(&json!({"payload": doc.to_string()})),
             )
             .await?;
+        if cfg.tun.is_some() && self.ctl.configs().await?["tun"]["enable"] != true {
+            return Err(
+                "The tunnel could not start after authorization. Check the core log and try again."
+                    .into(),
+            );
+        }
         // A reload can keep an old selection by name; acknowledge every select group explicitly.
         for g in &cfg.groups {
             if g.kind == config::GroupKind::Select {
@@ -861,24 +859,5 @@ mod tests {
         assert!(newer("1.20.0", "1.19.99"));
         assert!(!newer("1.19.32", "Mihomo Meta v1.19.32"));
         assert!(!newer("garbage", "1.19.32"));
-    }
-    #[test]
-    fn the_grant_script_quotes_paths_for_the_shell_and_applescript() {
-        let script = grant_tun_script(
-            Path::new("/Applications/r proxy.app/Contents/MacOS/mihomo"),
-            Path::new("/Users/o'neil/core/bin/mihomo-tun"),
-        );
-        assert!(
-            script.starts_with("do shell script \"mkdir -p '/Users/o'\\\\''neil/core/bin'"),
-            "{script}"
-        );
-        assert!(script.contains("cp -p '/Applications/r proxy.app/Contents/MacOS/mihomo' "));
-        assert!(script.contains("chown root:wheel") && script.contains("chmod 4755"));
-        assert!(
-            script.ends_with(
-                "'/Users/o'\\\\''neil/core/bin/mihomo-tun'\" with administrator privileges"
-            ),
-            "{script}"
-        );
     }
 }

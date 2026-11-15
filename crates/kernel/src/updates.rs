@@ -61,42 +61,6 @@ impl Kernel {
     pub fn installed_core(&self) -> Option<std::path::PathBuf> {
         rproxy_mihomo::installed_update(&self.core.home)
     }
-    /// macOS: let the core create the TUN interface. Asks for an administrator
-    /// password once (per core version), installs a setuid-root copy of the
-    /// core and restarts it.
-    pub async fn grant_core_access(&self) -> Result<()> {
-        if !cfg!(target_os = "macos") {
-            crate::bail!("Granting access is only needed on macOS.");
-        }
-        let home = self.core.home.clone();
-        let script = rproxy_mihomo::grant_tun_script(
-            &rproxy_mihomo::unprivileged(&home),
-            &rproxy_mihomo::privileged(&home),
-        );
-        let out = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("osascript")
-                .arg("-e")
-                .arg(script)
-                .output()
-        })
-        .await
-        .map_err(|e| Error::msg(e.to_string()))?
-        .map_err(|e| Error::msg(format!("Cannot ask for administrator rights: {e}")))?;
-        if !out.status.success() {
-            // -128: the user cancelled the password dialog.
-            let text = String::from_utf8_lossy(&out.stderr);
-            crate::bail!(
-                "{}",
-                if text.contains("-128") {
-                    "Access was not granted.".to_owned()
-                } else {
-                    format!("Could not grant access: {}", text.trim())
-                }
-            );
-        }
-        self.restart_core().await
-    }
-
     /// Stop the core, change its file, and start it again — also when the change failed.
     async fn swap_core(&self, change: impl FnOnce() -> std::io::Result<()>) -> Result<()> {
         self.core.stop().await;

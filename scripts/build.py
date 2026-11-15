@@ -39,7 +39,7 @@ def main():
         run('cargo', 'build', '--locked', '-p', 'rproxy-remote', '--lib', '--target', 'wasm32-unknown-unknown', '--profile', 'web')
         run('wasm-bindgen', '--target', 'web', '--no-typescript', '--remove-name-section', '--out-dir', 'web/pkg', str(target / 'wasm32-unknown-unknown/web/rproxy_remote.wasm'))
     if not args.web_only:
-        run('cargo', 'build', '--locked', '--bin', 'rproxy', *cargo_args)
+        run('cargo', 'build', '--locked', '--bin', 'rproxy', '--bin', 'rproxy-core-helper', *cargo_args)
 
 
 if __name__ == '__main__':

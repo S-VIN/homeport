@@ -61,6 +61,7 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\rproxy.lnk"
   Delete "$INSTDIR\rproxy.exe"
   Delete "$INSTDIR\mihomo.exe"
+  Delete "$INSTDIR\rproxy-core-helper.exe"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir /r "$INSTDIR\licenses"
   # Remove the payload of older installations too.
