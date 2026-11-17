@@ -44,7 +44,6 @@ fn plugin(setup: fn(&mut Setup) -> Result<()>) -> Plugin {
         description: "",
         category: categories::SERVERS,
         requires: &[],
-        provides: &[],
         required: true,
         default_enabled: true,
         platforms: Platform::ALL,

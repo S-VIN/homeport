@@ -1,4 +1,5 @@
-//! Owns one mihomo child. Control uses a private Unix socket or authenticated loopback TCP on Windows.
+//! Owns one mihomo process. Control uses a private Unix socket, or authenticated
+//! loopback TCP on Windows and for a tunnel core.
 use crate::config::{self, Config, Listener, System, Target, overlaps};
 use reqwest::Client;
 use serde::Deserialize;
@@ -23,6 +24,69 @@ use tokio::{
 use std::os::unix::fs::PermissionsExt;
 
 pub type Result<T> = std::result::Result<T, String>;
+
+/// `GET /connections`: open connections and the traffic totals.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Connections {
+    pub upload_total: u64,
+    pub download_total: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub connections: Vec<Connection>,
+}
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Connection {
+    pub id: String,
+    pub metadata: Metadata,
+    pub upload: u64,
+    pub download: u64,
+    /// Proxies and groups the connection goes through, outermost last.
+    #[serde(deserialize_with = "null_default")]
+    pub chains: Vec<String>,
+    pub rule: String,
+    pub rule_payload: String,
+}
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Metadata {
+    pub network: String,
+    pub host: String,
+    #[serde(rename = "destinationIP")]
+    pub destination_ip: String,
+    #[serde(deserialize_with = "port")]
+    pub destination_port: Option<u16>,
+    pub process: String,
+    pub inbound_name: String,
+}
+/// A rule set as the core reports it.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RuleSetStatus {
+    pub rule_count: u64,
+    /// RFC 3339; `None` until the first download.
+    #[serde(deserialize_with = "updated")]
+    pub updated_at: Option<String>,
+}
+fn null_default<'de, D: serde::Deserializer<'de>, T: Deserialize<'de> + Default>(
+    d: D,
+) -> std::result::Result<T, D::Error> {
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+/// mihomo sends ports as strings ("443"), sometimes as numbers.
+fn port<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<u16>, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::String(s) => s.parse().ok(),
+        Value::Number(n) => n.as_u64().and_then(|n| u16::try_from(n).ok()),
+        _ => None,
+    })
+}
+/// Go's zero time ("0001-01-01…") means never.
+fn updated<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.filter(|t| !t.is_empty() && !t.starts_with("0001")))
+}
 
 /// Number of isolated check lanes (`checks-N` listeners routed to `test-N` groups).
 pub const CHECK_LANES: usize = 6;
@@ -153,7 +217,7 @@ impl Controller {
         Ok(Delay::Passed(d.delay.max(1)))
     }
     /// `GET /proxies/{name}` as returned by mihomo.
-    pub async fn proxy(&self, name: &str) -> Result<Value> {
+    async fn proxy(&self, name: &str) -> Result<Value> {
         self.send(self.http.get(self.url(&format!("proxies/{name}"))))
             .await?
             .json()
@@ -167,7 +231,8 @@ impl Controller {
             .filter(|n| !n.is_empty())
             .map(str::to_owned))
     }
-    pub async fn connections(&self) -> Result<Value> {
+    /// Open connections and the traffic totals.
+    pub async fn connections(&self) -> Result<Connections> {
         self.send(self.http.get(self.url("connections")))
             .await?
             .json()
@@ -193,13 +258,19 @@ impl Controller {
             .await
             .map(drop)
     }
-    /// `GET /providers/rules`: `{providers: {name: {ruleCount, updatedAt, …}}}`.
-    pub async fn rule_providers(&self) -> Result<Value> {
-        self.send(self.http.get(self.url("providers/rules")))
+    /// Rule sets known to the core, by name.
+    pub async fn rule_providers(&self) -> Result<BTreeMap<String, RuleSetStatus>> {
+        #[derive(Deserialize)]
+        struct Reply {
+            providers: BTreeMap<String, RuleSetStatus>,
+        }
+        let r: Reply = self
+            .send(self.http.get(self.url("providers/rules")))
             .await?
             .json()
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        Ok(r.providers)
     }
     /// Download a rule set again now.
     pub async fn update_rule_provider(&self, name: &str) -> Result<()> {
@@ -211,13 +282,15 @@ impl Controller {
         .await
         .map(drop)
     }
-    /// `GET /configs`: the running general settings (e.g. whether TUN is up).
-    pub async fn configs(&self) -> Result<Value> {
-        self.send(self.http.get(self.url("configs")))
+    /// Whether the tunnel is up in the running core.
+    pub async fn tun_enabled(&self) -> Result<bool> {
+        let v: Value = self
+            .send(self.http.get(self.url("configs")))
             .await?
             .json()
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        Ok(v["tun"]["enable"].as_bool().unwrap_or(false))
     }
 }
 impl Controller {
@@ -226,10 +299,17 @@ impl Controller {
     }
 }
 
+/// What keeps the core running, and how it is stopped.
+enum Owner {
+    /// Our child: the supervisor (closing its stdin stops the core) or, in
+    /// hosts without one, the core itself.
+    Child { child: Child, supervised: bool },
+    /// The administrator-run supervisor of a tunnel core (see `elevation`).
+    Lease(std::net::TcpStream),
+}
+
 pub struct Mihomo {
-    child: Child,
-    supervised: bool,
-    lease: Option<TcpStream>,
+    owner: Owner,
     #[cfg(windows)]
     _job: Option<crate::windows_job::Job>,
     _dir: TempDir,
@@ -291,13 +371,10 @@ pub fn newer(candidate: &str, current: &str) -> bool {
     matches!((version_of(candidate), version_of(current)), (Some(a), Some(b)) if a > b)
 }
 
-/// An installed update newer than the bundled core, otherwise the bundled one.
-pub fn unprivileged(home: &Path) -> PathBuf {
-    installed_update(home).unwrap_or_else(bundled)
-}
-/// The core binary; TUN authorization belongs to the worker's lifetime.
+/// The core to run: an installed update newer than the bundled core,
+/// otherwise the bundled one.
 pub fn executable(home: &Path) -> PathBuf {
-    unprivileged(home)
+    installed_update(home).unwrap_or_else(bundled)
 }
 
 /// The core shipped with this build.
@@ -336,17 +413,50 @@ pub fn local_address(listen: IpAddr, port: u16) -> SocketAddr {
     SocketAddr::new(ip, port)
 }
 
+/// The controller endpoint of a new core: client settings, base URL and the
+/// core's configuration keys.
+fn controller(
+    http: reqwest::ClientBuilder,
+    dir: &Path,
+    tun: bool,
+) -> Result<(reqwest::ClientBuilder, String, Value)> {
+    // A private Unix socket where the core runs as this user. Windows has
+    // none, and a socket made by a root tunnel core is closed to the user:
+    // those use loopback TCP with a random bearer secret.
+    #[cfg(unix)]
+    if !tun {
+        let socket = dir.join("control.sock");
+        return Ok((
+            http.unix_socket(socket.clone()),
+            "http://localhost".to_owned(),
+            json!({"external-controller-unix": socket}),
+        ));
+    }
+    let _ = (dir, tun);
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|e| e.to_string())?;
+    let addr = listener.local_addr().map_err(|e| e.to_string())?;
+    let secret = uuid::Uuid::new_v4().to_string();
+    let mut headers = reqwest::header::HeaderMap::new();
+    let mut auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {secret}")).unwrap();
+    auth.set_sensitive(true);
+    headers.insert(reqwest::header::AUTHORIZATION, auth);
+    Ok((
+        http.default_headers(headers),
+        format!("http://{addr}"),
+        json!({"external-controller": addr.to_string(), "secret": secret}),
+    ))
+}
+
 impl Mihomo {
     /// Start the core. `home` keeps files between runs (rule sets, an updated core);
     /// the control socket and generated config live in a private temporary folder.
     /// A core that cannot start is skipped: an installed update, then the bundled
     /// core. A broken update is removed so Settings and the next start agree.
-    pub async fn start(reserved_ports: &[u16], home: &Path) -> Result<Self> {
-        Self::start_with_tun(reserved_ports, home, false).await
-    }
-    /// TUN uses a separate, OS-authorized worker; ordinary listeners stay unprivileged.
-    pub async fn start_with_tun(reserved_ports: &[u16], home: &Path, tun: bool) -> Result<Self> {
-        let mut cores = vec![unprivileged(home), bundled()];
+    ///
+    /// `tun` starts it with administrator rights, which a tunnel needs: the
+    /// system asks the user, and the rights end with this process.
+    pub async fn start(reserved_ports: &[u16], home: &Path, tun: bool) -> Result<Self> {
+        let mut cores = vec![executable(home), bundled()];
         cores.dedup();
         let mut error = String::new();
         for core in cores {
@@ -373,19 +483,18 @@ impl Mihomo {
     }
     async fn launch(reserved_ports: &[u16], home: &Path, core: &Path, tun: bool) -> Result<Self> {
         fs::create_dir_all(home).map_err(|e| format!("Cannot create {}: {e}", home.display()))?;
-        let home = fs::canonicalize(home).map_err(|e| e.to_string())?;
         let mut builder = tempfile::Builder::new();
         builder.prefix("rproxy-");
         #[cfg(unix)]
         builder.permissions(fs::Permissions::from_mode(0o700));
+        // A tunnel core runs on the host as root, which does not see a
+        // sandbox's /tmp; the core home has the same path for both.
         let dir = if tun {
-            builder.tempdir_in(&home)
+            builder.tempdir_in(home)
         } else {
             builder.tempdir()
         }
         .map_err(|e| e.to_string())?;
-        #[cfg(unix)]
-        let socket = dir.path().join("control.sock");
         // Keep every probe socket open until all lanes have distinct ports.
         let mut probes = Vec::new();
         let mut check_ports = Vec::new();
@@ -400,38 +509,7 @@ impl Mihomo {
         drop(probes);
         let routed_port = check_ports.pop().expect("one port for the routed listener");
         let http = crate::http().no_proxy().timeout(Duration::from_secs(4));
-        // Root creates Unix sockets inaccessible to the ordinary user. An
-        // authenticated loopback controller works across privilege/sandbox boundaries.
-        let use_tcp = cfg!(windows) || tun;
-        let (http, base, endpoint) = if use_tcp {
-            let listener =
-                TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|e| e.to_string())?;
-            let addr = listener.local_addr().map_err(|e| e.to_string())?;
-            let secret = uuid::Uuid::new_v4().to_string();
-            let mut headers = reqwest::header::HeaderMap::new();
-            let mut auth =
-                reqwest::header::HeaderValue::from_str(&format!("Bearer {secret}")).unwrap();
-            auth.set_sensitive(true);
-            headers.insert(reqwest::header::AUTHORIZATION, auth);
-            (
-                http.default_headers(headers),
-                format!("http://{addr}"),
-                json!({"external-controller": addr.to_string(), "secret": secret}),
-            )
-        } else {
-            #[cfg(unix)]
-            {
-                (
-                    http.unix_socket(socket),
-                    "http://localhost".to_owned(),
-                    json!({"external-controller-unix": dir.path().join("control.sock")}),
-                )
-            }
-            #[cfg(windows)]
-            {
-                unreachable!()
-            }
-        };
+        let (http, base, endpoint) = controller(http, dir.path(), tun)?;
         let http = http
             .build()
             .map_err(|_| "Cannot create mihomo client.".to_string())?;
@@ -443,82 +521,80 @@ impl Mihomo {
             .unwrap()
             .extend(endpoint.as_object().unwrap().clone());
         fs::write(&path, initial.to_string()).map_err(|e| e.to_string())?;
-        let supervised = crate::supervisor::executable().is_some();
-        let mut cmd = if let Some(guard) = crate::supervisor::executable() {
-            let mut cmd = Command::new(guard);
-            cmd.arg(crate::supervisor::ARG).arg(core);
-            cmd
+        let args = [
+            core.as_os_str(),
+            "-d".as_ref(),
+            home.as_os_str(),
+            "-f".as_ref(),
+            path.as_os_str(),
+        ];
+        #[cfg(windows)]
+        let mut job = None;
+        let owner = if tun {
+            // The bundled core is named, not located: see `supervisor::run`.
+            let beside = crate::supervisor::executable().and_then(|exe| exe.parent());
+            let mut args = args.map(std::ffi::OsString::from).to_vec();
+            if let (true, Some(name)) = (core.parent() == beside, core.file_name()) {
+                args[0] = name.into();
+            }
+            Owner::Lease(crate::elevation::start(&args, dir.path()).await?)
         } else {
-            Command::new(core)
-        };
-        cmd.arg("-d")
-            .arg(&home)
-            .arg("-f")
-            .arg(&path)
-            .stdin(if supervised {
+            let supervisor = crate::supervisor::executable();
+            let supervised = supervisor.is_some();
+            let mut cmd = Command::new(supervisor.map_or(core, |exe| exe.as_path()));
+            if supervised {
+                cmd.arg(crate::supervisor::ARG);
+                cmd.args(args);
+            } else {
+                cmd.args(&args[1..]);
+            }
+            cmd.stdin(if supervised {
                 Stdio::piped()
             } else {
                 Stdio::null()
             })
             .kill_on_drop(!supervised);
-        // A small Go runtime: two OS threads and a soft memory limit keep the
-        // core near 20–60 MB instead of growing with the CPU count. Values
-        // already in the environment win.
-        for (key, value) in [("GOMAXPROCS", "2"), ("GOGC", "50"), ("GOMEMLIMIT", "64MiB")] {
-            if std::env::var_os(key).is_none() {
-                cmd.env(key, value);
+            for (key, value) in crate::supervisor::GO_ENV {
+                if std::env::var_os(key).is_none() {
+                    cmd.env(key, value);
+                }
             }
-        }
-        // RPROXY_MIHOMO_LOG=debug|info|warning shows the core's log on stderr.
-        if config::log_level() == "silent" {
-            cmd.stdout(Stdio::null()).stderr(Stdio::null());
-        } else {
-            cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-        }
-        // The kernel stops the core if the application crashes or is killed.
-        #[cfg(target_os = "linux")]
-        let parent = std::process::id();
-        #[cfg(target_os = "linux")]
-        if !supervised {
-            unsafe {
-                cmd.pre_exec(move || {
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    if libc::getppid() as u32 != parent {
-                        return Err(std::io::Error::other("Parent exited"));
-                    }
-                    Ok(())
-                });
+            // RPROXY_MIHOMO_LOG=debug|info|warning shows the core's log on stderr.
+            if config::log_level() == "silent" {
+                cmd.stdout(Stdio::null()).stderr(Stdio::null());
+            } else {
+                cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
             }
-        }
-        #[cfg(windows)]
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        let (child, lease) = if tun {
-            let (child, lease) = crate::elevation::start(core, &path, dir.path()).await?;
-            (child, Some(lease))
-        } else {
-            (
-                cmd.spawn()
-                    .map_err(|e| format!("Cannot start mihomo: {e}"))?,
-                None,
-            )
-        };
-        #[cfg(windows)]
-        let job = if supervised || tun {
-            None
-        } else {
-            Some(
-                crate::windows_job::Job::attach(
-                    child.id().ok_or("Mihomo exited before job assignment")?,
-                )
-                .map_err(|e| e.to_string())?,
-            )
+            // The kernel stops the core if the application crashes or is killed.
+            #[cfg(target_os = "linux")]
+            if !supervised {
+                let parent = std::process::id();
+                unsafe {
+                    cmd.pre_exec(move || {
+                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if libc::getppid() as u32 != parent {
+                            return Err(std::io::Error::other("Parent exited"));
+                        }
+                        Ok(())
+                    });
+                }
+            }
+            #[cfg(windows)]
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            let child = cmd
+                .spawn()
+                .map_err(|e| format!("Cannot start mihomo: {e}"))?;
+            #[cfg(windows)]
+            if !supervised {
+                let pid = child.id().ok_or("Mihomo exited before job assignment")?;
+                job = Some(crate::windows_job::Job::attach(pid).map_err(|e| e.to_string())?);
+            }
+            Owner::Child { child, supervised }
         };
         let mut core = Self {
-            child,
-            supervised,
-            lease,
+            owner,
             #[cfg(windows)]
             _job: job,
             _dir: dir,
@@ -544,21 +620,46 @@ impl Mihomo {
         Err("Mihomo controller did not become ready.".into())
     }
     pub fn alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        match &mut self.owner {
+            Owner::Child { child, .. } => matches!(child.try_wait(), Ok(None)),
+            // The supervisor never writes: anything but "nothing yet" is its exit.
+            Owner::Lease(lease) => {
+                use std::io::Read;
+                matches!(lease.read(&mut [0]), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+            }
+        }
     }
+    /// Runs with administrator rights (started with `tun`).
     pub fn elevated(&self) -> bool {
-        self.lease.is_some()
+        matches!(self.owner, Owner::Lease(_))
     }
     pub async fn stop(&mut self) {
-        if let Some(lease) = self.lease.take() {
-            drop(lease); // Privileged worker kills and reaps before exiting.
-        } else if self.supervised {
-            // Never kill the guard first: closing the pipe asks it to kill+reap.
-            drop(self.child.stdin.take());
-        } else {
-            let _ = self.child.start_kill();
+        match &mut self.owner {
+            Owner::Child { child, supervised } => {
+                if *supervised {
+                    // Never kill the guard first: closing the pipe asks it to kill+reap.
+                    drop(child.stdin.take());
+                } else {
+                    let _ = child.start_kill();
+                }
+                let _ = child.wait().await;
+            }
+            Owner::Lease(lease) => {
+                // Windows has no SIGTERM: let mihomo undo the tunnel while it
+                // lives. Then close the lease; the supervisor closes its end
+                // once the core is reaped.
+                let off = self.ctl.http.patch(self.ctl.url("configs"));
+                let off = off.json(&json!({"tun": {"enable": false}}));
+                let _ = self.ctl.send(off).await;
+                let _ = lease.shutdown(std::net::Shutdown::Write);
+                for _ in 0..250 {
+                    if !self.alive() {
+                        break;
+                    }
+                    sleep(Duration::from_millis(40)).await;
+                }
+            }
         }
-        let _ = self.child.wait().await;
     }
     pub fn check_ports(&self) -> &[u16] {
         &self.check_ports
@@ -769,7 +870,7 @@ impl Mihomo {
                     .json(&json!({"payload": doc.to_string()})),
             )
             .await?;
-        if cfg.tun.is_some() && self.ctl.configs().await?["tun"]["enable"] != true {
+        if cfg.tun.is_some() && !self.ctl.tun_enabled().await? {
             return Err(
                 "The tunnel could not start after authorization. Check the core log and try again."
                     .into(),
@@ -847,7 +948,7 @@ mod tests {
         fs::write(installed_version_file(home), "999.0.0\n").unwrap();
         assert_eq!(installed_update(home), Some(installed(home)));
         assert_eq!(executable(home), installed(home));
-        assert_eq!(unprivileged(home), installed(home));
+        assert_eq!(executable(home), installed(home));
     }
     #[test]
     fn versions_compare_numerically() {

@@ -4,7 +4,7 @@
 use crate::{Error, Result, Snapshot, changes::Changes, mihomo, setup::Registry};
 use mihomo::{Config, Mihomo, Target};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, RwLock},
 };
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
@@ -45,17 +45,93 @@ pub(crate) struct Core {
     free: std::sync::Mutex<Vec<usize>>,
     status: RwLock<CoreStatus>,
     changes: Changes,
+    /// Of the last composed configuration.
+    labels: RwLock<Arc<Labels>>,
     /// mihomo's home folder: rule-set caches and an updated core survive restarts.
     pub(crate) home: std::path::PathBuf,
 }
 
-pub(crate) fn compose(reg: &Registry, snap: &Snapshot) -> Result<Config> {
-    Config::compose(
-        reg.fragments
+pub(crate) fn compose(reg: &Registry, snap: &Snapshot) -> Result<(Config, Labels)> {
+    let mut labels = Vec::new();
+    let cfg = Config::compose(reg.fragments.iter().map(|(p, f)| {
+        let mut f = f(snap);
+        labels.append(&mut f.labels);
+        (reg.plugins[*p].id, f)
+    }))
+    .map_err(Error::msg)?;
+    let labels = Labels::new(&cfg, labels);
+    Ok((cfg, labels))
+}
+
+/// The names the core reports in the user's words, from the fragments'
+/// [`labels`](mihomo::Fragment::labels) of the last composed configuration:
+/// servers instead of their ids, `*.youtube.com` instead of a regex.
+#[derive(Debug, Default)]
+pub struct Labels {
+    names: HashMap<String, String>,
+    groups: HashSet<String>,
+    inbounds: Vec<(String, String)>,
+}
+impl Labels {
+    fn new(cfg: &Config, labels: Vec<(String, String)>) -> Self {
+        let builtin = [
+            ("DIRECT", "Direct"),
+            ("REJECT", "Blocked"),
+            ("REJECT-DROP", "Blocked"),
+        ];
+        let mut names: HashMap<String, String> = builtin
+            .into_iter()
+            .map(|(name, label)| (name.into(), label.into()))
+            .collect();
+        names.extend(labels);
+        let inbounds = cfg
+            .listeners
             .iter()
-            .map(|(p, f)| (reg.plugins[*p].id, f(snap))),
-    )
-    .map_err(Error::msg)
+            .filter_map(|l| Some((l.name.clone(), names.get(&l.name)?.clone())))
+            .collect();
+        Self {
+            groups: cfg.groups.iter().map(|g| g.name.clone()).collect(),
+            names,
+            inbounds,
+        }
+    }
+    /// The user's words for a proxy, group, listener or rule
+    /// ([`mihomo::Rule::reported`]), if a plugin gave them.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.names.get(name).map(String::as_str)
+    }
+    /// The user's words, else the name as the core reports it.
+    pub fn name<'a>(&'a self, name: &'a str) -> &'a str {
+        self.get(name).unwrap_or(name)
+    }
+    /// A proxy group (`main`) rather than a single outbound.
+    pub fn is_group(&self, name: &str) -> bool {
+        self.groups.contains(name)
+    }
+    /// Listeners with a label: `(name, label)`, e.g. for rules by inbound.
+    pub fn inbounds(&self) -> &[(String, String)] {
+        &self.inbounds
+    }
+    /// `text` with every labelled name in it (a whole word) in the user's words.
+    pub fn text(&self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut start = None;
+        for (i, c) in text.char_indices().chain([(text.len(), ' ')]) {
+            let word = c.is_alphanumeric() || c == '-' || c == '_';
+            match start {
+                None if word => start = Some(i),
+                Some(s) if !word => {
+                    out.push_str(self.name(&text[s..i]));
+                    start = None;
+                }
+                _ => {}
+            }
+            if !word && i < text.len() {
+                out.push(c);
+            }
+        }
+        out
+    }
 }
 
 impl Core {
@@ -67,7 +143,14 @@ impl Core {
             free: std::sync::Mutex::new((0..mihomo::CHECK_LANES).rev().collect()),
             status: RwLock::default(),
             changes,
+            labels: RwLock::default(),
         }
+    }
+    /// Compose the configuration of `snap` and keep its labels.
+    fn compose(&self, reg: &Registry, snap: &Snapshot) -> Result<Config> {
+        let (cfg, labels) = compose(reg, snap)?;
+        *self.labels.write().unwrap() = Arc::new(labels);
+        Ok(cfg)
     }
     pub fn status(&self) -> CoreStatus {
         self.status.read().unwrap().clone()
@@ -76,8 +159,20 @@ impl Core {
         f(&mut self.status.write().unwrap());
         self.changes.notify();
     }
-    /// (Re)start the process and apply the configuration of `snap`.
+    /// (Re)start the process and apply the configuration of `snap`. A saved
+    /// tunnel that is not authorized is left out: the proxies still run and
+    /// [`CoreStatus::tun_error`] tells why.
     pub async fn start(&self, reg: &Registry, snap: &Snapshot) -> Result<()> {
+        let tun_error = self.restart(self.compose(reg, snap)).await?;
+        if tun_error.is_some() {
+            self.set(|s| s.tun_error = tun_error);
+        }
+        Ok(())
+    }
+    /// Stop the process and start one for `cfg`. A tunnel needs administrator
+    /// rights, asked from the system for each such process; when that fails
+    /// the core starts without the tunnel and the reason is returned.
+    async fn restart(&self, cfg: Result<Config>) -> Result<Option<String>> {
         let _lanes = self.lanes.acquire_many(mihomo::CHECK_LANES as u32).await;
         let mut proc = self.proc.lock().await;
         if let Some(mut old) = proc.take() {
@@ -86,7 +181,7 @@ impl Core {
         self.set(|s| *s = CoreStatus::default());
         let mut tun_error = None;
         let result = async {
-            let mut cfg = compose(reg, snap)?;
+            let mut cfg = cfg?;
             match self.launch(&cfg).await {
                 Err(e) if cfg.tun.is_some() => {
                     tun_error = Some(e.message);
@@ -105,9 +200,8 @@ impl Core {
                     s.state = CoreState::Running;
                     s.version = version;
                     s.listener_errors = report.listener_errors;
-                    s.tun_error = tun_error;
                 });
-                Ok(())
+                Ok(tun_error)
             }
             Err(e) => {
                 self.set(|s| s.state = CoreState::Failed(e.message.clone()));
@@ -117,7 +211,7 @@ impl Core {
     }
     async fn launch(&self, cfg: &Config) -> Result<(Mihomo, mihomo::ApplyReport)> {
         let ports: Vec<u16> = cfg.listeners.iter().map(|l| l.port).collect();
-        let mut m = Mihomo::start_with_tun(&ports, &self.home, cfg.tun.is_some())
+        let mut m = Mihomo::start(&ports, &self.home, cfg.tun.is_some())
             .await
             .map_err(Error::msg)?;
         match m.apply(cfg).await {
@@ -131,30 +225,16 @@ impl Core {
     /// Apply the configuration of `snap` if the core runs. While it is offline
     /// configuration stays editable and is applied on the next start.
     pub async fn sync(&self, reg: &Registry, snap: &Snapshot) -> Result<()> {
-        let mut cfg = compose(reg, snap)?;
-        if cfg.tun.is_none() {
-            if self.status.read().unwrap().tun_error.is_some() {
+        let mut cfg = self.compose(reg, snap)?;
+        // A tunnel refused at startup is asked for again only by an explicit
+        // restart or off/on, never by unrelated settings writes.
+        if self.status.read().unwrap().tun_error.is_some() {
+            if cfg.tun.is_some() {
+                cfg.tun = None;
+            } else {
                 self.set(|s| s.tun_error = None);
             }
-        } else if self.status.read().unwrap().tun_error.is_some() {
-            // A cancelled startup prompt is retried only on explicit restart or
-            // off/on, never by unrelated settings writes or background polling.
-            cfg.tun = None;
         }
-        // A privilege transition replaces the process and its check lanes.
-        // Obtain authorization before stopping the existing proxy: cancellation
-        // must leave its listeners and the saved setting untouched.
-        let transition = self
-            .proc
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|m| m.elevated() != cfg.tun.is_some());
-        let _lanes = if transition {
-            Some(self.lanes.acquire_many(mihomo::CHECK_LANES as u32).await)
-        } else {
-            None
-        };
         let mut proc = self.proc.lock().await;
         let Some(m) = proc.as_mut() else {
             return Ok(());
@@ -163,12 +243,12 @@ impl Core {
             return Ok(());
         }
         if m.elevated() != cfg.tun.is_some() {
-            let ports: Vec<u16> = cfg.listeners.iter().map(|l| l.port).collect();
-            let next = Mihomo::start_with_tun(&ports, &self.home, cfg.tun.is_some())
-                .await
-                .map_err(Error::msg)?;
-            m.stop().await;
-            *m = next;
+            // Turning the tunnel on or off changes the rights of the process.
+            drop(proc);
+            return match self.restart(Ok(cfg)).await? {
+                Some(refused) => Err(Error::msg(refused)),
+                None => Ok(()),
+            };
         }
         let report = m.apply(&cfg).await.map_err(Error::msg)?;
         if self.status.read().unwrap().listener_errors != report.listener_errors {
@@ -275,6 +355,10 @@ impl CoreApi {
     pub fn status(&self) -> CoreStatus {
         self.core.status()
     }
+    /// Names the core reports, in the user's words.
+    pub fn labels(&self) -> Arc<Labels> {
+        self.core.labels.read().unwrap().clone()
+    }
     /// Route a free check lane to `target` until the lease is released
     /// (waits while every lane is in use).
     pub async fn lease(&self, target: Target) -> Result<Lease> {
@@ -342,8 +426,8 @@ impl CoreApi {
             .await
             .map_err(Error::msg)
     }
-    /// `GET /connections` as returned by mihomo.
-    pub async fn connections(&self) -> Result<serde_json::Value> {
+    /// Open connections and the traffic totals.
+    pub async fn connections(&self) -> Result<mihomo::Connections> {
         self.core
             .controller()
             .await?
@@ -418,16 +502,16 @@ impl CoreApi {
                 ))
             })
     }
-    /// Rule sets known to the core: `{name: {ruleCount, updatedAt, …}}`.
-    pub async fn rule_providers(&self) -> Result<serde_json::Value> {
-        let v = self
-            .core
+    /// Rule sets known to the core, by name.
+    pub async fn rule_providers(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, mihomo::RuleSetStatus>> {
+        self.core
             .controller()
             .await?
             .rule_providers()
             .await
-            .map_err(Error::msg)?;
-        Ok(v["providers"].clone())
+            .map_err(Error::msg)
     }
     pub async fn update_rule_provider(&self, name: &str) -> Result<()> {
         self.core
@@ -441,13 +525,33 @@ impl CoreApi {
     pub fn executable(&self) -> std::path::PathBuf {
         mihomo::executable(&self.core.home)
     }
-    /// The running general settings (`GET /configs`).
-    pub async fn configs(&self) -> Result<serde_json::Value> {
+    /// Whether the tunnel is up in the running core.
+    pub async fn tun_enabled(&self) -> Result<bool> {
         self.core
             .controller()
             .await?
-            .configs()
+            .tun_enabled()
             .await
             .map_err(Error::msg)
+    }
+    /// Wakes up whenever the core status ([`Self::status`]) or the state changes.
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.kernel.changes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn labels_replace_whole_words_only() {
+        let cfg = Config::default();
+        let labels = Labels::new(&cfg, vec![("main".into(), "proxy".into())]);
+        assert_eq!(
+            labels.text("dial main (domain) using main[DIRECT], ok"),
+            "dial proxy (domain) using proxy[Direct], ok"
+        );
+        assert_eq!(labels.name("REJECT"), "Blocked");
+        assert_eq!(labels.name("other"), "other");
     }
 }

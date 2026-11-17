@@ -2,7 +2,7 @@
 //! The core's live log, like the Logs page of other Clash-family apps: what
 //! mihomo connected, refused or failed, newest last. Connections are read only
 //! while a window or browser tab is open; warnings and errors always.
-use rproxy_kernel::{kit, kit::theme, prelude::*};
+use rproxy_kernel::{core::Labels, kit, kit::theme, prelude::*};
 use std::time::Duration;
 
 pub static PLUGIN: Plugin = Plugin {
@@ -10,7 +10,6 @@ pub static PLUGIN: Plugin = Plugin {
     name: "Logs",
     description: "The core's live log: connections, rule matches, errors.",
     category: categories::NETWORK,
-    requires: &["servers"],
     setup,
     ..Plugin::DEFAULT
 };
@@ -54,7 +53,7 @@ impl Op for Clear {
 }
 
 /// One line of the stream; `None` for an info line nobody is reading.
-fn line(raw: &[u8], snap: &Snapshot, reading: bool) -> Option<Line> {
+fn line(raw: &[u8], labels: &Labels, reading: bool) -> Option<Line> {
     let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
     let level = Level::of(v["type"].as_str().unwrap_or(""));
     if level == Level::Info && !reading {
@@ -65,7 +64,7 @@ fn line(raw: &[u8], snap: &Snapshot, reading: bool) -> Option<Line> {
         at: now(),
         level,
         internal: internal(text),
-        text: readable(text, snap),
+        text: readable(text, labels),
     })
 }
 
@@ -100,19 +99,22 @@ fn internal(text: &str) -> bool {
         || CHATTER.iter().any(|c| text.contains(c))
 }
 
-/// The user's words: `match DomainRegex(^(?:.*\.)?youtube\.com$) using …` →
-/// `match youtube.com using …`, and in warnings `(match IPCIDR/10.0.0.0/8)` →
-/// `(match 10.0.0.0/8)`, as on the Connections page.
-fn readable(text: &str, snap: &Snapshot) -> String {
+/// The user's words: `match DomainRegex(^(?:.*\.)?youtube\.com$) using main[…]` →
+/// `match youtube.com using proxy[Japan Tokyo 53]`, and in warnings
+/// `(match IPCIDR/10.0.0.0/8)` → `(match 10.0.0.0/8)`, as on the Connections page.
+fn readable(text: &str, labels: &Labels) -> String {
+    // The core's own words for the main group falling over.
+    if text.contains(" failed multiple times, activate health check") {
+        return "The proxy failed several times; the core re-checks its servers.".into();
+    }
     match core_rule(text) {
-        Some((at, rule)) => {
-            let label = plugin_servers::rule_label(snap, &rule);
-            with_names(
-                &format!("{}{label}{}", &text[..at.start], &text[at.end..]),
-                snap,
-            )
-        }
-        None => with_names(text, snap),
+        Some((at, rule)) => format!(
+            "{}{}{}",
+            labels.text(&text[..at.start]),
+            labels.name(&rule),
+            labels.text(&text[at.end..])
+        ),
+        None => labels.text(text),
     }
 }
 
@@ -148,33 +150,6 @@ fn core_rule(text: &str) -> Option<(std::ops::Range<usize>, String)> {
     Some((start..end, rule))
 }
 
-/// `main[29fbe608-…]` → `proxy[Japan Tokyo 53]`, `dial main` → `dial proxy`:
-/// the names the user knows.
-fn with_names(text: &str, snap: &Snapshot) -> String {
-    // The core's own words for the main group falling over.
-    if text.contains(" failed multiple times, activate health check") {
-        return "The proxy failed several times; the core re-checks its servers.".into();
-    }
-    let mut out = text
-        .replace(" main[", " proxy[")
-        .replace("dial main ", "dial proxy ");
-    let ids: Vec<(String, Id)> = out
-        .split(|c: char| !(c.is_ascii_hexdigit() || c == '-'))
-        .filter(|w| w.len() == 36)
-        .filter_map(|w| Some((w.to_owned(), w.parse::<Id>().ok()?)))
-        .collect();
-    if ids.is_empty() {
-        return out;
-    }
-    let servers = snap.get(&plugin_servers::SERVERS);
-    for (word, id) in ids {
-        if let Some(s) = servers.iter().find(|s| s.id == id) {
-            out = out.replace(&word, &s.name);
-        }
-    }
-    out
-}
-
 /// Add new lines, a few times a second at most: every change repaints the UI.
 fn publish(cx: &Cx, fresh: &mut Vec<Line>) {
     if fresh.is_empty() {
@@ -205,10 +180,10 @@ async fn follow(cx: Cx) -> Result<()> {
                         let Ok(Some(chunk)) = chunk else { break };
                         // Bytes, not text: a character may span two chunks.
                         raw.extend_from_slice(&chunk);
-                        let (snap, reading) = (cx.snapshot(), cx.ui_open());
+                        let (labels, reading) = (cx.core().labels(), cx.ui_open());
                         while let Some(end) = raw.iter().position(|b| *b == b'\n') {
                             let bytes: Vec<u8> = raw.drain(..=end).collect();
-                            fresh.extend(line(&bytes, &snap, reading));
+                            fresh.extend(line(&bytes, &labels, reading));
                         }
                         let over = fresh.len().saturating_sub(KEEP);
                         fresh.drain(..over);
@@ -317,7 +292,7 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
         }
         let pal = kit::colors(ui);
         // The widest age, so every message starts at the same edge.
-        let font = egui::FontId::monospace(theme::SMALL);
+        let font = egui::FontId::proportional(theme::SMALL);
         let age_width = ui.fonts_mut(|f| {
             f.layout_no_wrap("59\u{a0}min ago".into(), font.clone(), pal.muted)
                 .size()
@@ -329,40 +304,62 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
-                for l in shown {
-                    let ink = match l.level {
-                        Level::Info => pal.foreground,
-                        Level::Warning => pal.warning,
-                        Level::Error => pal.danger,
-                    };
-                    let age = egui::RichText::new(kit::age(l.at))
-                        .font(font.clone())
-                        .color(pal.muted);
-                    // Words wrap whole; one longer than the line breaks anywhere.
-                    let text = |width: f32| {
-                        egui::text::LayoutJob::simple(l.text.clone(), font.clone(), ink, width)
-                    };
-                    if phone {
-                        // The age on its own line gives the text the full width.
-                        ui.label(age);
-                        kit::text_label(ui, text(ui.available_width()), true, false);
-                        ui.add_space(theme::SPACE_S);
-                        continue;
-                    }
-                    // Age on the left in the same type, so both share the
-                    // first line; wrapped text keeps its own column.
-                    ui.horizontal_top(|ui| {
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(age_width, 0.),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                ui.set_width(age_width);
-                                ui.label(age);
-                            },
-                        );
-                        kit::text_label(ui, text(ui.available_width()), true, false);
+                // Rows keep the card's inset; an age shows once for its run of lines.
+                let inset = theme::INSET - theme::SPACE_S;
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin::symmetric(inset as i8, theme::SPACE_S as i8))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = theme::SPACE_XS;
+                        let mut last_age = String::new();
+                        for l in shown {
+                            let ink = match l.level {
+                                Level::Info => pal.foreground,
+                                Level::Warning => pal.warning,
+                                Level::Error => pal.danger,
+                            };
+                            let age_text = kit::age(l.at);
+                            let repeated = age_text == last_age;
+                            last_age = age_text.clone();
+                            let age = egui::RichText::new(if repeated {
+                                String::new()
+                            } else {
+                                age_text
+                            })
+                            .font(font.clone())
+                            .color(pal.muted);
+                            // Words wrap whole; one longer than the line breaks anywhere.
+                            let text = |width: f32| {
+                                egui::text::LayoutJob::simple(
+                                    l.text.clone(),
+                                    font.clone(),
+                                    ink,
+                                    width,
+                                )
+                            };
+                            if phone {
+                                // The age on its own line gives the text the full width.
+                                if !repeated {
+                                    ui.label(age);
+                                }
+                                kit::text_label(ui, text(ui.available_width()), true, false);
+                                ui.add_space(theme::SPACE_S);
+                                continue;
+                            }
+                            // Age on the left in the same type, so both share the
+                            // first line; wrapped text keeps its own column.
+                            ui.horizontal_top(|ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(age_width, 0.),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        ui.set_width(age_width);
+                                        ui.label(age);
+                                    },
+                                );
+                                kit::text_label(ui, text(ui.available_width()), true, false);
+                            });
+                        }
                     });
-                }
             });
     });
     if show_hidden {

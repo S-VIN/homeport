@@ -8,11 +8,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn catalog() -> Vec<&'static rproxy_kernel::Plugin> {
-    vec![
-        &plugin_servers::PLUGIN,
-        &plugin_subscriptions::PLUGIN,
-        &plugin_format_uri::PLUGIN,
-    ]
+    vec![&plugin_servers::PLUGIN, &plugin_subscriptions::PLUGIN]
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -31,7 +27,7 @@ async fn invalid_imports_leave_the_running_profile_untouched() {
     for damage in [
         "ALTER TABLE kernel_plugins ADD COLUMN unexpected TEXT",
         "INSERT INTO kernel_settings (id,json) VALUES ('kernel.theme','not-json') ON CONFLICT(id) DO UPDATE SET json='not-json'",
-        "INSERT INTO kernel_plugins (id,enabled) VALUES ('auto-select',0) ON CONFLICT(id) DO UPDATE SET enabled=0; INSERT INTO kernel_settings (id,json) VALUES ('auto-select.auto','not-json') ON CONFLICT(id) DO UPDATE SET json='not-json'",
+        "INSERT INTO kernel_plugins (id,enabled) VALUES ('health-checks',0) ON CONFLICT(id) DO UPDATE SET enabled=0; INSERT INTO kernel_settings (id,json) VALUES ('health-checks.auto','not-json') ON CONFLICT(id) DO UPDATE SET json='not-json'",
         "CREATE TRIGGER unwanted AFTER INSERT ON kernel_plugins BEGIN DELETE FROM kernel_plugins; END",
     ] {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -61,7 +57,7 @@ async fn invalid_imports_leave_the_running_profile_untouched() {
     }
     let old = host.kernel();
     host.restart().await;
-    assert!(old.set_plugin("subscriptions", false).is_err());
+    assert!(old.set_plugin("logs", false).is_err());
     assert!(old.restart_core().await.is_err());
     assert_eq!(
         plugin_subscriptions::device_id(&dir.path().join("plugins/subscriptions")).unwrap(),
@@ -243,7 +239,6 @@ async fn import_waits_for_old_writers_and_rejects_late_operations() {
         description: "",
         category: categories::NETWORK,
         requires: &[],
-        provides: &[],
         required: true,
         default_enabled: true,
         platforms: Platform::ALL,
@@ -346,9 +341,10 @@ async fn native_export_protects_working_files_and_replaces_only_the_selected_fil
 
 #[test]
 fn hysteria_ipv6_and_old_subscription_settings_remain_compatible() {
-    let links =
-        plugin_format_uri::parse_links("hy2://secret@[2001:db8::1]:8443?sni=example.org#IPv6")
-            .unwrap();
+    let links = plugin_subscriptions::formats::uri::parse_links(
+        "hy2://secret@[2001:db8::1]:8443?sni=example.org#IPv6",
+    )
+    .unwrap();
     assert_eq!(links[0].server, "2001:db8::1");
     assert_eq!(links[0].port, 8443);
     assert_eq!(links[0].name, "IPv6");
@@ -374,7 +370,6 @@ async fn shutdown_wins_over_an_inflight_restart_and_prevents_future_launches() {
         description: "",
         category: categories::NETWORK,
         requires: &[],
-        provides: &[],
         required: true,
         default_enabled: true,
         platforms: Platform::ALL,
@@ -426,4 +421,76 @@ async fn shutdown_wins_over_an_inflight_restart_and_prevents_future_launches() {
     host.restart().await;
     assert!(host.import_configuration(candidate).await.is_err());
     assert!(host.try_kernel().is_none(), "shutdown must be final");
+}
+
+/// A plugin outside subscriptions adds a format: its links are accepted when a
+/// source is added, and its documents are parsed when the source loads.
+mod demo_format {
+    use plugin_servers::Proxy;
+    use plugin_subscriptions::{LINK, Parse};
+    use rproxy_kernel::prelude::*;
+
+    pub static PLUGIN: Plugin = Plugin {
+        id: "format-demo",
+        name: "Demo format",
+        description: "demo://host:port links.",
+        requires: &["subscriptions"],
+        setup,
+        ..Plugin::DEFAULT
+    };
+    fn setup(p: &mut Setup) -> Result<()> {
+        p.hook(&LINK, |_, raw| {
+            raw.starts_with("demo://").then(|| {
+                raw.rsplit_once(':')
+                    .filter(|(_, port)| port.parse::<u16>().is_ok())
+                    .map(drop)
+                    .ok_or_else(|| "A demo link needs a port.".to_owned())
+            })
+        });
+        p.handle(|_: Cx, op: Parse| async move {
+            let (host, port) = op.body.trim()["demo://".len()..].rsplit_once(':').unwrap();
+            let node = serde_json::json!({
+                "name": "Demo", "type": "http", "server": host, "port": port.parse::<u16>().unwrap()
+            });
+            Ok(vec![Proxy::from_value(node, 1)?])
+        })
+        .claim(|_, op| {
+            op.body
+                .trim()
+                .starts_with("demo://")
+                .then_some(Claim::content(60))
+        });
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plugin_adds_a_subscription_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut plugins = catalog();
+    plugins.push(&demo_format::PLUGIN);
+    let host = Host::start(plugins, dir.path()).await.unwrap();
+    let k = host.kernel();
+    let cx = k.cx_for("subscriptions");
+    assert!(
+        cx.call(Add::new(&SOURCES, Source::new("demo://example.org")))
+            .await
+            .is_err(),
+        "the format's own check rejects a link without a port"
+    );
+    cx.call(Add::new(&SOURCES, Source::new("demo://example.org:8080")))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut changes = k.changes();
+        while k.snapshot().get(&plugin_servers::SERVERS).is_empty() {
+            changes.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the demo source loads");
+    let servers = k.snapshot().get(&plugin_servers::SERVERS);
+    assert_eq!(servers[0].name, "Demo");
+    assert_eq!(servers[0].port, 8080);
+    host.shutdown().await;
 }

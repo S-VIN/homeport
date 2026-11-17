@@ -6,10 +6,11 @@
 //! ```text
 //! RefreshAll ─► RefreshSource{id} ─► Fetch{url} → body ─► Parse{body} → proxies ─► servers::ReplaceFromSource
 //! ```
-//! * format plugins answer [`Parse`] for the documents they recognize (claim by content);
+//! * [`formats`] answer [`Parse`] for the documents they recognize (claim by content);
+//!   another plugin adds a format the same way;
 //! * a plugin with its own download algorithm wraps [`Fetch`] or claims [`RefreshSource`]
 //!   for the sources it owns;
-//! * [`LINK`] lets format plugins accept direct links (`vless://…`) when a source is added.
+//! * [`LINK`] accepts direct links (`vless://…`) when a source is added.
 use plugin_servers::{self as servers, Proxy, ReplaceFromSource};
 use rproxy_kernel::{
     kit::{self, Tone},
@@ -18,12 +19,15 @@ use rproxy_kernel::{
 };
 use std::io::Read;
 
+pub mod formats;
+
 pub static PLUGIN: Plugin = Plugin {
     id: "subscriptions",
     name: "Subscriptions",
     description: "Load servers from subscription URLs and links, refreshed on a schedule.",
     category: categories::SERVERS,
     requires: &["servers"],
+    required: true,
     setup,
     ..Plugin::DEFAULT
 };
@@ -43,6 +47,8 @@ pub struct Source {
     pub used: Option<u64>,
     pub total: Option<u64>,
     pub expires: Option<u64>,
+    /// Tag color, chosen when the source is added and kept after others go.
+    pub hue: Option<u8>,
 }
 impl Source {
     pub fn new(url: impl Into<String>) -> Self {
@@ -55,7 +61,12 @@ impl Source {
             used: None,
             total: None,
             expires: None,
+            hue: None,
         }
+    }
+    /// Loaded from a provider (and refreshed), not a link or config kept as is.
+    pub fn remote(&self) -> bool {
+        url::Url::parse(&self.url).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
     }
     /// The provider's name for it, else its host, or the link scheme for direct links.
     pub fn label(&self) -> String {
@@ -66,10 +77,12 @@ impl Source {
             Ok(u) if matches!(u.scheme(), "http" | "https") => {
                 u.host_str().unwrap_or("Subscription").to_owned()
             }
+            Ok(u) if u.scheme() == "vpn" => "Amnezia key".into(),
             Ok(u) => {
                 let name = u.fragment().map(percent).filter(|f| !f.is_empty());
                 name.unwrap_or_else(|| format!("{} link", u.scheme()))
             }
+            Err(_) if formats::wireguard::is_config(&self.url) => "WireGuard config".into(),
             Err(_) => "Subscription".into(),
         }
     }
@@ -219,27 +232,41 @@ pub static LOADING: State<Vec<Id>> = State::new("subscriptions.loading");
 
 fn validate(snap: &Snapshot, s: &mut Source, others: &[Source]) -> Result<()> {
     let raw = s.url.trim();
-    let url = url::Url::parse(raw)
-        .map_err(|_| Error::msg("Enter an HTTP(S) subscription URL or a supported link."))?;
-    if matches!(url.scheme(), "http" | "https") {
-        if url.host().is_none() {
-            bail!("Enter an HTTP(S) subscription URL or a supported link.");
-        }
-        s.url = url.to_string();
-    } else {
-        match snap.hooks(&LINK, raw).into_iter().flatten().next() {
-            Some(Ok(())) => s.url = raw.to_owned(),
-            Some(Err(e)) => bail!("{e}"),
-            None => bail!(
-                "No enabled format plugin understands {}:// links.",
-                url.scheme()
-            ),
+    const HINT: &str = "Enter an HTTP(S) subscription URL or a supported link.";
+    match snap.first(&LINK, raw) {
+        Some(Ok(())) => s.url = raw.to_owned(),
+        Some(Err(e)) => bail!("{e}"),
+        // A pasted config is not a URL: formats answer for it above.
+        None => {
+            let url = url::Url::parse(raw).map_err(|_| Error::msg(HINT))?;
+            if !matches!(url.scheme(), "http" | "https") {
+                bail!("{}:// links are not supported.", url.scheme());
+            }
+            if url.host().is_none() {
+                bail!("{HINT}");
+            }
+            s.url = url.to_string();
         }
     }
     if others.iter().any(|o| o.url == s.url) {
         bail!("Subscription already exists.");
     }
+    if s.hue.is_none() {
+        s.hue = Some(free_hue(others, s.id));
+    }
     Ok(())
+}
+
+/// The id's preferred tag color, or the next one no other source has.
+fn free_hue(others: &[Source], id: Id) -> u8 {
+    let n = kit::palette::TAG_HUES;
+    let preferred = servers::hue_of(id);
+    let taken = |h: usize| others.iter().any(|o| o.hue == Some(h as u8));
+    let hue = (0..n)
+        .map(|i| (preferred + i) % n)
+        .find(|h| !taken(*h))
+        .unwrap_or(preferred);
+    hue as u8
 }
 
 /// Download a subscription document (size limit, gzip sniffing, UTF-8). Plugins that
@@ -315,6 +342,29 @@ pub async fn http_get(client: &reqwest::Client, url: &str, device_id: &str) -> R
     }
     let body = String::from_utf8(bytes).map_err(|_| Error::msg("Subscription is not UTF-8."))?;
     Ok(Document { body, info })
+}
+
+/// A direct link is its own document. A provider unreachable directly is
+/// retried the way user traffic goes: through the selected server.
+async fn fetch(cx: Cx, f: Fetch) -> Result<Document> {
+    if !f.url.starts_with("http://") && !f.url.starts_with("https://") {
+        return Ok(Document {
+            body: f.url,
+            info: Info::default(),
+        });
+    }
+    let direct = fetch_http(&cx, cx.http(), &f.url).await;
+    let Err(e) = &direct else { return direct };
+    if e.cancelled()
+        || matches!(e.code.as_str(), "device-limit" | "device-id")
+        || cx.get(&servers::SELECTED).is_none()
+    {
+        return direct;
+    }
+    let Ok(routed) = cx.core().routed_http().await else {
+        return direct;
+    };
+    fetch_http(&cx, &routed, &f.url).await
 }
 
 /// Use the same identity for direct requests and retries through the selected proxy.
@@ -465,17 +515,8 @@ async fn refresh_source(cx: Cx, op: RefreshSource) -> Result<()> {
 }
 
 fn setup(p: &mut Setup) -> Result<()> {
-    let dir = p.data_dir();
-    // Earlier versions kept the ID in the app folder; move it so providers
-    // that limit devices keep recognising this installation.
-    if let Some(app) = dir
-        .ancestors()
-        .nth(2)
-        .filter(|_| !dir.join("device-id").exists())
-    {
-        let _ = std::fs::rename(app.join("device-id"), dir.join("device-id"));
-    }
-    let identity = device_id(&dir)?;
+    formats::register(p);
+    let identity = device_id(&p.data_dir())?;
     p.live(&DEVICE_ID, move || identity.clone());
     p.live(&LOADING, Vec::new);
     p.list(&SOURCES)
@@ -484,22 +525,9 @@ fn setup(p: &mut Setup) -> Result<()> {
 
     p.handle(refresh_all);
     p.handle(refresh_source);
-    p.handle(|cx: Cx, f: Fetch| async move {
-        if f.url.starts_with("http://") || f.url.starts_with("https://") {
-            fetch_http(&cx, cx.http(), &f.url).await
-        } else {
-            // A direct link is its own document.
-            Ok(Document {
-                body: f.url,
-                info: Info::default(),
-            })
-        }
-    })
-    .rank(Rank::Fallback);
+    p.handle(fetch).rank(Rank::Fallback);
     p.handle(|_: Cx, _: Parse| async move {
-        Err::<Vec<Proxy>, _>(Error::msg(
-            "Unrecognized subscription format. Is a format plugin enabled?",
-        ))
+        Err::<Vec<Proxy>, _>(Error::msg("Unrecognized subscription format."))
     })
     .rank(Rank::Fallback);
 
@@ -534,8 +562,13 @@ fn setup(p: &mut Setup) -> Result<()> {
     p.hook(&servers::SOURCE_LABEL, |snap, id| {
         label(&snap.get(&SOURCES), *id)
     });
+    p.hook(&servers::SOURCE_RANK, |snap, id| {
+        snap.get(&SOURCES).iter().position(|s| s.id == *id)
+    });
     p.hook(&servers::SOURCE_HUE, |snap, id| {
-        hue(&snap.get(&SOURCES), *id)
+        let sources = snap.get(&SOURCES);
+        let s = sources.iter().find(|s| s.id == *id)?;
+        Some(s.hue.map_or_else(|| servers::hue_of(s.id), usize::from))
     });
 
     p.page_fn(
@@ -550,31 +583,13 @@ fn setup(p: &mut Setup) -> Result<()> {
     p.fill(&SETTINGS_SECTIONS, "refresh", 0, |ui, cx, _| {
         cx.setting(
             ui,
-            "Refresh subscriptions",
+            "Auto update",
             &SETTINGS,
             |s| &mut s.refresh_secs,
             |ui, v| kit::interval(ui, "refresh", v),
         );
     });
     Ok(())
-}
-
-/// Tag colors: each source keeps its preferred color unless an earlier one has
-/// it, so up to eight subscriptions never share a color.
-fn hue(sources: &[Source], id: Id) -> Option<usize> {
-    let mut taken = [false; kit::palette::TAG_HUES];
-    for s in sources {
-        let preferred = servers::hue_of(s.id);
-        let hue = (0..taken.len())
-            .map(|i| (preferred + i) % taken.len())
-            .find(|h| !taken[*h])
-            .unwrap_or(preferred);
-        taken[hue] = true;
-        if s.id == id {
-            return Some(hue);
-        }
-    }
-    None
 }
 
 /// Traffic and term of the plan, when the provider reports them.
@@ -602,6 +617,12 @@ fn plan(s: &Source) -> Option<(String, bool)> {
 }
 
 fn status(s: &Source, loading: bool) -> (String, Tone) {
+    if !s.remote() {
+        return match &s.error {
+            Some(e) => (e.trim_end_matches('.').to_owned(), Tone::Warning),
+            None => ("Added manually".into(), Tone::Neutral),
+        };
+    }
     let (text, tone) = load_status(s, loading);
     match plan(s).filter(|_| !loading) {
         Some((plan, alarming)) => {
@@ -661,13 +682,6 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
             || RefreshAll,
         );
     });
-    // On a phone the order arrows come with the editor.
-    let note = if kit::phone(ui) {
-        "Auto select prefers servers from subscriptions higher in the list. Tap the pencil to move one."
-    } else {
-        "Auto select prefers servers from subscriptions higher in the list."
-    };
-    kit::page_note(ui, note);
 
     let loading = cx.live(&LOADING);
     ListEditor::new(&SOURCES)
@@ -712,6 +726,10 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
         )
         .column(
             Column::custom("", 30., move |ui, cx, s: &Source| {
+                // A link or config is kept as pasted: nothing to refresh.
+                if !s.remote() {
+                    return;
+                }
                 let idle = !cx.live(&LOADING).contains(&s.id);
                 if kit::icon_button(ui, Icon::Refresh, "Refresh", idle).clicked() {
                     cx.run(RefreshSource { id: s.id });

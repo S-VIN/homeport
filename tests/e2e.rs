@@ -1,10 +1,10 @@
 //! End-to-end tests with the bundled mihomo and local HTTP fixtures.
 use plugin_health_checks as health;
-use plugin_inbounds::{INBOUNDS, Inbound};
+use plugin_local_proxy::{PROXY, Proxy, SaveProxy};
 use plugin_routing::{RULES, Route, Rule};
 use plugin_servers::{SELECTED, SERVERS, Select};
 use plugin_subscriptions::{Parse, RefreshAll, SOURCES, Source};
-use rproxy_kernel::{Host, Id, Kernel, list::Add, list::Remove, list::Save};
+use rproxy_kernel::{Host, Id, Kernel, list::Add, list::Remove};
 use std::{
     sync::{
         Arc, RwLock,
@@ -95,19 +95,14 @@ async fn free_port() -> u16 {
 }
 
 /// Start with all plugins and move the seeded listener to a free port.
-async fn start(dir: &std::path::Path) -> (Arc<Host>, Inbound) {
+async fn start(dir: &std::path::Path) -> (Arc<Host>, Proxy) {
     let host = Host::start(rproxy::catalog(), dir).await.unwrap();
     let k = host.kernel();
-    until(&k, "seeded listener", |k| {
-        !k.snapshot().get(&INBOUNDS).is_empty()
-    })
-    .await;
-    // Tests run in parallel: move the default listener to a free port and enable it.
-    let mut inbound = k.snapshot().get(&INBOUNDS)[0].clone();
+    // Tests run in parallel: move the proxy to a free port.
+    let mut inbound = (*k.snapshot().get(&PROXY)).clone();
     inbound.port = free_port().await;
-    inbound.enabled = true;
-    k.cx_for("inbounds")
-        .call(Save::new(&INBOUNDS, inbound.clone()))
+    k.cx_for("local-proxy")
+        .call(SaveProxy(inbound.clone()))
         .await
         .unwrap();
     (host, inbound)
@@ -176,6 +171,20 @@ async fn formats_are_claimed_by_their_plugins() {
     };
     assert!(add("vless://%FF@example.org:443").await.is_err());
     assert!(add("ftp://example.org/list").await.is_err());
+    // AmneziaWG: a config pasted into the one-line field, and an Amnezia VPN key.
+    let config = "[Interface]\nAddress = 10.8.1.2/32\nPrivateKey = a2V5\nJc = 4\nH1 = 1\n\n[Peer]\nPublicKey = cHVi\nEndpoint = 203.0.113.7:41820\n";
+    add(&config.replace('\n', " ")).await.unwrap();
+    let profile = serde_json::json!({"description": "Office", "containers": [
+        {"container": "amnezia-awg", "awg": {"last_config": serde_json::json!({"config": config}).to_string()}}
+    ]});
+    let key = format!(
+        "vpn://{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(profile.to_string())
+    );
+    add(&key).await.unwrap();
+    let wg = parse(key).await.unwrap().pop().unwrap();
+    assert_eq!((wg.name.as_str(), wg.port), ("Office", 41820));
+    assert_eq!(wg.options["amnezia-wg-option"]["jc"], 4);
     host.shutdown().await;
 }
 
@@ -263,14 +272,14 @@ async fn real_core_refresh_select_route_listeners_and_restart() {
     }
 
     // Editing a listener onto a busy port is rejected; the working one stays.
-    let inbounds = k.cx_for("inbounds");
+    let inbounds = k.cx_for("local-proxy");
     let busy = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let moved = Inbound {
+    let moved = Proxy {
         port: busy.local_addr().unwrap().port(),
         ..inbound.clone()
     };
-    assert!(inbounds.call(Save::new(&INBOUNDS, moved)).await.is_err());
-    assert_eq!(k.snapshot().get(&INBOUNDS)[0].port, port);
+    assert!(inbounds.call(SaveProxy(moved)).await.is_err());
+    assert_eq!(k.snapshot().get(&PROXY).port, port);
     assert_eq!(
         client.get(&url).send().await.unwrap().text().await.unwrap(),
         "via upstream"
@@ -278,15 +287,12 @@ async fn real_core_refresh_select_route_listeners_and_restart() {
     drop(busy);
 
     // Credentials are enforced on the real endpoint, for HTTP and SOCKS5.
-    let protected = Inbound {
+    let protected = Proxy {
         login: Some("user".into()),
         password: Some("secret".into()),
         ..inbound.clone()
     };
-    inbounds
-        .call(Save::new(&INBOUNDS, protected))
-        .await
-        .unwrap();
+    inbounds.call(SaveProxy(protected)).await.unwrap();
     assert_eq!(
         client.get(&url).send().await.unwrap().status().as_u16(),
         407
@@ -309,15 +315,12 @@ async fn real_core_refresh_select_route_listeners_and_restart() {
         );
     }
     // An empty password keeps the saved one.
-    let edited = Inbound {
+    let edited = Proxy {
         password: None,
-        ..k.snapshot().get(&INBOUNDS)[0].clone()
+        ..(*k.snapshot().get(&PROXY)).clone()
     };
-    inbounds.call(Save::new(&INBOUNDS, edited)).await.unwrap();
-    assert_eq!(
-        k.snapshot().get(&INBOUNDS)[0].password.as_deref(),
-        Some("secret")
-    );
+    inbounds.call(SaveProxy(edited)).await.unwrap();
+    assert_eq!(k.snapshot().get(&PROXY).password.as_deref(), Some("secret"));
 
     // State survives a restart.
     drop(k);
@@ -461,21 +464,22 @@ async fn missing_dependencies_disable_dependents() {
     let dir = tempfile::tempdir().unwrap();
     let catalog: Vec<_> = rproxy::catalog()
         .into_iter()
-        .filter(|p| p.id != "health-checks")
+        .filter(|p| p.id != "routing")
         .collect();
     let host = Host::start(catalog, dir.path()).await.unwrap();
     let ids: Vec<_> = host.kernel().plugins().iter().map(|p| p.id).collect();
     assert!(
-        !ids.contains(&"auto-select"),
-        "auto-select requires health-checks"
+        !ids.contains(&"vless-inbound"),
+        "vless-inbound requires routing"
     );
-    assert!(ids.contains(&"servers") && ids.contains(&"routing"));
+    // Auto select and the chain only need servers.
+    assert!(ids.contains(&"health-checks") && ids.contains(&"chain-exit"));
     host.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn auto_select_picks_a_healthy_server_and_manual_choice_turns_it_off() {
-    use plugin_auto_select::{AUTO, SetAuto};
+    use plugin_health_checks::auto::{AUTO, SetAuto};
     let dir = tempfile::tempdir().unwrap();
     let (host, _) = start(dir.path()).await;
     let k = host.kernel();
@@ -524,7 +528,7 @@ async fn auto_select_picks_a_healthy_server_and_manual_choice_turns_it_off() {
             .await
             .is_err()
     );
-    k.cx_for("auto-select").call(SetAuto(true)).await.unwrap();
+    k.cx_for("health-checks").call(SetAuto(true)).await.unwrap();
     until(&k, "automatic selection", |k| {
         *k.snapshot().get(&SELECTED) == Some(id("Good"))
     })
@@ -541,7 +545,7 @@ async fn auto_select_picks_a_healthy_server_and_manual_choice_turns_it_off() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn auto_select_fails_over_when_the_connected_server_dies() {
-    use plugin_auto_select::{AUTO, SetAuto};
+    use plugin_health_checks::auto::{AUTO, SetAuto};
     let dir = tempfile::tempdir().unwrap();
     let (host, inbound) = start(dir.path()).await;
     let k = host.kernel();
@@ -575,7 +579,7 @@ async fn auto_select_fails_over_when_the_connected_server_dies() {
         .call(health::CheckAll)
         .await
         .unwrap();
-    k.cx_for("auto-select").call(SetAuto(true)).await.unwrap();
+    k.cx_for("health-checks").call(SetAuto(true)).await.unwrap();
     // Connected, with the other server as the fallback group's backup.
     until(&k, "connection with a backup", |k| {
         k.snapshot().get(&SELECTED).is_some() && !k.snapshot().get(&AUTO).backups.is_empty()

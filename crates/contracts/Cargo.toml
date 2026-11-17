@@ -1,9 +1,0 @@
-[package]
-name = "rproxy-contracts"
-version = "0.2.0"
-edition = "2024"
-publish = false
-description = "Shared types, ops and hooks of replaceable capabilities; plugins implement them"
-
-[dependencies]
-rproxy-kernel = { path = "../kernel" }

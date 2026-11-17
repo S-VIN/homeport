@@ -52,8 +52,6 @@ def bundle(path, system, arch, resources=None):
     exe = 'rproxy.exe' if system == 'win32' else 'rproxy'
     target = ROOT / os.environ.get('CARGO_TARGET_DIR', 'target') / os.environ.get('CARGO_BUILD_TARGET', '')
     copy(target / 'release' / exe, path / exe)
-    helper = 'rproxy-core-helper.exe' if system == 'win32' else 'rproxy-core-helper'
-    copy(target / 'release' / helper, path / helper)
     core = verify_mihomo(system, arch)
     copy(core, path / core.name)
     (path / core.name).chmod(0o755)
@@ -84,7 +82,6 @@ def macos(arch, name):
     (app / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
     # Sign nested code first. Signing the app also signs its main executable.
     run('codesign', '--force', '--sign', '-', app / 'Contents/MacOS/mihomo')
-    run('codesign', '--force', '--sign', '-', app / 'Contents/MacOS/rproxy-core-helper')
     run('codesign', '--force', '--sign', '-', app)
     run('codesign', '--verify', '--deep', '--strict', app)
     (image / 'Applications').symlink_to('/Applications', target_is_directory=True)
@@ -119,7 +116,10 @@ def linux(arch, name):
         # Fewer malloc arenas: the default one per thread wastes memory in a tray app.
         'finish-args': ['--env=MALLOC_ARENA_MAX=2', '--filesystem=xdg-run/rproxy:create', '--share=network', '--share=ipc',
                         '--socket=wayland', '--socket=fallback-x11', '--device=dri', '--talk-name=org.kde.StatusNotifierWatcher',
-                        '--talk-name=org.freedesktop.Flatpak'],
+                        # TUN: the administrator prompt (pkexec) and the tunnel core run on the host.
+                        '--talk-name=org.freedesktop.Flatpak',
+                        # Start at login: read the entry the Background portal writes.
+                        '--filesystem=xdg-config/autostart:ro'],
         # Cargo already stripped debuginfo; this also avoids a host eu-strip (elfutils).
         'modules': [{'name': 'rproxy', 'buildsystem': 'simple', 'build-options': {'no-debuginfo': True},
                      'build-commands': ['cp -a usr/. /app/'],

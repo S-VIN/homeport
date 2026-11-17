@@ -89,6 +89,14 @@ impl Snapshot {
         self.rev
     }
     /// Ask every plugin that answers a [`Hook`](crate::Hook).
+    /// The first answer of a hook that plugins may leave unanswered (`None`).
+    pub fn first<I: ?Sized + 'static, T: 'static>(
+        &self,
+        hook: &crate::Hook<I, Option<T>>,
+        input: &I,
+    ) -> Option<T> {
+        self.reg.hook_fns(hook).iter().find_map(|f| f(self, input))
+    }
     pub fn hooks<I: ?Sized + 'static, O: 'static>(
         &self,
         hook: &crate::Hook<I, O>,

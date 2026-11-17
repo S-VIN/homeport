@@ -38,15 +38,19 @@ pub fn page_header(ui: &mut Ui, title: &str, counter: &str, actions: impl FnOnce
                     r.on_hover_text(counter);
                 }
             }
-            let left = ui.min_rect().right();
+            // Not `min_rect`: the row's minimum size already spans the width.
+            let left = ui.cursor().left();
             let free =
                 (ui.max_rect().right() - left - actions_width - theme::HORIZONTAL_GAP).max(0.);
             ui.add_space(free);
-            let r = ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = theme::HORIZONTAL_GAP;
-                actions(ui)
-            });
-            let w = r.response.rect.width();
+            let w = ui
+                .horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = theme::HORIZONTAL_GAP;
+                    let start = ui.cursor().left();
+                    actions(ui);
+                    ui.min_rect().right() - start
+                })
+                .inner;
             if (w - actions_width).abs() > 0.5 {
                 ui.data_mut(|d| d.insert_temp(id, w));
                 ui.ctx().request_discard("page header actions resized");
@@ -63,6 +67,8 @@ pub fn page_header(ui: &mut Ui, title: &str, counter: &str, actions: impl FnOnce
 
 /// Inputs and an "Add" button in one row above a list. `fields` gets the width
 /// left for inputs and returns true on Enter. Returns true when the user adds.
+/// While not `enabled` (an add is saving) only the button is off: the fields
+/// keep focus, so a rejected entry can be corrected at once.
 pub fn add_bar(
     ui: &mut Ui,
     label: &str,
@@ -71,19 +77,24 @@ pub fn add_bar(
 ) -> bool {
     let mut add = false;
     ui.horizontal(|ui| {
-        ui.add_enabled_ui(enabled, |ui| {
-            let button = 64.;
-            let width = ui.available_width() - button - theme::HORIZONTAL_GAP;
-            let enter = fields(ui, width);
-            let response = Button::primary("Add")
-                .icon(Icon::Add)
-                .width(button)
-                .enabled(enabled)
-                .show(ui);
-            response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
-            let clicked = response.clicked();
-            add = enter || clicked;
-        });
+        let button = 64.;
+        let width = ui.available_width() - button - theme::HORIZONTAL_GAP;
+        // The field being typed in: Enter gives up focus, the next entry wants it.
+        let typing = ui.scope_id().with("add-bar-focus");
+        let enter = fields(ui, width);
+        if let Some(f) = ui.memory(|m| m.focused()) {
+            ui.data_mut(|d| d.insert_temp(typing, f));
+        }
+        let response = Button::primary("Add")
+            .icon(Icon::Add)
+            .width(button)
+            .enabled(enabled)
+            .show(ui);
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
+        add = enabled && (enter || response.clicked());
+        if enter && let Some(f) = ui.data(|d| d.get_temp::<egui::Id>(typing)) {
+            ui.memory_mut(|m| m.request_focus(f));
+        }
     });
     ui.add_space(theme::SPACE_M);
     add
@@ -147,9 +158,11 @@ pub fn page_scroll<R>(ui: &mut Ui, id: impl egui::AsIdSalt, add: impl FnOnce(&mu
         .auto_shrink([false, false])
         .show(ui, |ui| {
             egui::Frame::NONE
+                // The bar floats over the edge: pages with and without a
+                // scroll end at the same right edge.
                 .inner_margin(egui::Margin {
                     left: 0,
-                    right: 7,
+                    right: 1,
                     top: 0,
                     bottom: 1,
                 })

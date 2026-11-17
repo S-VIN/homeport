@@ -3,15 +3,11 @@
 //! with expected status through mihomo's delay test (any number in parallel,
 //! works for every protocol), and a short download through one of the kernel's
 //! isolated check lanes. The rating is an overridable op ([`Rate`]); other
-//! plugins can wrap it.
+//! plugins can wrap it. On the results, [`auto`] selects the server.
 //!
 //! Adds to the Servers page: a Check-all button, Rating/Latency columns, details
 //! and sort orders; and its own Tests page.
 use plugin_servers::{self as servers, Exclusion, Server};
-// The capability this plugin implements; its ops and event are the contract's.
-pub use rproxy_contracts::health::{
-    CAPABILITY, CheckAll, Checked, FULL_SPEED, PROBE_URL, QuickCheck, Report,
-};
 use rproxy_kernel::mihomo::Delay;
 use rproxy_kernel::{
     kit,
@@ -24,23 +20,53 @@ use std::{
 };
 use tokio::{sync::Semaphore, task::JoinSet, time::timeout};
 
+pub mod auto;
+
 pub static PLUGIN: Plugin = Plugin {
     id: "health-checks",
     name: "Tests",
-    description: "Measure latency, HTTP tests and download speed of every server and rate it.",
+    description: "Measure latency, HTTP tests and download speed of every server, rate it and select the best one automatically.",
     category: categories::SERVERS,
     requires: &["servers"],
-    provides: &[CAPABILITY],
     setup,
     ..Plugin::DEFAULT
 };
 
+/// A download speed that counts as fast (bytes per second, 1 Mbit/s).
+pub const FULL_SPEED: u64 = 125_000;
+/// Probe used when no test URL is configured.
+pub use rproxy_kernel::mihomo::PROBE_URL;
+
+/// What a check of a server found.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Report {
+    pub ping_ms: Option<u32>,
+    pub bytes_per_sec: Option<u64>,
+    /// 0–100; `None` while unrated.
+    pub rating: Option<u8>,
+    /// When the server was checked (unix seconds).
+    pub checked: Option<u64>,
+    /// Configured test URLs that answered as expected, of `tests`.
+    pub passed: usize,
+    pub tests: usize,
+}
+impl Report {
+    /// Reachable and at least half of the tests passed.
+    pub fn works(&self) -> bool {
+        self.ping_ms.is_some() && self.passed * 2 >= self.tests
+    }
+    /// Every test passed and the download speed is full.
+    pub fn ideal(&self) -> bool {
+        self.passed == self.tests && self.bytes_per_sec.unwrap_or(0) >= FULL_SPEED
+    }
+}
+
 choices!(pub enum Expected {
-    NoContent => "204",
-    Success => "2xx",
-    Below400 => "< 400",
-    Below500 => "< 500",
-    Below503 => "< 503",
+    NoContent => "Status 204",
+    Success => "Status 2xx",
+    Below400 => "Status < 400",
+    Below500 => "Status < 500",
+    Below503 => "Status < 503",
     Any => "Any status",
 });
 impl Expected {
@@ -130,6 +156,28 @@ pub fn health(snap: &Snapshot, server: Id) -> Option<Health> {
 }
 
 // ---- ops ------------------------------------------------------------------
+
+/// Check every eligible server (job "Test servers").
+pub struct CheckAll;
+impl Op for CheckAll {
+    type Reply = ();
+    fn job(&self) -> Option<JobSpec> {
+        Some(JobSpec::new("Test servers").page("servers"))
+    }
+}
+/// Fast check without a download, not stored (e.g. a candidate right before
+/// switching to it).
+pub struct QuickCheck {
+    pub id: Id,
+}
+impl Op for QuickCheck {
+    type Reply = Option<Report>;
+}
+/// Emitted after a full check pass.
+#[derive(Clone, Debug)]
+pub struct Checked {
+    pub servers: Vec<Id>,
+}
 
 /// Full check of one server; stores and returns its health.
 pub struct CheckServer {
@@ -270,15 +318,8 @@ async fn download_speed(client: &reqwest::Client) -> Option<u64> {
     let _ = timeout(Duration::from_secs(2), read).await;
     (bytes > 0).then(|| (bytes as f64 / start.elapsed().as_secs_f64().max(0.001)) as u64)
 }
-fn server(snap: &Snapshot, id: Id) -> Option<Server> {
-    snap.get(&servers::SERVERS)
-        .iter()
-        .find(|s| s.id == id)
-        .cloned()
-}
 fn skipped(snap: &Snapshot, s: &Server) -> bool {
-    // Name filters exclude for good; servers that only failed a check are re-checked.
-    servers::exclusion(snap, s).is_some_and(|e| e.disconnect)
+    servers::exclusion(snap, s).is_some_and(|e| e.permanent)
 }
 
 /// Test every eligible server, or only those without a result yet.
@@ -372,7 +413,7 @@ fn setup(p: &mut Setup) -> Result<()> {
 
     p.handle(check_all_servers);
     p.handle(check_new_servers);
-    p.wrap(test_new_servers);
+    p.on(test_new_servers);
     p.handle(check_server);
     p.handle(quick_check);
     p.every(
@@ -386,41 +427,17 @@ fn setup(p: &mut Setup) -> Result<()> {
         unreachable(&h).then(|| Exclusion {
             reason: "Unreachable in the last test".into(),
             group: "Unavailable",
-            disconnect: false,
+            permanent: false,
         })
     });
-    p.hook(&servers::SORT_KEYS, |_, _| {
-        vec![
-            ("Rating", |snap: &Snapshot, s: &Server| {
-                -(health(snap, s.id)
-                    .and_then(|h| h.rating)
-                    .map_or(-1, i64::from))
-            }),
-            ("Latency", |snap: &Snapshot, s: &Server| {
-                health(snap, s.id)
-                    .and_then(|h| h.ping_ms)
-                    .map_or(i64::MAX, i64::from)
-            }),
-            ("Download speed", |snap: &Snapshot, s: &Server| {
-                -(health(snap, s.id)
-                    .and_then(|h| h.bytes_per_sec)
-                    .map_or(-1, |b| b as i64))
-            }),
-        ]
-    });
     p.hook(&servers::FREEZE, |snap, _| *snap.live(&CHECKING));
-    p.hook(&rproxy_contracts::health::REPORT, |snap, id| {
-        report(snap, *id)
-    });
-    p.hook(&rproxy_contracts::health::CHECK_URL, |snap, _| {
-        Some(probe_url(snap))
-    });
     // The tray turns red when the connected server failed its last check.
     p.hook(&rproxy_kernel::shell::TRAY, |snap, _| {
         let id = (*snap.get(&servers::SELECTED))?;
         (health(snap, id)?.rating == Some(0)).then_some(rproxy_kernel::shell::TrayLink::Failed)
     });
     ui(p);
+    auto::setup(p);
     Ok(())
 }
 
@@ -464,22 +481,17 @@ async fn check_new_servers(cx: Cx, _: CheckNew) -> Result<()> {
     check_all(&cx, true).await
 }
 
-async fn test_new_servers(
-    cx: Cx,
-    op: servers::ReplaceFromSource,
-    next: Next<servers::ReplaceFromSource>,
-) -> Result<servers::Replaced> {
-    let replaced = next.run(&cx, op).await?;
+async fn test_new_servers(cx: Cx, e: servers::ServersChanged) -> Result<()> {
     // A running full pass starts this run itself when it ends.
-    if !replaced.added.is_empty() && !*cx.live(&CHECKING) {
+    if !e.added.is_empty() && !*cx.live(&CHECKING) {
         cx.spawn(CheckNew)?;
     }
-    Ok(replaced)
+    Ok(())
 }
 
 async fn check_server(cx: Cx, op: CheckServer) -> Result<Option<Health>> {
     let snap = cx.snapshot();
-    let Some(s) = server(&snap, op.id).filter(|s| !skipped(&snap, s)) else {
+    let Some(s) = servers::server(&snap, op.id).filter(|s| !skipped(&snap, s)) else {
         return Ok(None);
     };
     let _measuring = cx.mark_live(&IN_FLIGHT, s.id);
@@ -536,7 +548,7 @@ async fn check_server(cx: Cx, op: CheckServer) -> Result<Option<Health>> {
 /// before switching). Uses no check lane, so it never waits for a full check. Not stored.
 async fn quick_check(cx: Cx, op: QuickCheck) -> Result<Option<Report>> {
     let snap = cx.snapshot();
-    let Some(s) = server(&snap, op.id).filter(|s| !skipped(&snap, s)) else {
+    let Some(s) = servers::server(&snap, op.id).filter(|s| !skipped(&snap, s)) else {
         return Ok(None);
     };
     let (ping, results) = cx.or_cancel(measure(&cx, s.id, &probes(&snap))).await?;
@@ -564,8 +576,8 @@ async fn quick_check(cx: Cx, op: QuickCheck) -> Result<Option<Report>> {
     }))
 }
 
-/// The stored check of a server, as the health contract reports it.
-fn report(snap: &Snapshot, server: Id) -> Option<Report> {
+/// The stored check of a server.
+pub fn report(snap: &Snapshot, server: Id) -> Option<Report> {
     let h = health(snap, server)?;
     let results = snap.get(&RESULTS);
     let mine = results.iter().filter(|r| r.server == server);
@@ -637,19 +649,27 @@ fn ui(p: &mut Setup) {
         title: "Rating",
         help: "0–100 from latency, tests and speed",
         secondary: false,
+        sort: Some(|snap, s| {
+            -(health(snap, s.id)
+                .and_then(|h| h.rating)
+                .map_or(-1, i64::from))
+        }),
     };
     servers::column(p, rating, |ui, cx, s| {
         if cx.live(&IN_FLIGHT).contains(&s.id) {
             kit::spinner(ui).on_hover_text("Testing…");
             return;
         }
-        // An unreachable server has no rating worth a red 0; its row says why.
-        let rating = health(cx.snapshot(), s.id)
-            .filter(|h| !unreachable(h))
-            .and_then(|h| h.rating);
-        let text = rating.map_or_else(|| "—".into(), |n| n.to_string());
-        ui.colored_label(kit::rating_color(ui, rating), text)
-            .on_hover_text(summary(cx.snapshot(), s));
+        // An unreachable server has no rating worth a red 0: it says it failed.
+        let h = health(cx.snapshot(), s.id);
+        let r = if h.as_ref().is_some_and(unreachable) {
+            kit::tone_text(ui, "Failed", kit::Tone::Warning)
+        } else {
+            let rating = h.and_then(|h| h.rating);
+            let text = rating.map_or_else(|| "—".into(), |n| n.to_string());
+            ui.colored_label(kit::rating_color(ui, rating), text)
+        };
+        r.on_hover_text(summary(cx.snapshot(), s));
     });
     let latency = servers::Column {
         id: "latency",
@@ -657,6 +677,11 @@ fn ui(p: &mut Setup) {
         title: "Latency",
         help: "Best response time of a test URL through the server",
         secondary: true,
+        sort: Some(|snap, s| {
+            health(snap, s.id)
+                .and_then(|h| h.ping_ms)
+                .map_or(i64::MAX, i64::from)
+        }),
     };
     servers::column(p, latency, |ui, cx, s| {
         let ping = health(cx.snapshot(), s.id).and_then(|h| h.ping_ms);
@@ -667,6 +692,28 @@ fn ui(p: &mut Setup) {
             pal.faint
         };
         ui.colored_label(ink, ping.map_or_else(|| "—".into(), |n| format!("{n} ms")));
+    });
+    let speed = servers::Column {
+        id: "speed",
+        order: 30,
+        title: "Speed",
+        help: "Download speed in the last speed test",
+        secondary: true,
+        sort: Some(|snap, s| {
+            -(health(snap, s.id)
+                .and_then(|h| h.bytes_per_sec)
+                .map_or(-1, |b| b as i64))
+        }),
+    };
+    servers::column(p, speed, |ui, cx, s| {
+        let speed = health(cx.snapshot(), s.id).and_then(|h| h.bytes_per_sec);
+        let pal = kit::colors(ui);
+        let ink = if speed.is_some() {
+            pal.foreground
+        } else {
+            pal.faint
+        };
+        ui.colored_label(ink, speed.map_or_else(|| "—".into(), kit::rate));
     });
     p.fill(&servers::DETAILS, "health", 10, details);
     p.fill(&servers::CONNECTION, "health", 10, connection_stats);
@@ -682,7 +729,7 @@ fn ui(p: &mut Setup) {
     p.fill(&SETTINGS_SECTIONS, "interval", 0, |ui, cx, _| {
         cx.setting(
             ui,
-            "Test servers",
+            "Auto test",
             &CONFIG,
             |s| &mut s.check_secs,
             |ui, v| kit::interval(ui, "check", v),
@@ -824,10 +871,6 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
         let ok = cx.core_status().running();
         cx.job_button(ui, Icon::Checks, "Test all", ok, || CheckAll);
     });
-    kit::page_note(
-        ui,
-        "Each server is tested through these URLs for latency, the expected answer and download speed. Results feed the rating (0–100).",
-    );
     let results = cx.get(&RESULTS);
 
     ListEditor::new(&TESTS)
@@ -865,7 +908,7 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
         .empty(
             Icon::Checks,
             "No test URLs",
-            "Tests use a built-in probe; add sites you care about.",
+            "Add a site above to test servers with it.",
         )
         .show(ui, cx);
 }

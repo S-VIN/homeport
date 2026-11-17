@@ -24,11 +24,27 @@ use std::{sync::atomic::Ordering, time::Duration};
 
 type LaunchResult = Result<(), Box<dyn std::error::Error>>;
 
+const USAGE: &str = "Usage: rproxy [desktop|background|web]";
+/// The profile folder instead of the user data directory (Docker, tests).
+const DATA_DIR_ENV: &str = "RPROXY_DATA_DIR";
+/// IP:PORT of the web UI; in desktop mode it serves the browser next to the window.
+const LISTEN_ENV: &str = "RPROXY_LISTEN";
+
 const ASSETS: &[Asset] = &[
     Asset {
         path: "/",
         mime: "text/html; charset=utf-8",
         bytes: include_bytes!("../web/index.html"),
+    },
+    Asset {
+        path: "/icon.svg",
+        mime: "image/svg+xml",
+        bytes: include_bytes!("../assets/logos/rproxy-blue.svg"),
+    },
+    Asset {
+        path: "/icon.png",
+        mime: "image/png",
+        bytes: include_bytes!("../assets/logos/blue.png"),
     },
     Asset {
         path: "/rproxy_remote.js",
@@ -111,67 +127,37 @@ fn main() -> LaunchResult {
         return rproxy_kernel::mihomo::supervisor::run(internal).map_err(Into::into);
     }
     rproxy_kernel::mihomo::supervisor::configure(std::env::current_exe()?);
-    let mut mode = None;
-    let mut listen: Option<std::net::SocketAddr> = None;
-    let mut background = false;
-    let mut smoke_test = false;
-    let mut dir = None;
-    let mut args = std::env::args_os().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "web" || arg == "desktop" {
-            if mode.replace(arg == "web").is_some() {
-                return Err("Choose desktop or web.".into());
-            }
-        } else if arg == "--listen" {
-            let addr = args
-                .next()
-                .ok_or("Missing --listen IP:PORT")?
-                .into_string()
-                .map_err(|_| "Invalid listen address")?
-                .parse()?;
-            if listen.replace(addr).is_some() {
-                return Err("--listen given more than once.".into());
-            }
-        } else if arg == "--smoke-test" {
-            smoke_test = true;
-        } else if arg == "--background" {
-            background = true;
-        } else if arg == "--data-dir" {
-            let path = args
-                .next()
-                .filter(|p| !p.is_empty())
-                .ok_or("Missing --data-dir path")?;
-            if dir.replace(PathBuf::from(path)).is_some() {
-                return Err("--data-dir given more than once.".into());
-            }
-        } else if arg == "--help" {
+    // One optional word picks the mode; everything else comes from the environment.
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let (web, background) = match args.iter().map(|a| a.to_str()).collect::<Vec<_>>()[..] {
+        [] => (!cfg!(feature = "desktop"), false),
+        [Some("desktop")] => (false, false),
+        [Some("background")] => (false, true),
+        [Some("web")] => (true, false),
+        _ => {
             attach_console();
-            println!(
-                "rproxy [desktop|web] [--listen IP:PORT] [--background] [--data-dir PATH]\nDesktop opens a window; web serves the same UI at http://127.0.0.1:8080."
-            );
-            return Ok(());
-        } else {
-            return Err("Unknown option. Use --help.".into());
+            return Err(USAGE.into());
         }
-    }
-    let dir = match dir {
-        Some(d) => d,
-        None => data_dir()?,
     };
-    let web = mode.unwrap_or(!cfg!(feature = "desktop"));
     if !web && !cfg!(feature = "desktop") {
         return Err("This build supports web mode only.".into());
-    }
-    if web && background {
-        return Err("--background requires desktop mode.".into());
     }
     if web {
         attach_console();
     }
-    if web && listen.is_none() && !smoke_test {
-        listen = Some(([127, 0, 0, 1], 8080).into());
-    }
-    let instance_dir = if web || smoke_test {
+    let dir = match std::env::var_os(DATA_DIR_ENV).filter(|p| !p.is_empty()) {
+        Some(d) => PathBuf::from(d),
+        None => data_dir()?,
+    };
+    // The web UI: the address from the environment, or the default one in web mode.
+    let listen: Option<std::net::SocketAddr> = match std::env::var(LISTEN_ENV) {
+        Ok(addr) if !addr.is_empty() => Some(
+            addr.parse()
+                .map_err(|_| format!("{LISTEN_ENV} must be IP:PORT, got {addr:?}"))?,
+        ),
+        _ => web.then(|| ([127, 0, 0, 1], 8080).into()),
+    };
+    let instance_dir = if web {
         dir.clone()
     } else {
         instance::desktop_directory()?
@@ -194,15 +180,6 @@ fn main() -> LaunchResult {
         .filter(|p| !web || p.id != "autostart")
         .collect();
     let host = rt.block_on(Host::start(catalog, &dir))?;
-    if smoke_test {
-        let running = host.kernel().core_status().running();
-        rt.block_on(host.shutdown());
-        return if running {
-            Ok(())
-        } else {
-            Err("Mihomo failed to start.".into())
-        };
-    }
     let server = listener
         .map(|l| -> std::io::Result<_> {
             let addr = l.local_addr()?;
@@ -246,6 +223,8 @@ fn main() -> LaunchResult {
         #[cfg(feature = "desktop")]
         let r = windows(&rt, &host, background, &_instance);
         #[cfg(not(feature = "desktop"))]
+        let _ = background;
+        #[cfg(not(feature = "desktop"))]
         let r: LaunchResult = Err("Desktop support is not compiled in.".into());
         if let Some(s) = server {
             s.abort();
@@ -258,7 +237,7 @@ fn main() -> LaunchResult {
 }
 
 /// Windows: the app has no console of its own (GUI subsystem). Started from a
-/// terminal, `rproxy web` and `--help` print there, and Ctrl+C stops it.
+/// terminal, `rproxy web` prints there, and Ctrl+C stops it.
 fn attach_console() {
     #[cfg(windows)]
     // SAFETY: no arguments to validate; failing (no parent console) is harmless.

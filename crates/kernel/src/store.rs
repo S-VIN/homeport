@@ -1,6 +1,5 @@
 //! One SQLite table per persisted list: by default the record type's own
 //! (`#[table(name)]`), or another one chosen for a second list of that type.
-mod legacy;
 mod schema;
 
 use crate::{Error, Result};
@@ -23,8 +22,6 @@ pub trait Table: Sized {
     fn values(&self) -> Vec<&dyn ToSql>;
     fn key(&self) -> &Self::Key;
     fn from_row(row: &Row<'_>) -> rusqlite::Result<Self>;
-    #[doc(hidden)]
-    fn legacy_id(&self) -> String;
 }
 
 #[derive(Clone)]
@@ -127,9 +124,6 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db)?;
         schema::ensure::<T>(&tx, table, strict)?;
-        if strict && table == T::NAME {
-            legacy::import::<T>(&tx)?;
-        }
         tx.commit().map_err(db)
     }
     /// A failing closure rolls back every change. Keep network I/O outside it.

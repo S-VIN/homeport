@@ -1,9 +1,27 @@
 //! The one shape every subscription format produces. Format plugins turn their
 //! documents into [`Proxy`] values; `servers` gives them stable identities.
-use crate::{Protocol, Server, outbound::Definition};
-use rproxy_kernel::{Error, Id, Result};
+use crate::{Protocol, Server};
+use rproxy_kernel::{Error, Id, Result, sql_text};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::{fmt, str::FromStr, sync::Arc};
+
+/// Protocol options of a server, stored as one JSON column.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Options(pub Arc<Map<String, Value>>);
+impl fmt::Display for Options {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&serde_json::to_string(&self.0).map_err(|_| fmt::Error)?)
+    }
+}
+impl FromStr for Options {
+    type Err = serde_json::Error;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        serde_json::from_str(s)
+    }
+}
+sql_text!(Options);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Proxy {
@@ -36,23 +54,19 @@ impl Proxy {
     }
     /// Identity: the source plus the complete outbound config except its display name.
     /// Changing credentials or transport creates a new server; renaming does not.
-    pub(crate) fn normalize(mut self, source: Id) -> Result<(Server, Definition)> {
+    pub(crate) fn normalize(mut self, source: Id) -> Result<Server> {
         let name = std::mem::take(&mut self.name);
         let encoded =
             serde_json::to_vec(&self).map_err(|_| Error::msg("Invalid proxy definition"))?;
-        let id = source.child(&encoded);
-        let definition = Definition::new(id, self.options)?;
-        Ok((
-            Server {
-                id,
-                source,
-                name,
-                protocol: self.protocol,
-                address: self.server,
-                port: self.port,
-            },
-            definition,
-        ))
+        Ok(Server {
+            id: source.child(&encoded),
+            source,
+            name,
+            protocol: self.protocol,
+            address: self.server,
+            port: self.port,
+            options: Options(Arc::new(self.options)),
+        })
     }
 }
 

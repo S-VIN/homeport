@@ -148,6 +148,8 @@ pub(crate) struct Registry {
     pub ops: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
     pub observers: HashMap<TypeId, Vec<Observer>>,
     pub hooks: HashMap<&'static str, Box<dyn Any + Send + Sync>>,
+    /// The plugin answering each exclusive hook.
+    pub deciders: HashMap<&'static str, Option<usize>>,
     pub slots: HashMap<&'static str, Box<dyn Any + Send + Sync>>,
     pub slot_edits: Vec<SlotEdit>,
     /// `(slot id, plugin)` of every contribution: where a plugin shows its UI.
@@ -165,8 +167,8 @@ pub(crate) struct Registry {
         u32,
         Box<dyn Fn(&crate::store::rusqlite::Connection) -> Result<()> + Send + Sync>,
     )>,
-    /// Problems met while loading saved data (shown once the app runs).
-    pub warnings: Vec<String>,
+    /// `(title, text)` of problems met while starting (shown once the app runs).
+    pub warnings: Vec<(&'static str, String)>,
     pub seq: usize,
     pub data_dir: std::path::PathBuf,
 }
@@ -374,28 +376,6 @@ impl<'a> Setup<'a> {
             Box::new(move || Arc::new(crate::state::Live::new(init())) as Value),
         ));
     }
-    /// Custom persistence for data that does not fit one table.
-    pub fn persist<T: Send + Sync + 'static>(
-        &mut self,
-        s: &'static State<T>,
-        register: impl Fn(&crate::store::Store) -> Result<()> + Send + Sync + 'static,
-        load: impl Fn(&crate::store::Tx<'_>) -> Result<T> + Send + Sync + 'static,
-        save: impl Fn(&crate::store::Tx<'_>, &T, &T) -> Result<()> + Send + Sync + 'static,
-    ) {
-        self.reg.declare(s.name, self.plugin);
-        self.reg.persist.push((
-            s.name,
-            self.plugin,
-            Persist {
-                register: Box::new(move |store, _| register(store)),
-                load: Box::new(move |tx| load(tx).map(|v| Arc::new(v) as Value)),
-                save: Box::new(move |tx, a, b| {
-                    save(tx, a.downcast_ref().unwrap(), b.downcast_ref().unwrap())
-                }),
-                fallback: None,
-            },
-        ));
-    }
     /// A schema step that runs once, before state loads, in its own
     /// transaction: `p.migrate(1, |sql| …)`, then 2, 3… for later changes.
     /// Not needed for new nullable columns or `#[column(default = "…")]`.
@@ -550,6 +530,22 @@ impl<'a> Setup<'a> {
         hook: &'static Hook<I, O>,
         f: impl Fn(&Snapshot, &I) -> O + Send + Sync + 'static,
     ) {
+        if hook.exclusive
+            && let Some(other) = self.reg.deciders.insert(hook.id, self.plugin)
+            && other != self.plugin
+        {
+            self.reg.deciders.insert(hook.id, other);
+            let name = |p: Option<usize>| p.map_or("Kernel", |p| self.reg.plugins[p].name);
+            let warning = format!(
+                "{} and {} both decide `{}`; {} is ignored. Turn one of them off.",
+                name(other),
+                name(self.plugin),
+                hook.id,
+                name(self.plugin),
+            );
+            self.reg.warnings.push(("Plugins", warning));
+            return;
+        }
         self.reg
             .hooks
             .entry(hook.id)
@@ -579,7 +575,8 @@ impl<'a> Setup<'a> {
         self.reg.schedules.push(crate::setup::Schedule {
             plugin,
             name,
-            every: Arc::new(every),
+            // A zero period means the schedule is off.
+            every: Arc::new(move |s| every(s).filter(|d| !d.is_zero())),
             task: Arc::new(move |cx| {
                 let make = make.clone();
                 let op = make();
@@ -697,52 +694,6 @@ impl<'a> Setup<'a> {
             reg.contributions_mut(slot).retain(|c| c.id != contribution);
         }));
     }
-    /// A tool opened from a toolbar: a button (icon, label, count) in
-    /// `toolbar` and, while open, a panel with a title and a close button in
-    /// `panel` above the page content. The kernel keeps the open state per
-    /// window and fits the button to narrow screens.
-    pub fn tool(
-        &mut self,
-        toolbar: &'static Slot<()>,
-        panel: &'static Slot<()>,
-        tool: Tool,
-        count: impl Fn(&Snapshot) -> usize + Send + Sync + 'static,
-        body: impl Fn(&mut egui::Ui, &mut UiCx) + Send + Sync + 'static,
-    ) {
-        let open = egui::Id::unique(("kernel-tool", self.plugin_id(), tool.id));
-        let is_open = move |ui: &egui::Ui| ui.data(|d| d.get_temp::<bool>(open).unwrap_or(false));
-        self.fill(toolbar, tool.id, tool.order, move |ui, cx, _| {
-            let n = count(cx.snapshot());
-            let on = is_open(ui);
-            if crate::kit::tool_button(ui, tool.icon, tool.label, n, on).clicked() {
-                ui.data_mut(|d| d.insert_temp(open, !on));
-            }
-        });
-        self.fill(panel, tool.id, tool.order, move |ui, cx, _| {
-            if !is_open(ui) {
-                return;
-            }
-            let pal = crate::kit::colors(ui);
-            crate::kit::row_line(ui, 24., |ui| {
-                ui.label(
-                    crate::kit::bold(tool.label, crate::kit::theme::BODY).color(pal.foreground),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if crate::kit::icon_button(
-                        ui,
-                        crate::kit::Icon::Close,
-                        &format!("Close {}", tool.label.to_lowercase()),
-                        true,
-                    )
-                    .clicked()
-                    {
-                        ui.data_mut(|d| d.insert_temp(open, false));
-                    }
-                });
-            });
-            body(ui, cx);
-        });
-    }
     /// A page in the bottom navigation with its own per-session state.
     pub fn page<T: Page + Default + 'static>(&mut self, spec: PageSpec) {
         let plugin = self.me();
@@ -769,17 +720,6 @@ impl<'a> Setup<'a> {
             }),
         });
     }
-}
-
-/// A toolbar tool, see [`Setup::tool`].
-#[derive(Clone, Copy)]
-pub struct Tool {
-    /// Unique within the plugin.
-    pub id: &'static str,
-    pub label: &'static str,
-    pub icon: crate::kit::Icon,
-    /// Lower comes first in the toolbar.
-    pub order: i32,
 }
 
 /// Fine-tune a just-registered handler.

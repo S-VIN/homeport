@@ -1,0 +1,18 @@
+[package]
+name = "plugin-local-proxy"
+version = "0.2.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rproxy-kernel = { path = "../../crates/kernel" }
+serde = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Networking_WinInet"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

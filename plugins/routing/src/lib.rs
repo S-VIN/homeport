@@ -7,6 +7,7 @@
 //! MetaCubeX geo database. The core downloads them, keeps them in its home
 //! folder and refreshes them daily; the page can refresh them on demand.
 use plugin_servers as servers;
+use rproxy_kernel::core::Labels;
 use rproxy_kernel::mihomo::{RuleBehavior, RuleProvider};
 use rproxy_kernel::{kit, mihomo::ipnet::IpNet, prelude::*, ui::Column, ui::ListEditor};
 use std::{
@@ -77,6 +78,10 @@ impl Op for RefreshGeo {
         Some(JobSpec::new("Read geo data status").quiet())
     }
 }
+/// Apps can't be matched by process name inside a sandbox (Flatpak, Docker).
+fn sandboxed() -> bool {
+    Platform::is_flatpak() || Platform::is_docker()
+}
 fn geo_providers(snap: &Snapshot) -> Vec<RuleProvider> {
     let mut out: Vec<RuleProvider> = Vec::new();
     for r in snap.get(&RULES).iter() {
@@ -94,16 +99,12 @@ async fn read_geo(cx: &Cx) -> Result<()> {
     let status: HashMap<String, GeoStatus> = geo_providers(&cx.snapshot())
         .into_iter()
         .map(|p| {
-            let v = &all[&p.name];
-            let updated = v["updatedAt"]
-                .as_str()
-                .filter(|t| !t.starts_with("0001"))
-                .map(str::to_owned);
+            let v = all.get(&p.name).cloned().unwrap_or_default();
             (
                 p.name,
                 GeoStatus {
-                    rules: v["ruleCount"].as_u64().unwrap_or(0),
-                    updated,
+                    rules: v.rule_count,
+                    updated: v.updated_at,
                 },
             )
         })
@@ -117,33 +118,16 @@ pub static PLUGIN: Plugin = Plugin {
     name: "Routing",
     description: "Send domains and networks through the proxy, directly, or block them. The first match wins.",
     requires: &["servers"],
+    required: true,
     setup,
     ..Plugin::DEFAULT
 };
 
 choices!(pub enum Route {
-    Proxy => "Proxy" | "Via server",
+    Proxy => "Proxy",
     Direct => "Direct",
     Block => "Block",
 });
-
-choices!(
-    /// The proxy mode of Clash-family apps: follow the rules, or send all
-    /// traffic one way for a while without touching them.
-    pub enum Mode {
-        Rule => "Rule",
-        Global => "Global",
-        Direct => "Direct",
-    }
-);
-// `choices!` takes no per-value attributes, so no `#[default]`.
-#[allow(clippy::derivable_impls)]
-impl Default for Mode {
-    fn default() -> Self {
-        Mode::Rule
-    }
-}
-pub static MODE: State<Mode> = State::new("routing.mode");
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Table)]
 #[table(name = "routing_rules")]
@@ -153,6 +137,53 @@ pub struct Rule {
     pub action: Route,
 }
 pub static RULES: State<Vec<Rule>> = State::new("routing.rules");
+
+/// Send traffic matching `pattern` this way: changes the route of the rule
+/// with this pattern, or adds the rule at the top.
+pub struct SetRoute {
+    pub pattern: String,
+    pub action: Route,
+}
+impl Op for SetRoute {
+    type Reply = ();
+    const SAVES: bool = true;
+}
+/// How traffic matching exactly `pattern` goes: the first rule with this
+/// pattern or for everything decides.
+pub fn route_for(snap: &Snapshot, pattern: &str) -> Route {
+    snap.get(&RULES)
+        .iter()
+        .find(|r| r.pattern == pattern || r.pattern == "*")
+        .map_or(Route::Proxy, |r| r.action)
+}
+async fn set_route(cx: Cx, op: SetRoute) -> Result<()> {
+    let existing = cx
+        .get(&RULES)
+        .iter()
+        .find(|r| r.pattern == op.pattern)
+        .cloned();
+    match existing {
+        Some(r) => {
+            let rule = Rule {
+                action: op.action,
+                ..r
+            };
+            cx.call(Save::new(&RULES, rule)).await.map(drop)
+        }
+        None => {
+            let rule = Rule {
+                id: Id::random(),
+                pattern: op.pattern,
+                action: op.action,
+            };
+            let add = Add {
+                at: Some(0),
+                ..Add::new(&RULES, rule)
+            };
+            cx.call(add).await.map(drop)
+        }
+    }
+}
 
 fn target(r: Route, via: &Target) -> Target {
     match r {
@@ -178,6 +209,8 @@ pub fn core_rule(rule: &Rule, via: &Target) -> Result<CoreRule> {
         CoreRule::Match(t)
     } else if let Some(app) = pattern.strip_prefix("app:") {
         CoreRule::ProcessName(app.to_owned(), t)
+    } else if let Some(name) = pattern.strip_prefix("inbound:") {
+        CoreRule::InName(name.to_owned(), t)
     } else if let Some(net) = network {
         CoreRule::IpCidr {
             net,
@@ -187,18 +220,6 @@ pub fn core_rule(rule: &Rule, via: &Target) -> Result<CoreRule> {
     } else {
         CoreRule::DomainRegex(domain_regex(&pattern), t)
     })
-}
-
-/// Whether the core's description of a rule (`DomainRegex ^…$`) is `rule`.
-fn same_rule(rule: &CoreRule, reported: &str) -> bool {
-    let (kind, payload) = reported.split_once(' ').unwrap_or((reported, ""));
-    match rule {
-        CoreRule::DomainRegex(regex, _) => kind == "DomainRegex" && regex == payload,
-        CoreRule::IpCidr { net, .. } => kind.starts_with("IPCIDR") && net.to_string() == payload,
-        CoreRule::RuleSet { name, .. } => kind == "RuleSet" && name == payload,
-        CoreRule::ProcessName(app, _) => kind == "ProcessName" && app == payload,
-        _ => false,
-    }
 }
 
 /// Like domain rules in other proxy apps: `example.com` and `*.example.com`
@@ -252,7 +273,7 @@ pub fn rule_pattern(pattern: &str) -> Result<(String, Option<IpNet>)> {
     if let Some(app) = pattern.strip_prefix("app:") {
         let app = app.trim();
         // The sandbox hides other processes from the core.
-        if Platform::is_flatpak() || Platform::is_docker() {
+        if sandboxed() {
             return Err(Error::msg(
                 "App rules need the regular install: Flatpak and Docker hide other apps.",
             ));
@@ -263,6 +284,17 @@ pub fn rule_pattern(pattern: &str) -> Result<(String, Option<IpNet>)> {
             ));
         }
         return Ok((format!("app:{app}"), None));
+    }
+    if let Some(name) = pattern.strip_prefix("inbound:") {
+        let name = name.trim();
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c))
+        {
+            return Err(Error::msg("Choose an inbound, for example VLESS clients."));
+        }
+        return Ok((format!("inbound:{name}"), None));
     }
     let mut p = String::with_capacity(pattern.len());
     for c in pattern.chars().flat_map(char::to_lowercase) {
@@ -331,6 +363,7 @@ async fn above_catch_all(cx: Cx, mut op: Add<Rule>, next: Next<Add<Rule>>) -> Re
 
 fn setup(p: &mut Setup) -> Result<()> {
     p.wrap(above_catch_all);
+    p.handle(set_route);
     p.list(&RULES).validate(|_, rule, _, others| {
         let (pattern, network) = rule_pattern(&rule.pattern)?;
         let clash = others.iter().any(|r| {
@@ -345,42 +378,23 @@ fn setup(p: &mut Setup) -> Result<()> {
         Ok(())
     });
     p.live(&GEO, HashMap::new);
-    p.editable_setting(&MODE);
     p.core(|snap| {
         let via = servers::route(snap);
-        let rules: Vec<CoreRule> = match *snap.get(&MODE) {
-            Mode::Rule => snap
-                .get(&RULES)
-                .iter()
-                .filter_map(|r| core_rule(r, &via).ok())
-                .collect(),
-            // The final rule already sends everything through the proxy.
-            Mode::Global => Vec::new(),
-            Mode::Direct => vec![CoreRule::Match(Target::Direct)],
-        };
+        let (mut rules, mut labels) = (Vec::new(), Vec::new());
+        for r in snap.get(&RULES).iter() {
+            let Ok(core) = core_rule(r, &via) else {
+                continue;
+            };
+            // Connections and Logs show the rule as the user wrote it.
+            if r.pattern != "*" {
+                labels.push((core.reported(), r.pattern.clone()));
+            }
+            rules.push(core);
+        }
         Fragment {
             rule_providers: geo_providers(snap),
+            labels,
             ..Fragment::rules(Stage::User, rules)
-        }
-    });
-    p.fill(&servers::CONNECTION, "mode", 5, |ui, cx, _| {
-        let mode = *cx.get(&MODE);
-        if mode != Mode::Rule {
-            kit::tone_text(ui, mode_help(mode), kit::Tone::Warning);
-            ui.add_space(kit::theme::SPACE_M);
-        }
-    });
-    p.fill(&rproxy_kernel::shell::STATUS, "mode", 3, |ui, cx, _| {
-        let mode = *cx.get(&MODE);
-        if mode != Mode::Rule {
-            let pal = kit::colors(ui);
-            let tip = mode_help(mode);
-            cx.status_chip(
-                ui,
-                kit::Lead::Icon(Icon::Routing, pal.warning),
-                &format!("{mode} mode"),
-                tip,
-            );
         }
     });
     p.handle(|cx: Cx, _: UpdateGeo| async move {
@@ -430,22 +444,15 @@ fn setup(p: &mut Setup) -> Result<()> {
         },
         page,
     );
-    p.hook(&servers::RULE_LABEL, |snap, rule| {
-        let via = servers::route(snap);
-        let made = |r: &Rule| core_rule(r, &via).is_ok_and(|c| same_rule(&c, rule));
-        snap.get(&RULES)
-            .iter()
-            .find(|r| made(r))
-            .map(|r| r.pattern.clone())
-    });
     Ok(())
 }
 
 /// What a pattern matches, for the small type badge.
 fn kind(pattern: &str) -> &'static str {
     match rule_pattern(pattern) {
-        Ok((p, _)) if p == "*" => "Catch-all",
+        Ok((p, _)) if p == "*" => "Everything",
         Ok((p, _)) if p.starts_with("app:") => "App",
+        Ok((p, _)) if p.starts_with("inbound:") => "Inbound",
         Ok((p, _)) if p.starts_with("geosite:") => "GeoSite",
         Ok((p, _)) if p.starts_with("geoip:") => "GeoIP",
         Ok((_, Some(net))) if net.prefix_len() == net.max_prefix_len() => "IP",
@@ -454,12 +461,135 @@ fn kind(pattern: &str) -> &'static str {
     }
 }
 
-fn mode_help(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Rule => "Rule: traffic follows the routing rules below.",
-        Mode::Global => "Rules are paused: Global mode sends all traffic through the proxy.",
-        Mode::Direct => "Rules are paused: Direct mode sends no traffic through the proxy.",
+choices!(
+    /// The type picked in the add bar; it only decides the pattern's prefix.
+    enum Kind {
+        Domain => "Domain",
+        Ip => "IP",
+        GeoIp => "GeoIP",
+        GeoSite => "GeoSite",
+        App => "App",
+        Inbound => "Inbound",
+        Everything => "Everything",
     }
+);
+impl Kind {
+    fn prefix(self) -> &'static str {
+        match self {
+            Kind::GeoIp => "geoip:",
+            Kind::GeoSite => "geosite:",
+            Kind::App => "app:",
+            Kind::Inbound => "inbound:",
+            _ => "",
+        }
+    }
+    fn of(pattern: &str) -> Option<Kind> {
+        let p = pattern.trim();
+        Kind::ALL
+            .iter()
+            .copied()
+            .find(|k| !k.prefix().is_empty() && p.starts_with(k.prefix()))
+            .or((p == "*").then_some(Kind::Everything))
+    }
+}
+
+/// GeoIP lists offered in the add bar; any other code still works typed as `geoip:xx`.
+const COUNTRIES: &[(&str, &str)] = &[
+    ("private", "Private networks (LAN)"),
+    ("ru", "🇷🇺 Russia"),
+    ("by", "🇧🇾 Belarus"),
+    ("ua", "🇺🇦 Ukraine"),
+    ("kz", "🇰🇿 Kazakhstan"),
+    ("cn", "🇨🇳 China"),
+    ("ir", "🇮🇷 Iran"),
+    ("tr", "🇹🇷 Turkey"),
+    ("us", "🇺🇸 United States"),
+    ("gb", "🇬🇧 United Kingdom"),
+    ("de", "🇩🇪 Germany"),
+    ("nl", "🇳🇱 Netherlands"),
+    ("fr", "🇫🇷 France"),
+    ("fi", "🇫🇮 Finland"),
+    ("se", "🇸🇪 Sweden"),
+    ("pl", "🇵🇱 Poland"),
+    ("jp", "🇯🇵 Japan"),
+    ("kr", "🇰🇷 South Korea"),
+    ("sg", "🇸🇬 Singapore"),
+    ("hk", "🇭🇰 Hong Kong"),
+    ("in", "🇮🇳 India"),
+    ("ae", "🇦🇪 United Arab Emirates"),
+    ("ca", "🇨🇦 Canada"),
+    ("br", "🇧🇷 Brazil"),
+];
+
+/// The add bar: a type, then what it needs. The draft keeps the full pattern.
+fn rule_fields(ui: &mut egui::Ui, inbounds: &[(String, String)], r: &mut Rule, width: f32) -> bool {
+    let sandboxed = sandboxed();
+    let kinds: Vec<Kind> = Kind::ALL
+        .iter()
+        .copied()
+        .filter(|k| match k {
+            Kind::App => !sandboxed,
+            Kind::Inbound => !inbounds.is_empty(),
+            _ => true,
+        })
+        .collect();
+    let key = ui.scope_id().with("rule-kind");
+    let mut kind: Kind = ui
+        .data(|d| d.get_temp(key))
+        .or_else(|| Kind::of(&r.pattern))
+        .unwrap_or(Kind::Domain);
+    let pattern = r.pattern.trim();
+    let mut value = match Kind::of(pattern) {
+        Some(k) if k == kind => pattern[k.prefix().len()..].to_owned(),
+        _ => pattern.to_owned(),
+    };
+    if value == "*" {
+        value.clear();
+    }
+    let mut picked = kind;
+    let fields = kit::Fields::new(width).choice("kind", &mut picked, &kinds);
+    let fields = match kind {
+        Kind::Domain => fields
+            .input("pattern", &mut value, "example.org or *tube*")
+            .help("example.org also covers its subdomains; =example.org only that name; * matches any text. A pasted link works too."),
+        Kind::Ip => fields.input("pattern", &mut value, "10.0.0.0/8, 1.2.3.4 or 192.168.*"),
+        Kind::GeoIp => {
+            let options = COUNTRIES.iter().map(|(v, l)| (v.to_string(), l.to_string()));
+            fields.options("country", &mut value, options.collect(), "Country")
+        }
+        Kind::GeoSite => fields
+            .input("pattern", &mut value, "category-ru, youtube, google…")
+            .help("A list name from the MetaCubeX geo database (meta-rules-dat)."),
+        Kind::App => fields
+            .input("pattern", &mut value, "Telegram or chrome.exe")
+            .help("The process name, as Logs and Connections show it."),
+        Kind::Inbound => {
+            fields.options("inbound", &mut value, inbounds.to_vec(), "Inbound")
+        }
+        Kind::Everything => fields,
+    };
+    let enter = fields.choice("route", &mut r.action, Route::ALL).show(ui);
+    if picked != kind {
+        ui.data_mut(|d| d.insert_temp(key, picked));
+        // A country or an inbound means nothing as typed text, and back.
+        let closed = |k| matches!(k, Kind::GeoIp | Kind::Inbound);
+        if closed(picked) || closed(kind) {
+            value.clear();
+        }
+        kind = picked;
+    }
+    r.pattern = match kind {
+        Kind::Everything => "*".into(),
+        _ if value.trim().is_empty() => String::new(),
+        k => format!("{}{}", k.prefix(), value.trim()),
+    };
+    enter && !r.pattern.is_empty()
+}
+
+/// How a rule's pattern reads in the list: inbounds by their label.
+fn pattern_label(labels: &Labels, pattern: &str) -> Option<String> {
+    let name = pattern.strip_prefix("inbound:")?;
+    labels.get(name).map(str::to_owned)
 }
 
 fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
@@ -478,45 +608,42 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
             );
         }
     });
-    let mut mode = *cx.get(&MODE);
-    kit::settings_card(ui, |ui| {
-        kit::settings_row(ui, "Mode", "", |ui| {
-            let options = [
-                (Mode::Rule, "Rule"),
-                (Mode::Global, "Global"),
-                (Mode::Direct, "Direct"),
-            ];
-            if kit::segmented(ui, &mut mode, &options) {
-                cx.update("mode", &MODE, move |m| *m = mode);
-            }
-        });
-    });
-    kit::page_note(
-        ui,
-        if mode == Mode::Rule {
-            "Rules are checked from the top; the first match wins. Traffic that no rule matches goes through the proxy."
-        } else {
-            mode_help(mode)
-        },
-    );
-
+    // Listeners other plugins label (`vless` → "VLESS clients").
+    let labels = cx.core().labels();
+    let inbounds = labels.inbounds().to_vec();
     ListEditor::new(&RULES)
-        .add_form("Add routing rule", || Rule { id: Id::random(), pattern: String::new(), action: Route::Proxy }, |ui, r, width| {
-            kit::Fields::new(width)
-                .input("pattern", &mut r.pattern, "Domain, IP, network or app:Name")
-                .help("example.org also covers its subdomains; =example.org only that name; *tube* any name containing tube. Also 10.0.0.0/8, geosite:category-ru, geoip:ru, app:Telegram (an app by its process name, as Logs and Connections show it), or a pasted link.")
-                .choice("route", &mut r.action, Route::ALL)
-                .show(ui)
-                && !r.pattern.trim().is_empty()
-        })
-        .column(Column::edit("Pattern", "Domain, IP or network", |r: &mut Rule| &mut r.pattern))
-        .column(Column::custom("Type", 74., |ui, _, r: &Rule| {
+        .add_form(
+            "Add routing rule",
+            || Rule {
+                id: Id::random(),
+                pattern: String::new(),
+                action: Route::Proxy,
+            },
+            move |ui, r, width| rule_fields(ui, &inbounds, r, width),
+        )
+        .column(
+            Column::edit("Pattern", "Domain, IP or network", |r: &mut Rule| {
+                &mut r.pattern
+            })
+            .display(move |r: &Rule| {
+                pattern_label(&labels, &r.pattern).unwrap_or_else(|| r.pattern.clone())
+            }),
+        )
+        .column(Column::custom("Type", 80., |ui, _, r: &Rule| {
             kit::badge(ui, kind(&r.pattern), kit::Tone::Neutral);
         }))
-        .column(Column::choice("Route", 120., |r: &mut Rule| &mut r.action, Route::ALL))
+        .column(Column::choice(
+            "Route",
+            120.,
+            |r: &mut Rule| &mut r.action,
+            Route::ALL,
+        ))
         .subtitle(move |rows, i| rule_note(rows, i, &geo_status))
-        .empty(Icon::Routing, "No routing rules", "Everything goes through the proxy.")
-        .paused(mode != Mode::Rule)
+        .empty(
+            Icon::Routing,
+            "No routing rules",
+            "Everything goes through the proxy.",
+        )
         .show(ui, cx);
 }
 
@@ -534,7 +661,7 @@ fn rule_note(
         ));
     }
     // Say, imported from a desktop install.
-    if rows[i].pattern.starts_with("app:") && (Platform::is_flatpak() || Platform::is_docker()) {
+    if rows[i].pattern.starts_with("app:") && (sandboxed()) {
         return Some((
             "Never used: Flatpak and Docker hide other apps".into(),
             kit::Tone::Warning,
@@ -581,10 +708,9 @@ mod tests {
         let CoreRule::DomainRegex(regex, _) = &made else {
             panic!("{made:?}")
         };
-        assert!(same_rule(&made, &format!("DomainRegex {regex}")));
-        assert!(!same_rule(&made, "DomainRegex ^other$"));
+        assert_eq!(made.reported(), format!("DomainRegex {regex}"));
         let net = core_rule(&rule("10.0.0.0/8"), &Target::Direct).unwrap();
-        assert!(same_rule(&net, "IPCIDR 10.0.0.0/8"));
+        assert_eq!(net.reported(), "IPCIDR 10.0.0.0/8");
     }
     #[test]
     fn patterns_normalize_without_ambiguous_prefixes() {
@@ -606,7 +732,9 @@ mod tests {
             action: Route::Direct,
         };
         assert_eq!(
-            core_rule(&g, &servers::main_target()).unwrap().wire(),
+            core_rule(&g, &Target::Group(servers::MAIN.into()))
+                .unwrap()
+                .wire(),
             "RULE-SET,geoip-ru,DIRECT"
         );
         assert_eq!(
@@ -619,7 +747,9 @@ mod tests {
                 pattern: pattern.into(),
                 action: Route::Direct,
             };
-            core_rule(&r, &servers::main_target()).unwrap().wire()
+            core_rule(&r, &Target::Group(servers::MAIN.into()))
+                .unwrap()
+                .wire()
         };
         // A domain also covers its subdomains, as in other proxy apps.
         let suffix = "DOMAIN-REGEX,^(?:.*\\.)?example\\.org$,DIRECT";

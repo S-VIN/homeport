@@ -29,11 +29,7 @@ fn expand(input: DeriveInput) -> Result<TokenStream> {
     let ident = &input.ident;
     let name =
         name.ok_or_else(|| Error::new_spanned(ident, "expected #[table(name = \"...\")]"))?;
-    if name.is_empty()
-        || name.contains('\0')
-        || name.eq_ignore_ascii_case("hk_documents")
-        || name.to_ascii_lowercase().starts_with("sqlite_")
-    {
+    if name.is_empty() || name.contains('\0') || name.to_ascii_lowercase().starts_with("sqlite_") {
         return Err(Error::new_spanned(
             ident,
             "invalid or reserved SQLite table name",
@@ -102,7 +98,6 @@ fn expand(input: DeriveInput) -> Result<TokenStream> {
             fn from_row(row: &#sql::Row<'_>) -> #sql::Result<Self> {
                 Ok(Self { #(#ids: row.get(#names)?),* })
             }
-            fn legacy_id(&self) -> String { self.#key_field.to_string() }
             fn key(&self) -> &Self::Key { &self.#key_field }
         }
     }

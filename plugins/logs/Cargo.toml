@@ -6,7 +6,6 @@ publish = false
 
 [dependencies]
 rproxy-kernel = { path = "../../crates/kernel" }
-plugin-servers = { path = "../servers" }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }

@@ -162,11 +162,62 @@ impl Ui {
         }
         self.frame(vec![Event::PointerGone]);
     }
+    /// A tab: in the bottom navigation, the sidebar or the More menu (page
+    /// titles and settings sections may say the same words).
+    fn tab(&self, label: &str) -> Option<Rect> {
+        fn all(s: &Shape, label: &str, out: &mut Vec<Rect>) {
+            match s {
+                Shape::Text(t) if t.galley.text() == label => {
+                    out.push(Rect::from_min_size(t.pos, t.galley.size()))
+                }
+                Shape::Vec(v) => v.iter().for_each(|s| all(s, label, out)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for s in &self.shapes {
+            let mut here = Vec::new();
+            all(&s.shape, label, &mut here);
+            found.extend(here.into_iter().filter(|r| {
+                s.clip_rect.contains_rect(*r) && r.min.y >= 0. && r.max.y <= self.size.y
+            }));
+        }
+        let sidebar = self.size.x >= 960.;
+        found
+            .iter()
+            .copied()
+            .find(|r| {
+                if sidebar {
+                    r.max.x <= 184.
+                } else {
+                    r.min.y >= self.size.y - 48.
+                }
+            })
+            .or_else(|| found.last().copied())
+    }
     fn navigate(&mut self, label: &str) {
-        if self.text(label).is_none() {
+        let tab = |ui: &Self| {
+            ui.tab(label)
+                .filter(|r| ui.size.x >= 960. && r.max.x <= 184. || r.min.y >= ui.size.y - 48.)
+        };
+        if tab(self).is_none() {
             self.click("More");
         }
-        self.click(label);
+        let pos = self
+            .tab(label)
+            .unwrap_or_else(|| panic!("missing tab {label} at {:?}", self.size))
+            .center();
+        for pressed in [true, false] {
+            self.frame(vec![
+                Event::PointerMoved(pos),
+                Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ]);
+        }
         for _ in 0..2 {
             self.frame(vec![]);
         }
@@ -204,10 +255,8 @@ impl Ui {
 async fn shell_navigation_connections_and_configuration_fit_supported_sizes() {
     let dir = tempfile::tempdir().unwrap();
     let host = Host::start(rproxy::catalog(), dir.path()).await.unwrap();
-    host.kernel().set_plugin("auto-select", false).unwrap();
-    host.restart().await;
     let source = rproxy_kernel::Id::random();
-    let proxies = plugin_format_uri::parse_links("vless://00000000-0000-0000-0000-000000000001@example.org:443?security=tls#%F0%9F%87%AB%F0%9F%87%AE%20Helsinki%20%E2%9A%A1\nvless://00000000-0000-0000-0000-000000000002@example.net:443?security=tls#%F0%9F%87%A9%F0%9F%87%AA%20Frankfurt\nvless://00000000-0000-0000-0000-000000000003@example.com:443?security=tls#%F0%9F%9A%80%20A%20very%20long%20server%20name%20that%20must%20truncate").unwrap();
+    let proxies = plugin_subscriptions::formats::uri::parse_links("vless://00000000-0000-0000-0000-000000000001@example.org:443?security=tls#%F0%9F%87%AB%F0%9F%87%AE%20Helsinki%20%E2%9A%A1\nvless://00000000-0000-0000-0000-000000000002@example.net:443?security=tls#%F0%9F%87%A9%F0%9F%87%AA%20Frankfurt\nvless://00000000-0000-0000-0000-000000000003@example.com:443?security=tls#%F0%9F%9A%80%20A%20very%20long%20server%20name%20that%20must%20truncate").unwrap();
     host.kernel()
         .cx_for("servers")
         .call(plugin_servers::ReplaceFromSource {
@@ -293,7 +342,7 @@ async fn shell_navigation_connections_and_configuration_fit_supported_sizes() {
             }
             ui.click("Clear filter");
             assert!(ui.text("alpha.example:443").is_some());
-            host.kernel().set_plugin("auto-select", true).unwrap();
+            host.kernel().set_plugin("logs", false).unwrap();
             ui.navigate("Settings");
             assert!(
                 ui.text("Restart").is_some(),
@@ -304,7 +353,7 @@ async fn shell_navigation_connections_and_configuration_fit_supported_sizes() {
             }
             ui.click("Restart");
             assert!(ui.text("Restart now").is_some());
-            host.kernel().set_plugin("auto-select", false).unwrap();
+            host.kernel().set_plugin("logs", true).unwrap();
             ui.navigate("Settings");
             ui.session.file_finished(Ok(Some((
                 "my-config.sqlite3".into(),
@@ -346,7 +395,6 @@ static POPUP_REVIEW_PLUGIN: rproxy_kernel::Plugin = rproxy_kernel::Plugin {
     description: "",
     category: rproxy_kernel::categories::NETWORK,
     requires: &[],
-    provides: &[],
     required: true,
     default_enabled: true,
     platforms: rproxy_kernel::Platform::ALL,
@@ -506,9 +554,10 @@ async fn popup_review_scenarios() {
                 "plugins",
                 "settings",
                 "connections",
-                "inbounds",
+                "local-proxy",
                 "routing",
                 "checks",
+                "deploy",
                 "system-proxy-help",
             ] {
                 if std::env::var("RPROXY_CAPTURE_SCENARIOS")
@@ -528,7 +577,7 @@ async fn popup_review_scenarios() {
                         // The selected server's chip leads the status bar.
                         for pressed in [true,false] { let pos=Pos2::new(70.,16.);ui.frame(vec![Event::PointerMoved(pos),Event::PointerButton {pos,button:egui::PointerButton::Primary,pressed,modifiers:Default::default()}]); }
                     },
-                    "listeners" if size[0]<960.=>{ if ui.text("No proxy port").is_some(){ui.click("No proxy port");}else{continue;} },
+                    "listeners" if size[0]<960.=>{ if ui.text("127.0.0.1:20808").is_some(){ui.click("127.0.0.1:20808");}else{continue;} },
                     "more" if ui.text("More").is_some()=>ui.click("More"),
                     "schedule"=>{ui.navigate("Settings");ui.reveal("Every day");ui.click("Every day");},
                     "tooltip"=>{ui.navigate("Settings");ui.hover("Export…");},
@@ -537,10 +586,11 @@ async fn popup_review_scenarios() {
                     "plugins"=>ui.navigate("Plugins"),
                     "settings"=>ui.navigate("Settings"),
                     "connections"=>ui.navigate("Connections"),
-                    "inbounds"=>ui.navigate("Proxy ports"),
+                    "local-proxy"=>ui.navigate("Local proxy"),
                     "routing"=>ui.navigate("Routing"),
                     "checks"=>ui.navigate("Tests"),
-                    "system-proxy-help"=>{ui.navigate("Proxy ports");ui.hover("System proxy");},
+                    "deploy"=>ui.navigate("Install to server"),
+                    "system-proxy-help"=>{ui.navigate("Local proxy");ui.reveal("System proxy");ui.hover("System proxy");},
                     "subscription-tooltip"=>{ui.navigate("Subscriptions");let label=if std::env::var_os("RPROXY_TEST_SUBSCRIPTION_URLS").is_some(){"allvsub.cc"}else{"Helsinki ⚡"}; if ui.text(label).is_some(){ui.hover(label);}else{continue;}},
                     "connection-tooltip" if size[0]<960.=>{ui.frame(vec![Event::PointerMoved(Pos2::new(70.,16.))]);for _ in 0..12 { ui.frame(vec![]); }},
                     "server-tooltip"|"server-details"=>{

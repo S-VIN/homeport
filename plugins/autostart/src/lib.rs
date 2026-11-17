@@ -14,12 +14,16 @@ pub static PLUGIN: Plugin = Plugin {
     ..Plugin::DEFAULT
 };
 
-/// Whether rproxy starts at login (re-read after every change).
+/// Whether rproxy starts at login, as the system has it (re-read after every change).
 pub static ENABLED: State<bool> = State::new("autostart.enabled");
+/// What the user chose. A login entry that disappeared (an app reinstall, a
+/// cleanup tool) is created again at the next start.
+static WANTED: State<bool> = State::new("autostart.wanted");
 
 pub struct SetAutostart(pub bool);
 impl Op for SetAutostart {
     type Reply = ();
+    const SAVES: bool = true;
 }
 
 /// The login entry for this executable, as the system stores it.
@@ -36,60 +40,68 @@ pub fn set(enable: bool) -> io::Result<()> {
     entry::write(if enable { Some(expected()?) } else { None }.as_deref())
 }
 
-/// An entry written by another copy of rproxy (moved, updated or reinstalled) now
-/// starts this one. Development builds leave the user's entry alone.
-fn refresh() -> io::Result<()> {
-    match entry::read()? {
-        Some(current) if !cfg!(debug_assertions) && current != expected()? => set(true),
-        _ => Ok(()),
+/// The entry the Background portal writes for a Flatpak, read through the
+/// manifest's `xdg-config/autostart:ro` (the sandbox's own config is elsewhere).
+fn portal_entry() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let app = std::env::var("FLATPAK_ID").ok()?;
+    Some(std::path::PathBuf::from(home).join(format!(".config/autostart/{app}.desktop")))
+}
+
+/// Whether a login entry exists now.
+fn present() -> bool {
+    if Platform::is_flatpak() {
+        portal_entry().is_some_and(|p| p.is_file())
+    } else {
+        entry::read().is_ok_and(|e| e.is_some())
     }
 }
 
-fn setup(p: &mut Setup) -> Result<()> {
-    // The portal cannot be asked whether autostart is on; remember its last answer.
-    let portal_on = p.data_dir().join("portal-autostart");
-    let on = portal_on.clone();
-    p.live(&ENABLED, move || {
-        if Platform::is_flatpak() {
-            on.is_file()
-        } else {
-            entry::read().is_ok_and(|e| e.is_some())
-        }
-    });
-    if !Platform::is_flatpak() {
-        p.on(|_: Cx, _: Started| async move {
-            refresh().map_err(|e| Error::msg(format!("Cannot update the login entry: {e}")))
-        });
+/// Make the system match the user's choice.
+async fn apply(on: bool) -> Result<()> {
+    if Platform::is_flatpak() {
+        portal::request(on).await.map(drop).map_err(Error::msg)
+    } else {
+        set(on).map_err(|e| Error::msg(format!("Cannot update the login entry: {e}")))
     }
-    p.handle(move |cx: Cx, SetAutostart(on): SetAutostart| {
-        let portal_on = portal_on.clone();
-        async move {
-            let enabled = if Platform::is_flatpak() {
-                let enabled = portal::request(on).await.map_err(Error::msg)?;
-                let marker = if enabled {
-                    std::fs::write(&portal_on, b"1")
-                } else {
-                    std::fs::remove_file(&portal_on).or_else(|e| {
-                        if e.kind() == io::ErrorKind::NotFound {
-                            Ok(())
-                        } else {
-                            Err(e)
-                        }
-                    })
-                };
-                marker.map_err(|e| Error::msg(e.to_string()))?;
-                enabled
-            } else {
-                set(on).map_err(|e| Error::msg(e.to_string()))?;
-                entry::read().is_ok_and(|e| e.is_some())
-            };
-            cx.set_live(&ENABLED, enabled);
-            Ok(())
-        }
-    });
+}
+
+/// At start: an entry that is gone while wanted comes back, and an entry from
+/// another copy of rproxy (moved, updated or reinstalled) now starts this one.
+/// Development builds leave the user's entry alone.
+async fn repair(cx: Cx, _: Started) -> Result<()> {
+    if cfg!(debug_assertions) {
+        return Ok(());
+    }
+    let wanted = *cx.get(&WANTED);
+    let stale = !Platform::is_flatpak()
+        && matches!((entry::read(), expected()), (Ok(Some(e)), Ok(x)) if e != x);
+    if wanted && (!present() || stale) {
+        apply(true).await?;
+    }
+    cx.set_live(&ENABLED, present());
+    Ok(())
+}
+
+async fn set_autostart(cx: Cx, SetAutostart(on): SetAutostart) -> Result<()> {
+    apply(on).await?;
+    cx.write(move |w| {
+        w.set(&WANTED, on);
+        Ok(())
+    })
+    .await?;
+    cx.set_live(&ENABLED, present());
+    Ok(())
+}
+
+fn setup(p: &mut Setup) -> Result<()> {
+    p.live(&ENABLED, present);
+    p.setting(&WANTED);
+    p.on(repair);
+    p.handle(set_autostart);
     p.fill(&SETTINGS_SECTIONS, "toggle", 0, |ui, cx, _| {
         let mut on = *cx.live(&ENABLED);
-        kit::settings_row(ui, "Start at login", "", |ui| {
+        kit::settings_row(ui, "Enabled", "", |ui| {
             if kit::toggle_named(ui, &mut on, "", "Start at login").changed() {
                 cx.submit("autostart", SetAutostart(on));
             }
@@ -115,7 +127,7 @@ fn desktop_entry(exe: &str) -> io::Result<String> {
         }
     }
     Ok(format!(
-        "[Desktop Entry]\nType=Application\nName=rproxy\nExec=\"{}\" --background\nTerminal=false\n",
+        "[Desktop Entry]\nType=Application\nName=rproxy\nExec=\"{}\" background\nTerminal=false\n",
         quoted.replace('\\', "\\\\")
     ))
 }
@@ -129,7 +141,7 @@ fn launch_agent(exe: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
 <plist version=\"1.0\">\n<dict>\n\t<key>Label</key>\n\t<string>io.github.rproxy</string>\n\t<key>ProgramArguments</key>\n\t<array>\n\
-\t\t<string>{xml}</string>\n\t\t<string>--background</string>\n\t</array>\n\t<key>RunAtLoad</key>\n\t<true/>\n</dict>\n</plist>\n"
+\t\t<string>{xml}</string>\n\t\t<string>background</string>\n\t</array>\n\t<key>RunAtLoad</key>\n\t<true/>\n</dict>\n</plist>\n"
     )
 }
 
@@ -203,7 +215,7 @@ mod entry {
     use winreg::{RegKey, enums::HKEY_CURRENT_USER};
     const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
     pub fn content(exe: &std::path::Path) -> io::Result<String> {
-        Ok(format!("\"{}\" --background", exe.display()))
+        Ok(format!("\"{}\" background", exe.display()))
     }
     pub fn read() -> io::Result<Option<String>> {
         let run = match RegKey::predef(HKEY_CURRENT_USER).open_subkey(RUN) {
@@ -242,7 +254,7 @@ mod entry {
 }
 
 /// Flatpak: `org.freedesktop.portal.Background.RequestBackground`. The portal
-/// writes the host autostart entry itself and returns whether it is on.
+/// writes the host autostart entry itself (`flatpak run --command=rproxy … background`).
 mod portal {
     #[cfg(target_os = "linux")]
     pub async fn request(enable: bool) -> Result<bool, String> {
@@ -280,7 +292,7 @@ mod portal {
                 Value::from("Start rproxy in the background when you log in."),
             ),
             ("autostart", Value::from(enable)),
-            ("commandline", Value::from(vec!["rproxy", "--background"])),
+            ("commandline", Value::from(vec!["rproxy", "background"])),
         ]);
         let background = zbus::Proxy::new(
             &bus,
@@ -320,7 +332,7 @@ mod tests {
     fn desktop_entries_quote_the_executable() {
         let entry = desktop_entry("/home/a b/100%/rproxy\"$").unwrap();
         assert!(
-            entry.contains("Exec=\"/home/a b/100%%/rproxy\\\\\"\\\\$\" --background\n"),
+            entry.contains("Exec=\"/home/a b/100%%/rproxy\\\\\"\\\\$\" background\n"),
             "{entry}"
         );
         assert!(desktop_entry("/bad\npath").is_err());
@@ -328,7 +340,7 @@ mod tests {
     #[test]
     fn launch_agents_run_the_app_binary_at_load() {
         let plist = launch_agent("/Applications/R&D.app/Contents/MacOS/rproxy");
-        assert!(plist.contains("<string>/Applications/R&amp;D.app/Contents/MacOS/rproxy</string>\n\t\t<string>--background</string>"));
+        assert!(plist.contains("<string>/Applications/R&amp;D.app/Contents/MacOS/rproxy</string>\n\t\t<string>background</string>"));
         assert!(plist.contains("<key>RunAtLoad</key>\n\t<true/>"));
         assert!(plist.contains("<string>io.github.rproxy</string>"));
     }

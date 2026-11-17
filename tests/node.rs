@@ -1,13 +1,13 @@
 //! A VLESS node and a client on one machine, both with the real bundled mihomo:
 //! VLESS + REALITY + XHTTP end to end, the camouflage site for probes without a
-//! key, and the exit-server chain (client → entry → node → internet).
-use plugin_exit_server as exit;
-use plugin_inbounds::{INBOUNDS, Inbound};
+//! key, and the chain-exit chain (client → entry → node → internet).
+use plugin_chain_exit as exit;
+use plugin_local_proxy::{PROXY, Proxy, SaveProxy};
 use plugin_routing::{Route, Rule};
 use plugin_servers::{SERVERS, Select};
 use plugin_subscriptions::Source;
-use plugin_vless_server as vless;
-use rproxy_kernel::{Host, Id, Kernel, Update, list::Add, list::Save};
+use plugin_vless_inbound as vless;
+use rproxy_kernel::{Host, Id, Kernel, Update, list::Add};
 use std::{
     net::SocketAddr,
     sync::{
@@ -102,7 +102,7 @@ async fn connect_proxy() -> (u16, Arc<AtomicUsize>) {
 }
 
 /// Host with the default listener moved to a free port (tests run in parallel).
-async fn start(dir: &std::path::Path, enable: &[&str]) -> (Arc<Host>, Inbound) {
+async fn start(dir: &std::path::Path, enable: &[&str]) -> (Arc<Host>, Proxy) {
     let host = Host::start(rproxy::catalog(), dir).await.unwrap();
     if !enable.is_empty() {
         for id in enable {
@@ -111,25 +111,20 @@ async fn start(dir: &std::path::Path, enable: &[&str]) -> (Arc<Host>, Inbound) {
         host.restart().await;
     }
     let k = host.kernel();
-    until(&k, "seeded listener", |k| {
-        !k.snapshot().get(&INBOUNDS).is_empty()
-    })
-    .await;
-    let mut inbound = k.snapshot().get(&INBOUNDS)[0].clone();
+    let mut inbound = (*k.snapshot().get(&PROXY)).clone();
     inbound.port = free_port().await;
-    inbound.enabled = true;
-    k.cx_for("inbounds")
-        .call(Save::new(&INBOUNDS, inbound.clone()))
+    k.cx_for("local-proxy")
+        .call(SaveProxy(inbound.clone()))
         .await
         .unwrap();
     (host, inbound)
 }
 
-/// An exit node: VLESS server on a free port, client traffic leaves directly.
+/// An exit node: VLESS inbound on a free port, client traffic leaves directly.
 async fn node(dir: &std::path::Path) -> (Arc<Host>, String, u16) {
-    let (host, _) = start(dir, &["vless-server"]).await;
+    let (host, _) = start(dir, &["vless-inbound"]).await;
     let k = host.kernel();
-    let cx = k.cx_for("vless-server");
+    let cx = k.cx_for("vless-inbound");
     let port = free_port().await;
     cx.call(Update {
         state: &vless::CONFIG,
@@ -239,7 +234,7 @@ async fn vless_node_serves_clients_and_disguises_itself() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn exit_server_chains_after_the_selected_server_and_fails_closed() {
+async fn chain_exit_chains_after_the_selected_server_and_fails_closed() {
     let (node_dir, client_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let (node, link, _) = node(node_dir.path()).await;
     let (entry, tunnels) = connect_proxy().await;
@@ -287,7 +282,7 @@ async fn exit_server_chains_after_the_selected_server_and_fails_closed() {
         .unwrap();
 
     // The exit: the node's link, added on the Exit server page.
-    k.cx_for("exit-server")
+    k.cx_for("chain-exit")
         .call(Add::new(
             &exit::EXITS,
             exit::Exit {
@@ -314,7 +309,7 @@ async fn exit_server_chains_after_the_selected_server_and_fails_closed() {
         tunnels.load(Ordering::SeqCst) > before,
         "the exit was dialed through the entry"
     );
-    let ms = k.cx_for("exit-server").call(exit::CheckExit).await.unwrap();
+    let ms = k.cx_for("chain-exit").call(exit::CheckExit).await.unwrap();
     assert!(ms > 0);
 
     // No entry: traffic stops instead of going to the exit directly.
@@ -335,7 +330,7 @@ async fn exit_server_chains_after_the_selected_server_and_fails_closed() {
         .call(Select::manual(Some(server)))
         .await
         .unwrap();
-    k.cx_for("exit-server").call(exit::Use(None)).await.unwrap();
+    k.cx_for("chain-exit").call(exit::Use(None)).await.unwrap();
     let before = tunnels.load(Ordering::SeqCst);
     let r = via(inbound.port)
         .get(format!("http://127.0.0.1:{target}/"))

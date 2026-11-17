@@ -6,7 +6,6 @@ publish = false
 
 [dependencies]
 rproxy-kernel = { path = "../../crates/kernel" }
-rproxy-contracts = { path = "../../crates/contracts" }
 plugin-servers = { path = "../servers" }
 serde = { workspace = true }
 reqwest = { workspace = true }

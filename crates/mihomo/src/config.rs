@@ -95,6 +95,22 @@ impl Rule {
             }
         }
     }
+    /// How the core names the rule in connections and logs (`DomainRegex ^…$`).
+    pub fn reported(&self) -> String {
+        let (kind, payload) = match self {
+            Self::Match(_) => return "Match".into(),
+            Self::Domain(d, _) => ("Domain", d.clone()),
+            Self::DomainSuffix(d, _) => ("DomainSuffix", d.clone()),
+            Self::DomainKeyword(d, _) => ("DomainKeyword", d.clone()),
+            Self::DomainRegex(r, _) => ("DomainRegex", r.clone()),
+            Self::IpCidr { net, .. } => ("IPCIDR", net.to_string()),
+            Self::GeoIp(c, _) => ("GeoIP", c.clone()),
+            Self::InName(n, _) => ("InName", n.clone()),
+            Self::ProcessName(n, _) => ("ProcessName", n.clone()),
+            Self::RuleSet { name, .. } => ("RuleSet", name.clone()),
+        };
+        format!("{kind} {payload}")
+    }
     fn target(&self) -> &Target {
         match self {
             Self::Match(t)
@@ -119,6 +135,8 @@ pub struct Proxy {
     pub server: String,
     pub port: u16,
     pub options: Map<String, Value>,
+    /// Dial the server through another proxy or group (a chain).
+    pub dialer: Option<Target>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -227,6 +245,9 @@ pub struct Fragment {
     pub rule_providers: Vec<RuleProvider>,
     /// At most one plugin may turn the tunnel on.
     pub tun: Option<Tun>,
+    /// Names of this fragment in the user's words: proxies, groups, listeners
+    /// and rules as the core reports them ([`Rule::reported`]). Not sent to the core.
+    pub labels: Vec<(String, String)>,
 }
 impl Fragment {
     pub fn rules(stage: Stage, rules: impl IntoIterator<Item = Rule>) -> Self {
@@ -352,14 +373,17 @@ impl Config {
             return Err(format!("A rule references an unknown rule set: {}", r.wire()));
         }
         for p in &cfg.proxies {
-            if let Some(via) = p.options.get("dialer-proxy") {
-                let via = via.as_str().unwrap_or_default();
-                if via == p.name || !known(&Target::Group(via.to_owned())) {
-                    return Err(format!(
-                        "Proxy {} is dialed through an unknown proxy {via}",
-                        p.name
-                    ));
-                }
+            if p.options.contains_key("dialer-proxy") {
+                return Err(format!("Proxy {} sets dialer-proxy in its options", p.name));
+            }
+            if let Some(via) = &p.dialer
+                && (via.wire() == p.name || !known(via))
+            {
+                return Err(format!(
+                    "Proxy {} is dialed through an unknown proxy {}",
+                    p.name,
+                    via.wire()
+                ));
             }
         }
         for g in &cfg.groups {
@@ -432,6 +456,9 @@ pub fn render(cfg: &Config, sys: &System<'_>, listeners: &[&Listener]) -> Value 
             v["type"] = json!(p.protocol);
             v["server"] = json!(p.server);
             v["port"] = json!(p.port);
+            if let Some(via) = &p.dialer {
+                v["dialer-proxy"] = json!(via.wire());
+            }
             v
         })
         .collect();
@@ -665,6 +692,7 @@ mod tests {
             server: "127.0.0.1".into(),
             port: 1,
             options: Map::new(),
+            dialer: None,
         }
     }
 

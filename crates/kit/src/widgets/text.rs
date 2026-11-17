@@ -14,15 +14,6 @@ pub fn hint(ui: &mut Ui, text: impl Into<String>) -> Response {
         false,
     )
 }
-/// One line of help under a page header: what the page does, in plain words.
-/// It wraps, so touch screens (no hover) read it too.
-pub fn page_note(ui: &mut Ui, text: impl Into<String>) {
-    let text = RichText::new(text)
-        .size(theme::SMALL)
-        .color(theme::palette(ui).muted);
-    text_label(ui, text, true, false);
-    ui.add_space(theme::SPACE_M);
-}
 /// Small muted column caption.
 pub fn caption(ui: &mut Ui, text: impl Into<String>) -> Response {
     text_label(

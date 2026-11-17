@@ -1,8 +1,8 @@
 use super::*;
 
-/// A row of a settings card: label with optional help on the left (on hover;
-/// a line under the label on phones, which have no hover), the control on the
-/// right; stacks under a narrow width. Rows after the first get a divider.
+/// A row of a settings card: label with an optional help tooltip on the left,
+/// the control on the right; stacks under a narrow width. Rows after the first
+/// get a divider.
 pub fn settings_row(ui: &mut Ui, label: &str, help: &str, control: impl FnOnce(&mut Ui)) {
     let p = theme::palette(ui);
     settings_item(
@@ -12,12 +12,7 @@ pub fn settings_row(ui: &mut Ui, label: &str, help: &str, control: impl FnOnce(&
             let response =
                 ui.add(egui::Label::new(RichText::new(label).color(p.foreground)).wrap());
             if !help.is_empty() {
-                if phone(ui) {
-                    let help = RichText::new(help).size(theme::SMALL).color(p.muted);
-                    ui.add(egui::Label::new(help).wrap());
-                } else {
-                    response.on_hover_text(help);
-                }
+                response.on_hover_text(help);
             }
         },
         control,
@@ -106,7 +101,8 @@ pub fn settings_caption(ui: &mut Ui, text: &str, help: Option<&str>) {
     }
 }
 
-const PERIODS: [(u32, &str); 7] = [
+const PERIODS: [(u32, &str); 8] = [
+    (0, "Off"),
     (900, "Every 15 minutes"),
     (3600, "Every hour"),
     (10800, "Every 3 hours"),
@@ -115,7 +111,7 @@ const PERIODS: [(u32, &str); 7] = [
     (86400, "Every day"),
     (604800, "Every week"),
 ];
-/// Period picker: presets, or a number of minutes or hours under "Custom".
+/// Period picker: Off (0), presets, or a number of minutes or hours under "Custom".
 /// Returns true when the user committed a new value.
 pub fn interval(ui: &mut Ui, id: impl egui::AsIdSalt, value: &mut u32) -> bool {
     let key = egui::Id::unique(("kit-interval", id));

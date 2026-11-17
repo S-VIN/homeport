@@ -21,8 +21,8 @@ services:
     <<: *service
     image: ${RPROXY_IMAGE:-ghcr.io/s-vin/rproxy:latest}
     init: true
-    command: [web, --listen, "127.0.0.1:${RPROXY_UI_PORT:-20800}", --data-dir, /data]
     environment:
+      RPROXY_LISTEN: 127.0.0.1:${RPROXY_UI_PORT:-20800}
       TZ: ${TZ:-UTC}
       RPROXY_PUBLIC_ORIGIN: https://${RPROXY_PANEL_DOMAIN:?Set RPROXY_PANEL_DOMAIN}:${HTTPS_PORT:-8443}
     volumes:

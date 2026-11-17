@@ -133,7 +133,6 @@ pub struct ListEditor<'s, T: Record> {
     columns: Vec<Column<'s, T>>,
     add: Option<(&'s str, Box<dyn Fn() -> T + 's>, Fields<'s, T>)>,
     ordered: bool,
-    paused: bool,
     empty: Option<(Icon, &'s str, &'s str)>,
     subtitle: Option<Subtitle<'s, T>>,
     leading: Option<Leading<'s, T>>,
@@ -147,7 +146,6 @@ impl<'s, T: Record> ListEditor<'s, T> {
             columns: Vec::new(),
             add: None,
             ordered: true,
-            paused: false,
             empty: None,
             subtitle: None,
             leading: None,
@@ -172,12 +170,6 @@ impl<'s, T: Record> ListEditor<'s, T> {
     /// Hide the reorder arrows (order still persists).
     pub fn unordered(mut self) -> Self {
         self.ordered = false;
-        self
-    }
-    /// The rows don't apply right now (say, a mode overrides them): they fade
-    /// but stay editable, and the add bar stays as it is.
-    pub fn paused(mut self, paused: bool) -> Self {
-        self.paused = paused;
         self
     }
     pub fn no_headers(mut self) -> Self {
@@ -209,7 +201,6 @@ impl<'s, T: Record> ListEditor<'s, T> {
         }
         self.add_bar(ui, cx, list);
         let rows = cx.get(self.state);
-        let top = ui.cursor().top();
         kit::list_card(ui, |ui| {
             // Rows sit inside `kit::row`'s inset; header and rows share one layout.
             let width = ui.available_width() - 2. * (theme::INSET - theme::SPACE_S);
@@ -242,15 +233,6 @@ impl<'s, T: Record> ListEditor<'s, T> {
                     }
                 });
         });
-        if self.paused {
-            // One veil over the card fades every part alike.
-            let card = egui::Rect::from_x_y_ranges(
-                ui.max_rect().x_range(),
-                top..=ui.cursor().top() - theme::SPACE_M,
-            );
-            let veil = kit::colors(ui).background.gamma_multiply(0.5);
-            ui.painter().rect_filled(card, theme::RADIUS, veil);
-        }
         ui.data_mut(|d| d.insert_temp(editing_id, editing));
     }
 

@@ -18,7 +18,10 @@ dist
 **/*.sqlite3*
 web/pkg
 
-/docker
+# The install-to-server plugin embeds these templates at compile time.
+/docker/*
+!/docker/compose.yaml
+!/docker/Caddyfile
 /.dockerignore
 /*.md
 /scripts/package.py

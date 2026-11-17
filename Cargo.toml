@@ -7,11 +7,10 @@ description = "Proxy manager: kernel + plugins, one egui UI for the desktop wind
 
 [features]
 default = ["desktop"]
-desktop = ["dep:plugin-autostart", "dep:eframe", "dep:ksni", "dep:rfd", "dep:winit", "dep:zbus", "dep:futures-util", "dep:tray-icon", "dep:objc2", "dep:objc2-app-kit"]
+desktop = ["dep:plugin-autostart", "dep:plugin-install-to-server", "dep:eframe", "dep:ksni", "dep:rfd", "dep:winit", "dep:zbus", "dep:futures-util", "dep:tray-icon", "dep:objc2", "dep:objc2-app-kit"]
 
 [dependencies]
 rproxy-kernel = { path = "crates/kernel" }
-rproxy-contracts = { path = "crates/contracts" }
 rproxy-remote = { path = "crates/remote" }
 egui = { workspace = true, features = ["default_fonts"] }
 eframe = { workspace = true, optional = true }
@@ -23,20 +22,16 @@ uuid = { workspace = true }
 image = { workspace = true }
 plugin-servers = { path = "plugins/servers" }
 plugin-subscriptions = { path = "plugins/subscriptions" }
-plugin-format-uri = { path = "plugins/format-uri" }
-plugin-format-xray = { path = "plugins/format-xray" }
-plugin-format-clash = { path = "plugins/format-clash" }
 plugin-name-filters = { path = "plugins/name-filters" }
 plugin-routing = { path = "plugins/routing" }
-plugin-inbounds = { path = "plugins/inbounds" }
+plugin-local-proxy = { path = "plugins/local-proxy" }
 plugin-health-checks = { path = "plugins/health-checks" }
-plugin-auto-select = { path = "plugins/auto-select" }
 plugin-autostart = { path = "plugins/autostart", optional = true }
-plugin-exit-server = { path = "plugins/exit-server" }
-plugin-vless-server = { path = "plugins/vless-server" }
+plugin-chain-exit = { path = "plugins/chain-exit" }
+plugin-vless-inbound = { path = "plugins/vless-inbound" }
 plugin-connections = { path = "plugins/connections" }
 plugin-logs = { path = "plugins/logs" }
-plugin-deploy-server = { path = "plugins/deploy-server" }
+plugin-install-to-server = { path = "plugins/install-to-server", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3.7", optional = true }

@@ -20,6 +20,7 @@ mod page;
 mod pieces;
 mod properties;
 mod settings;
+mod table;
 mod text;
 
 pub use buttons::*;
@@ -30,4 +31,5 @@ pub use page::*;
 pub use pieces::*;
 pub use properties::*;
 pub use settings::*;
+pub use table::*;
 pub use text::*;

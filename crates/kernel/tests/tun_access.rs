@@ -47,11 +47,7 @@ async fn saved_tun_authorization_failure_keeps_the_core_available_and_is_not_ret
     .await
     .unwrap();
     assert!(k.core_status().running());
-    assert!(
-        !k.core_api().configs().await.unwrap()["tun"]["enable"]
-            .as_bool()
-            .unwrap_or(false)
-    );
+    assert!(!k.core_api().tun_enabled().await.unwrap());
     cx.call(Update {
         state: &SETTINGS,
         change: Box::new(|s| s.off = true),

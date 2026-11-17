@@ -1,7 +1,7 @@
 //! Geo rules, connections, configuration exchange and the tunnel with the real bundled mihomo.
-use plugin_inbounds::INBOUNDS;
+use plugin_local_proxy::{PROXY, SaveProxy};
 use plugin_routing::{GEO, Route, Rule};
-use rproxy_kernel::{Host, Id, Kernel, list::Add, list::Save};
+use rproxy_kernel::{Host, Id, Kernel, list::Add};
 use std::{sync::Arc, time::Duration};
 
 async fn until(k: &Kernel, what: &str, secs: u64, ok: impl Fn(&Kernel) -> bool) {
@@ -18,21 +18,15 @@ async fn until(k: &Kernel, what: &str, secs: u64, ok: impl Fn(&Kernel) -> bool) 
 async fn start(dir: &std::path::Path) -> Arc<Host> {
     let host = Host::start(rproxy::catalog(), dir).await.unwrap();
     let k = host.kernel();
-    until(&k, "seeded listener", 15, |k| {
-        !k.snapshot().get(&INBOUNDS).is_empty()
-    })
-    .await;
-    let mut inbound = k.snapshot().get(&INBOUNDS)[0].clone();
+    let mut inbound = (*k.snapshot().get(&PROXY)).clone();
     inbound.port = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap()
         .local_addr()
         .unwrap()
         .port();
-    // The seeded listener starts off when its default port is taken (another rproxy).
-    inbound.enabled = true;
-    k.cx_for("inbounds")
-        .call(Save::new(&INBOUNDS, inbound))
+    k.cx_for("local-proxy")
+        .call(SaveProxy(inbound))
         .await
         .unwrap();
     host
@@ -98,7 +92,7 @@ fn via(port: u16) -> reqwest::Client {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "registers a Cloudflare WARP device"]
 async fn warp_is_set_up_and_carries_traffic_as_the_exit() {
-    use plugin_exit_server as exit;
+    use plugin_chain_exit as exit;
     let dir = tempfile::tempdir().unwrap();
     let host = start(dir.path()).await;
     let k = host.kernel();
@@ -132,7 +126,7 @@ async fn warp_is_set_up_and_carries_traffic_as_the_exit() {
             .await
             .unwrap();
     } else {
-        k.cx_for("exit-server")
+        k.cx_for("chain-exit")
             .call(rproxy_kernel::Update {
                 state: &exit::SETTINGS,
                 change: Box::new(|s| s.entry = exit::Entry::Direct),
@@ -140,10 +134,10 @@ async fn warp_is_set_up_and_carries_traffic_as_the_exit() {
             .await
             .unwrap();
     }
-    let cx = k.cx_for("exit-server");
+    let cx = k.cx_for("chain-exit");
     cx.call(exit::SetUpWarp).await.unwrap();
     assert_eq!(exit::plan(&k.snapshot()), Some(exit::Plan::Warp));
-    let port = k.snapshot().get(&INBOUNDS)[0].port;
+    let port = k.snapshot().get(&PROXY).port;
     let mut trace = String::new();
     for _ in 0..5 {
         if let Ok(r) = via(port)
@@ -209,7 +203,7 @@ async fn connections_show_live_traffic_and_can_be_closed() {
         ))
         .await
         .unwrap();
-    let port = k.snapshot().get(&INBOUNDS)[0].port;
+    let port = k.snapshot().get(&PROXY).port;
     let origin = slow_origin("held", Duration::from_secs(6)).await;
     let send = move || {
         tokio::spawn(async move {
@@ -302,9 +296,9 @@ async fn failed_tunnel_authorization_keeps_the_saved_setting_and_proxy() {
     let k = host.kernel();
     // Library hosts do not configure a supervisor, so they cannot open OS dialogs.
     let error = k
-        .cx_for("inbounds")
+        .cx_for("local-proxy")
         .call(rproxy_kernel::Update {
-            state: &plugin_inbounds::DEVICE,
+            state: &plugin_local_proxy::PROXY,
             change: Box::new(|d| d.tun = true),
         })
         .await
@@ -314,11 +308,35 @@ async fn failed_tunnel_authorization_keeps_the_saved_setting_and_proxy() {
         "{error}"
     );
     assert!(k.core_status().running(), "the rest keeps working");
-    assert!(!k.snapshot().get(&plugin_inbounds::DEVICE).tun);
+    assert!(!k.snapshot().get(&plugin_local_proxy::PROXY).tun);
+    assert!(!k.core_api().tun_enabled().await.unwrap());
+    host.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_installation_that_cannot_start_explains_why_and_saves_nothing() {
+    use plugin_install_to_server::{DEPLOYMENTS, Install, STATUS, Status, deploy::Options};
+    let dir = tempfile::tempdir().unwrap();
+    let host = start(dir.path()).await;
+    let k = host.kernel();
+    let cx = k.cx_for("install-to-server");
+    let error = cx.call(Install(Options::default())).await.unwrap_err();
+    assert_eq!(error.message, "Enter the server address.");
+    // A port nothing listens on: SSH is unreachable.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let options = Options {
+        host: "127.0.0.1".into(),
+        ssh_port: closed.local_addr().unwrap().port(),
+        password: "secret".into(),
+        ..Options::default()
+    };
+    drop(closed);
+    let error = cx.call(Install(options)).await.unwrap_err();
     assert!(
-        !k.core_api().configs().await.unwrap()["tun"]["enable"]
-            .as_bool()
-            .unwrap_or(false)
+        error.message.contains("does not answer over SSH"),
+        "{error}"
     );
+    assert_eq!(*k.snapshot().live(&STATUS), Status::Failed(error.message));
+    assert!(k.snapshot().get(&DEPLOYMENTS).is_empty());
     host.shutdown().await;
 }

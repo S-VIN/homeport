@@ -9,13 +9,16 @@ pub mod supervisor;
 pub use config::*;
 pub use ipnet;
 pub use process::{
-    ApplyReport, BINARY, CHECK_LANES, Controller, Delay, Mihomo, bundled, bundled_version,
-    executable, installed, installed_update, installed_version_file, local_address, newer,
-    unprivileged, version_of,
+    ApplyReport, BINARY, CHECK_LANES, Connection, Connections, Controller, Delay, Metadata, Mihomo,
+    RuleSetStatus, bundled, bundled_version, executable, installed, installed_update,
+    installed_version_file, local_address, newer, version_of,
 };
 
 #[cfg(windows)]
-use rproxy_core_helper::windows_job;
+mod windows_job;
+
+/// The URL delay tests fetch unless a plugin sets its own (any 2xx/204 site).
+pub const PROBE_URL: &str = "https://www.gstatic.com/generate_204";
 
 /// Every HTTP client of the app starts here: TLS uses ring (installed once).
 pub fn http() -> reqwest::ClientBuilder {

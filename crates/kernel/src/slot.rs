@@ -46,12 +46,25 @@ pub(crate) struct Contributions<P>(pub Vec<Contribution<P>>);
 /// "why is this server excluded?". Answers are collected in plugin order.
 pub struct Hook<I: ?Sized + 'static, O: 'static> {
     pub id: &'static str,
+    /// One decision, one plugin (see [`Self::exclusive`]).
+    pub exclusive: bool,
     _p: PhantomData<fn(&I) -> O>,
 }
 impl<I: ?Sized, O> Hook<I, O> {
     pub const fn new(id: &'static str) -> Self {
         Self {
             id,
+            exclusive: false,
+            _p: PhantomData,
+        }
+    }
+    /// A decision only one plugin may make (e.g. where traffic goes). When
+    /// two enabled plugins answer it, the later one is ignored and the user
+    /// is told which plugins conflict.
+    pub const fn exclusive(id: &'static str) -> Self {
+        Self {
+            id,
+            exclusive: true,
             _p: PhantomData,
         }
     }

@@ -3891,24 +3891,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
-name = "plugin-auto-select"
-version = "0.2.0"
-dependencies = [
- "plugin-servers",
- "plugin-subscriptions",
- "rproxy-contracts",
- "rproxy-kernel",
- "serde",
- "tokio",
-]
-
-[[package]]
 name = "plugin-autostart"
 version = "0.2.0"
 dependencies = [
  "rproxy-kernel",
  "winreg",
  "zbus",
+]
+
+[[package]]
+name = "plugin-chain-exit"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "plugin-servers",
+ "reqwest",
+ "rproxy-kernel",
+ "serde",
+ "serde_json",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -3922,78 +3923,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "plugin-deploy-server"
-version = "0.1.0"
-dependencies = [
- "plugin-routing",
- "plugin-subscriptions",
- "plugin-vless-server",
- "rproxy-kernel",
- "russh",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "url",
-]
-
-[[package]]
-name = "plugin-exit-server"
-version = "0.1.0"
-dependencies = [
- "base64 0.23.1",
- "plugin-format-uri",
- "plugin-servers",
- "reqwest",
- "rproxy-kernel",
- "serde",
- "serde_json",
- "x25519-dalek",
-]
-
-[[package]]
-name = "plugin-format-clash"
-version = "0.2.0"
-dependencies = [
- "plugin-servers",
- "plugin-subscriptions",
- "rproxy-kernel",
- "serde-saphyr",
- "serde_json",
-]
-
-[[package]]
-name = "plugin-format-uri"
-version = "0.2.0"
-dependencies = [
- "base64 0.23.1",
- "percent-encoding",
- "plugin-servers",
- "plugin-subscriptions",
- "rproxy-kernel",
- "serde_json",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "plugin-format-xray"
-version = "0.2.0"
-dependencies = [
- "plugin-servers",
- "plugin-subscriptions",
- "rproxy-kernel",
- "serde_json",
- "uuid",
-]
-
-[[package]]
 name = "plugin-health-checks"
 version = "0.2.0"
 dependencies = [
  "plugin-servers",
  "reqwest",
- "rproxy-contracts",
  "rproxy-kernel",
  "serde",
  "tokio",
@@ -4001,11 +3935,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "plugin-inbounds"
+name = "plugin-install-to-server"
+version = "0.1.0"
+dependencies = [
+ "plugin-routing",
+ "rproxy-kernel",
+ "russh",
+ "serde",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "plugin-local-proxy"
 version = "0.2.0"
 dependencies = [
- "plugin-servers",
- "plugin-subscriptions",
  "reqwest",
  "rproxy-kernel",
  "serde",
@@ -4019,7 +3963,6 @@ dependencies = [
 name = "plugin-logs"
 version = "0.1.0"
 dependencies = [
- "plugin-servers",
  "reqwest",
  "rproxy-kernel",
  "serde_json",
@@ -4049,9 +3992,12 @@ dependencies = [
 name = "plugin-servers"
 version = "0.2.0"
 dependencies = [
+ "percent-encoding",
  "rproxy-kernel",
  "serde",
  "serde_json",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -4064,12 +4010,14 @@ dependencies = [
  "reqwest",
  "rproxy-kernel",
  "serde",
+ "serde-saphyr",
  "serde_json",
  "url",
+ "uuid",
 ]
 
 [[package]]
-name = "plugin-vless-server"
+name = "plugin-vless-inbound"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
@@ -4517,25 +4465,20 @@ dependencies = [
  "ksni",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
- "plugin-auto-select",
  "plugin-autostart",
+ "plugin-chain-exit",
  "plugin-connections",
- "plugin-deploy-server",
- "plugin-exit-server",
- "plugin-format-clash",
- "plugin-format-uri",
- "plugin-format-xray",
  "plugin-health-checks",
- "plugin-inbounds",
+ "plugin-install-to-server",
+ "plugin-local-proxy",
  "plugin-logs",
  "plugin-name-filters",
  "plugin-routing",
  "plugin-servers",
  "plugin-subscriptions",
- "plugin-vless-server",
+ "plugin-vless-inbound",
  "reqwest",
  "rfd",
- "rproxy-contracts",
  "rproxy-kernel",
  "rproxy-remote",
  "serde_json",
@@ -4547,24 +4490,6 @@ dependencies = [
  "windows-sys 0.61.2",
  "winit",
  "zbus",
-]
-
-[[package]]
-name = "rproxy-contracts"
-version = "0.2.0"
-dependencies = [
- "rproxy-kernel",
-]
-
-[[package]]
-name = "rproxy-core-helper"
-version = "0.2.0"
-dependencies = [
- "libc",
- "serde",
- "serde_json",
- "tempfile",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4615,13 +4540,13 @@ dependencies = [
  "ipnet",
  "libc",
  "reqwest",
- "rproxy-core-helper",
  "rustls",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

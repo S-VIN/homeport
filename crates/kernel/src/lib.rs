@@ -42,12 +42,12 @@ pub use host::{Host, Session};
 pub use id::{Id, hex, now, random_bytes};
 pub use kernel::{Cx, Input, Kernel, LiveMark, Notice, NoticeAction, Started};
 pub use op::{Claim, JobSpec, Next, Op, Rank};
-pub use plugin::{Category, Platform, Plugin, Policy, categories};
+pub use plugin::{Category, Platform, Plugin, categories};
 pub use rproxy_derive::Table;
 pub use rproxy_kit as kit;
 pub use rproxy_kit::egui;
 pub use rproxy_mihomo as mihomo;
-pub use setup::{Setup, Tool};
+pub use setup::Setup;
 pub use slot::{Hook, Slot};
 pub use state::{Changed, Record, Snapshot, State, Write};
 pub use ui::{Page, PageSpec, Request, UiCx};
@@ -131,7 +131,7 @@ pub mod prelude {
     pub use crate::shell::{PANELS, SETTINGS_SECTIONS, STATUS};
     pub use crate::{
         Category, Changed, Claim, Cx, Error, Hook, Id, JobSpec, Next, Op, Page, PageSpec, Platform,
-        Plugin, Policy, Rank, Record, Request, Result, Set, Setup, Slot, Snapshot, Started, State,
-        Table, Tool, UiCx, Update, Write, bail, categories, choices, hex, now, random_bytes,
+        Plugin, Rank, Record, Request, Result, Set, Setup, Slot, Snapshot, Started, State, Table,
+        UiCx, Update, Write, bail, categories, choices, hex, now, random_bytes,
     };
 }

@@ -97,13 +97,12 @@ macro_rules! sql_text {
     };
 }
 
-/// A closed set of labelled values: `Display` (the label), `FromStr`, `ALL`
-/// and a TEXT column. Saved data holds the stable value name (`Proxy`), so a
-/// label can change freely; labels it had before are still read:
-/// `Proxy => "Proxy" | "Via server"`.
+/// A closed set of labelled values: `Display` (the label), `FromStr` (name or
+/// label), `ALL` and a TEXT column. Saved data holds the stable value name
+/// (`Proxy`), so a label can change freely: `Proxy => "Via server"`.
 #[macro_export]
 macro_rules! choices {
-    ($(#[$m:meta])* $vis:vis enum $name:ident { $($item:ident => $label:literal $(| $old:literal)*),+ $(,)? }) => {
+    ($(#[$m:meta])* $vis:vis enum $name:ident { $($item:ident => $label:literal),+ $(,)? }) => {
         $(#[$m])*
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         $vis enum $name { $($item),+ }
@@ -122,7 +121,7 @@ macro_rules! choices {
         impl std::str::FromStr for $name {
             type Err = ();
             fn from_str(s: &str) -> std::result::Result<Self, ()> {
-                $(if s == stringify!($item) || s == $label $(|| s == $old)* {
+                $(if s == stringify!($item) || s == $label {
                     return Ok(Self::$item);
                 })+
                 Err(())
@@ -168,7 +167,7 @@ mod tests {
     use crate::store::rusqlite::Connection;
 
     crate::choices! {
-        enum Route { Proxy => "Proxy" | "Via server" }
+        enum Route { Proxy => "Via server" }
     }
 
     #[test]

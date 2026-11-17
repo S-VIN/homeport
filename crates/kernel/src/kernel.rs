@@ -1,5 +1,5 @@
 use crate::{
-    Error, Op, Plugin, Policy, Result, RunId, Setup, State,
+    Error, Op, Plugin, Result, RunId, Setup, State,
     changes::Changes,
     core::{Core, CoreApi},
     jobs::{JobContext, Jobs, Task, Timing},
@@ -111,16 +111,6 @@ pub(crate) fn resolve(
     catalog: &[&'static Plugin],
     saved: &HashMap<String, bool>,
 ) -> (Vec<&'static Plugin>, Vec<(String, String)>) {
-    let mut policies: HashMap<&str, Policy> = HashMap::new();
-    for p in catalog {
-        if let Some(old) = policies.insert(p.category.id, p.category.policy) {
-            assert_eq!(
-                old, p.category.policy,
-                "category {} declared with two policies",
-                p.category.id
-            );
-        }
-    }
     let mut why = Vec::new();
     let mut on: Vec<&'static Plugin> = catalog
         .iter()
@@ -139,30 +129,7 @@ pub(crate) fn resolve(
         why.push((p.id.to_owned(), p.platforms_note().unwrap_or_default()));
         false
     });
-    // Exclusive categories: the first enabled plugin wins.
-    let mut taken: HashMap<&str, &str> = HashMap::new();
-    on.retain(|p| {
-        if p.category.policy == Policy::Exclusive {
-            if let Some(winner) = taken.get(p.category.id) {
-                let winner = catalog
-                    .iter()
-                    .find(|c| c.id == *winner)
-                    .map_or(*winner, |c| c.name);
-                why.push((
-                    p.id.to_owned(),
-                    format!(
-                        "{winner} is already on; only one {} plugin can run",
-                        p.category.name.to_lowercase()
-                    ),
-                ));
-                return false;
-            }
-            taken.insert(p.category.id, p.id);
-        }
-        true
-    });
-    // A requirement names a plugin or a capability it provides.
-    let gives = |p: &Plugin, need: &str| p.id == need || p.provides.contains(&need);
+    let gives = |p: &Plugin, need: &str| p.id == need;
     loop {
         let before = on.len();
         let present = on.clone();
@@ -328,8 +295,8 @@ impl Kernel {
                 k.core.monitor().await;
             }
         });
-        for warning in &k.reg.warnings {
-            k.notify_error("Settings", warning);
+        for (title, warning) in &k.reg.warnings {
+            k.notify_error(title, warning);
         }
         k.dispatch(Started);
         Ok(k)
@@ -736,19 +703,7 @@ impl Kernel {
     pub fn set_plugin(&self, id: &str, enabled: bool) -> Result<()> {
         let mut t = self.saved_toggles.lock().unwrap();
         self.ensure_open()?;
-        let mut changes = vec![(id.to_owned(), enabled)];
-        if enabled
-            && let Some(p) = self.catalog.iter().find(|p| p.id == id)
-            && p.category.policy == Policy::Exclusive
-        {
-            for other in self
-                .catalog
-                .iter()
-                .filter(|o| o.id != id && o.category.id == p.category.id)
-            {
-                changes.push((other.id.to_owned(), false));
-            }
-        }
+        let changes = vec![(id.to_owned(), enabled)];
         self.store.transaction(|tx| {
             for (id, on) in &changes {
                 tx.put(&PluginRow {
@@ -792,16 +747,15 @@ impl Cx {
             job: self.job.clone(),
         }
     }
-    pub fn kernel(&self) -> &Arc<Kernel> {
-        &self.k
-    }
     pub fn plugin_id(&self) -> &'static str {
         self.plugin.map_or("kernel", |p| self.k.reg.plugins[p].id)
     }
-    /// The plugin's own folder, as `Setup::data_dir`.
+    /// The plugin's own folder (created), as `Setup::data_dir`.
     pub fn data_dir(&self) -> std::path::PathBuf {
         let id = self.plugin.map_or("kernel", |p| self.k.reg.plugins[p].id);
-        self.k.reg.data_dir.join("plugins").join(id)
+        let dir = self.k.reg.data_dir.join("plugins").join(id);
+        let _ = std::fs::create_dir_all(&dir);
+        dir
     }
     pub fn plugin_name(&self) -> &'static str {
         self.plugin.map_or("rproxy", |p| self.k.reg.plugins[p].name)
@@ -1128,7 +1082,7 @@ fn migrate(store: &Store, reg: &mut Registry) -> Result<()> {
     reg.migrations.sort_by_key(|(p, v, _)| (*p, *v));
     let fresh: Vec<bool> = store.transaction(|tx| {
         (0..reg.plugins.len())
-            .map(|p| Ok(!installed(tx, reg.plugins[p].id)? && !has_data(tx.sql(), reg, p)?))
+            .map(|p| Ok(!installed(tx, reg.plugins[p].id)?))
             .collect()
     })?;
     for (_, _, p) in &reg.persist {
@@ -1182,7 +1136,7 @@ fn load_cells(
                     set_aside(tx, name)?;
                     let owner = plugin.map_or("rproxy", |i| reg.plugins[i].name);
                     let warning = format!("{owner}: the saved setting {name} could not be read, so its default is used.");
-                    warnings.push(warning);
+                    warnings.push(("Settings", warning));
                     default()
                 }
                 (Err(e), _) => return Err(e),
@@ -1191,7 +1145,7 @@ fn load_cells(
         }
         Ok(cells)
     })?;
-    reg.warnings = warnings;
+    reg.warnings.extend(warnings);
     Ok(cells)
 }
 
@@ -1213,31 +1167,6 @@ fn installed(tx: &crate::store::Tx<'_>, plugin: &str) -> Result<bool> {
     Ok(tx
         .get::<crate::state::MigrationRow>(format!("{plugin}|installed").as_str())?
         .is_some())
-}
-
-/// The plugin saved something before: one of its tables exists or it has a
-/// setting (for data from before the `installed` row existed).
-fn has_data(
-    sql: &crate::store::rusqlite::Connection,
-    reg: &Registry,
-    plugin: usize,
-) -> Result<bool> {
-    let id = reg.plugins[plugin].id;
-    let exists = |table: &str| -> Result<bool> {
-        let query = "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?)";
-        Ok(sql.query_row(query, [table], |r| r.get(0))?)
-    };
-    let setting: bool = sql.query_row(
-        "SELECT EXISTS(SELECT 1 FROM kernel_settings WHERE substr(id, 1, length(?1) + 1) = ?1 || '.')",
-        [id],
-        |r| r.get(0),
-    )?;
-    let mut tables = reg
-        .tables
-        .iter()
-        .filter(|(_, state)| reg.owner(state) == Some(plugin))
-        .map(|(table, _)| *table);
-    Ok(setting || tables.try_fold(false, |found, t| Ok::<_, Error>(found || exists(t)?))?)
 }
 
 /// What an op read when it started (see [`Cx::input`]).
@@ -1297,7 +1226,6 @@ mod tests {
         description: "",
         category: categories::NETWORK,
         requires: &[],
-        provides: &[],
         required: false,
         default_enabled: true,
         platforms: if cfg!(windows) {

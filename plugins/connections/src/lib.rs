@@ -7,11 +7,11 @@
 //! saved, no transaction); the UI repaints when it changes.
 use plugin_servers::{self as servers, Server};
 use rproxy_kernel::{
+    core::Labels,
     kit::{self, theme},
     prelude::*,
     shell::panel_title,
 };
-use serde_json::Value;
 use std::{
     collections::HashMap,
     time::{Duration, Instant},
@@ -82,12 +82,9 @@ impl Traffic {
         }
         (up, down)
     }
-    fn update(&mut self, v: &Value, clock: &mut Clock) {
+    fn update(&mut self, v: &mihomo::Connections, clock: &mut Clock) {
         let now = Instant::now();
-        let (up_total, down_total) = (
-            v["uploadTotal"].as_u64().unwrap_or(0),
-            v["downloadTotal"].as_u64().unwrap_or(0),
-        );
+        let (up_total, down_total) = (v.upload_total, v.download_total);
         if let Some(at) = clock.sampled {
             let secs = now.duration_since(at).as_secs_f64().max(0.1);
             self.up_rate = (up_total.saturating_sub(self.up_total) as f64 / secs) as u64;
@@ -100,51 +97,32 @@ impl Traffic {
             .map(|c| (c.id.clone(), c.started))
             .collect();
         let mut seen = HashMap::new();
-        self.conns = v["connections"]
-            .as_array()
-            .map(Vec::as_slice)
-            .unwrap_or_default()
+        self.conns = v
+            .connections
             .iter()
-            .filter(|c| {
-                let inbound = c["metadata"]["inboundName"].as_str().unwrap_or("");
-                !rproxy_kernel::mihomo::config::internal_listener(inbound)
-            })
+            .filter(|c| !mihomo::config::internal_listener(&c.metadata.inbound_name))
             .map(|c| {
-                let m = &c["metadata"];
-                let host = m["host"]
-                    .as_str()
-                    .filter(|h| !h.is_empty())
-                    .or_else(|| m["destinationIP"].as_str())
-                    .unwrap_or("?");
-                let id = c["id"].as_str().unwrap_or_default().to_owned();
-                let chain: Vec<String> = c["chains"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|x| x.as_str().map(str::to_owned))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let m = &c.metadata;
+                let host = [&m.host, &m.destination_ip]
+                    .into_iter()
+                    .find(|h| !h.is_empty())
+                    .map_or("?", |h| h.as_str());
                 let conn = Conn {
-                    target: match &m["destinationPort"] {
-                        Value::String(p) => format!("{host}:{p}"),
-                        Value::Number(p) => format!("{host}:{p}"),
-                        _ => host.to_owned(),
+                    target: match m.destination_port {
+                        Some(p) => format!("{host}:{p}"),
+                        None => host.to_owned(),
                     },
-                    network: m["network"].as_str().unwrap_or("").to_uppercase(),
-                    process: m["process"].as_str().unwrap_or("").to_owned(),
-                    rule: match (
-                        c["rule"].as_str().unwrap_or(""),
-                        c["rulePayload"].as_str().unwrap_or(""),
-                    ) {
+                    network: m.network.to_uppercase(),
+                    process: m.process.clone(),
+                    rule: match (c.rule.as_str(), c.rule_payload.as_str()) {
                         (r, "") => r.to_owned(),
                         (r, p) => format!("{r} {p}"),
                     },
-                    up: c["upload"].as_u64().unwrap_or(0),
-                    down: c["download"].as_u64().unwrap_or(0),
-                    started: old.get(&id).copied().unwrap_or(now),
-                    chain,
-                    id,
+                    up: c.upload,
+                    down: c.download,
+                    started: old.get(&c.id).copied().unwrap_or(now),
+                    chain: c.chains.clone(),
+                    id: c.id.clone(),
                 };
                 let server = conn.chain.iter().find_map(|n| n.parse::<Id>().ok());
                 seen.insert(conn.id.clone(), (server, conn.up, conn.down));
@@ -219,22 +197,14 @@ fn setup(p: &mut Setup) -> Result<()> {
     Ok(())
 }
 
-/// What a connection went through, in words.
-fn route(snap: &Snapshot, chain: &[String]) -> String {
-    let servers = snap.get(&servers::SERVERS);
-    let name = |n: &str| -> Option<String> {
-        if let Ok(id) = n.parse::<Id>() {
-            return servers.iter().find(|s| s.id == id).map(|s| s.name.clone());
-        }
-        match n {
-            "DIRECT" => Some("Direct".into()),
-            "REJECT" | "REJECT-DROP" => Some("Blocked".into()),
-            "exit" => Some("Exit server".into()),
-            "warp" => Some("WARP".into()),
-            _ => None,
-        }
-    };
-    let parts: Vec<String> = chain.iter().filter_map(|n| name(n)).collect();
+/// What a connection went through, in words: its outbounds, not the groups
+/// that picked them.
+fn route(labels: &Labels, chain: &[String]) -> String {
+    let parts: Vec<&str> = chain
+        .iter()
+        .filter(|n| !labels.is_group(n))
+        .filter_map(|n| labels.get(n))
+        .collect();
     if parts.is_empty() {
         chain.first().cloned().unwrap_or_default()
     } else {
@@ -273,7 +243,7 @@ fn ui(p: &mut Setup) {
 }
 
 fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
-    let snap = cx.snapshot().clone();
+    let labels = cx.core().labels();
     let t = cx.live(&TRAFFIC);
     let online = t.online;
     let counter = if online {
@@ -332,8 +302,8 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
         .iter()
         .map(|c| {
             // Rules in the user's words ("*.youtube.com"), not the core's.
-            let rule = servers::rule_label(&snap, &c.rule);
-            (Conn { rule, ..c.clone() }, route(&snap, &c.chain))
+            let rule = labels.name(&c.rule).to_owned();
+            (Conn { rule, ..c.clone() }, route(&labels, &c.chain))
         })
         .filter(|(c, r)| matches(c, r))
         .collect();
@@ -355,14 +325,15 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
         if needle.is_empty() {
             kit::list_card(ui, |ui| {
                 if online {
-                    kit::empty(ui, Icon::Activity, "No open connections");
-                    ui.vertical_centered(|ui| {
-                        kit::hint(ui, "Apps that use the proxy show up here.")
-                    });
+                    kit::empty_with(
+                        ui,
+                        Icon::Activity,
+                        "No open connections",
+                        "Apps that use the proxy show up here.",
+                    );
                 } else {
                     kit::empty(ui, Icon::Warning, "Core offline");
                 }
-                ui.add_space(theme::SPACE_M);
             });
         } else {
             kit::empty(ui, Icon::Filter, "Nothing matches");
@@ -503,9 +474,10 @@ mod tests {
             "metadata": {"host": "example.org", "destinationPort": "443", "network": "tcp"}})
         };
         let (mut t, mut clock) = (Traffic::default(), Clock::default());
-        t.update(&serde_json::json!({"uploadTotal": 2, "downloadTotal": 300, "connections": [conn("a", 100), conn("b", 200)]}), &mut clock);
+        let read = |v| serde_json::from_value::<mihomo::Connections>(v).unwrap();
+        t.update(&read(serde_json::json!({"uploadTotal": 2, "downloadTotal": 300, "connections": [conn("a", 100), conn("b", 200)]})), &mut clock);
         assert_eq!(t.by_server(server), (2, 300));
-        t.update(&serde_json::json!({"uploadTotal": 3, "downloadTotal": 450, "connections": [conn("b", 350)]}), &mut clock);
+        t.update(&read(serde_json::json!({"uploadTotal": 3, "downloadTotal": 450, "connections": [conn("b", 350)]})), &mut clock);
         assert!(t.active());
         assert_eq!(
             t.by_server(server),

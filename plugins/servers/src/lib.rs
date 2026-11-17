@@ -6,17 +6,18 @@
 //! Extension points for other plugins:
 //! * ops [`ReplaceFromSource`], [`RemoveSource`], [`Select`];
 //! * hooks [`EXCLUDE`] (why a server must not be used), [`SOURCE_LABEL`],
-//!   [`SORT_KEYS`], [`FREEZE`];
-//! * UI zones on the Servers page: [`TOOLBAR`], [`TOOLS`], [`COLUMNS`],
+//!   [`SOURCE_HUE`], [`SOURCE_RANK`], [`ROUTE`], [`FAILOVER`], [`IDLE`],
+//!   [`FREEZE`]; columns ([`column`]) may sort the list;
+//! * UI zones on the Servers page: [`TOOLBAR`], [`COLUMNS`],
 //!   [`DETAILS`] and in the connection card: [`CONNECTION`].
 mod import;
-mod outbound;
+mod link;
 mod ui;
 
-pub use import::Proxy;
-pub use outbound::{Definition, Definitions};
+pub use import::{Options, Proxy};
+pub use link::is_link;
 use rproxy_kernel::{prelude::*, shell::TrayLink};
-use std::{collections::HashSet, sync::Arc};
+use std::collections::HashSet;
 
 pub static PLUGIN: Plugin = Plugin {
     id: "servers",
@@ -44,15 +45,8 @@ choices!(pub enum Protocol {
     WireGuard => "wireguard",
 });
 impl Protocol {
-    /// TCP-based protocols can be pinged with a TCP connect.
-    pub fn tcp(self) -> bool {
-        !matches!(
-            self,
-            Self::Hysteria | Self::Hysteria2 | Self::Tuic | Self::WireGuard
-        )
-    }
     /// TLS is implied by the protocol.
-    pub fn implies_tls(self) -> bool {
+    pub(crate) fn implies_tls(self) -> bool {
         matches!(
             self,
             Self::Hysteria2 | Self::Trojan | Self::AnyTls | Self::Tuic
@@ -69,43 +63,22 @@ pub struct Server {
     pub protocol: Protocol,
     pub address: String,
     pub port: u16,
+    /// Protocol options for mihomo (everything except name, type, server, port).
+    pub options: Options,
 }
 
 pub static SERVERS: State<Vec<Server>> = State::new("servers.list");
-pub static DEFINITIONS: State<Definitions> = State::new("servers.definitions");
 pub static SELECTED: State<Option<Id>> = State::new("servers.selected");
 
 /// Name of the mihomo group that carries user traffic (`select`, or `fallback` with [`FAILOVER`]).
 pub const MAIN: &str = "main";
-pub fn main_target() -> Target {
-    Target::Group(MAIN.into())
-}
-/// How a core rule reads to the user: the core reports e.g.
-/// `DomainRegex ^.*\.youtube\.com$`, the plugin that made it answers
-/// `*.youtube.com`.
-pub static RULE_LABEL: Hook<str, Option<String>> = Hook::new("servers.rule-label");
-/// The user's words for a core rule (see [`RULE_LABEL`]), else the rule itself.
-pub fn rule_label(snap: &Snapshot, rule: &str) -> String {
-    snap.hooks(&RULE_LABEL, rule)
-        .into_iter()
-        .flatten()
-        .next()
-        .unwrap_or_else(|| match rule {
-            // The core's final rule: whatever no other rule caught.
-            "Match" => "Everything else".to_owned(),
-            rule => rule.to_owned(),
-        })
-}
 /// Where traffic sent "via server" goes. A plugin may answer with another
 /// target, e.g. an exit server dialed through `main` (selected → exit → internet).
-pub static ROUTE: Hook<(), Option<Target>> = Hook::new("servers.route");
+pub static ROUTE: Hook<(), Option<Target>> = Hook::exclusive("servers.route");
 /// The target for traffic sent via the server (see [`ROUTE`]).
 pub fn route(snap: &Snapshot) -> Target {
-    snap.hooks(&ROUTE, &())
-        .into_iter()
-        .flatten()
-        .next()
-        .unwrap_or_else(main_target)
+    snap.first(&ROUTE, &())
+        .unwrap_or_else(|| Target::Group(MAIN.into()))
 }
 
 // ---- ops ------------------------------------------------------------------
@@ -159,13 +132,11 @@ impl Op for Select {
 
 async fn replace_source(cx: Cx, op: ReplaceFromSource) -> Result<Replaced> {
     let mut fresh = Vec::new();
-    let mut defs = Vec::new();
     let mut seen = HashSet::new();
     for proxy in op.proxies {
-        let (server, def) = proxy.normalize(op.source)?;
+        let server = proxy.normalize(op.source)?;
         if seen.insert(server.id) {
             fresh.push(server);
-            defs.push(def);
         }
     }
     cx.write(move |w| {
@@ -210,23 +181,9 @@ async fn replace_source(cx: Cx, op: ReplaceFromSource) -> Result<Replaced> {
             list.extend(fresh);
         });
         if let Some(next) = successor {
-            w.set(&SELECTED, Some(next));
-            w.emit(SelectionChanged {
-                from: current,
-                to: Some(next),
-                auto: true,
-            });
-        }
-        let alive: HashSet<Id> = w.get(&SERVERS).iter().map(|s| s.id).collect();
-        w.update(&DEFINITIONS, |d| {
-            let map = Arc::make_mut(d);
-            for def in defs {
-                map.entry(def.fields.id).or_insert_with(|| Arc::new(def));
-            }
-            map.retain(|id, _| alive.contains(id));
-        });
-        if w.get(&SELECTED).is_some_and(|id| !alive.contains(&id)) {
-            w.set(&SELECTED, None);
+            set_selected(w, Some(next), true);
+        } else if current.is_some_and(|id| !w.get(&SERVERS).iter().any(|s| s.id == id)) {
+            set_selected(w, None, true);
         }
         if !added.is_empty() || !removed.is_empty() {
             w.emit(ServersChanged {
@@ -252,6 +209,8 @@ pub struct ServersChanged {
     pub added: Vec<Id>,
     pub removed: Vec<Id>,
 }
+/// The connection changed: by the user, a policy (`auto`) or because the
+/// connected server was refreshed or removed (`auto` too).
 #[derive(Clone, Debug)]
 pub struct SelectionChanged {
     pub from: Option<Id>,
@@ -268,23 +227,31 @@ pub struct Excluded {
 
 // ---- hooks ----------------------------------------------------------------
 
-/// Why a server must not be used. `disconnect` also drops it when selected.
-/// Excluded servers close the list in groups under the caption `group`.
+/// Why a server must not be used. Excluded servers close the list in groups
+/// under the caption `group`.
 #[derive(Clone, Debug)]
 pub struct Exclusion {
     pub reason: String,
     pub group: &'static str,
-    pub disconnect: bool,
+    /// The user's choice (e.g. a name filter): the server is never tested and
+    /// is disconnected when selected. Otherwise (e.g. it failed a test) it is
+    /// only avoided and tested again.
+    pub permanent: bool,
 }
 pub static EXCLUDE: Hook<Server, Option<Exclusion>> = Hook::new("servers.exclude");
 /// Human label of a source id (e.g. the subscription host).
 pub static SOURCE_LABEL: Hook<Id, Option<String>> = Hook::new("servers.source-label");
+/// Priority of a source for automatic choices: lower first (e.g. the
+/// subscription's position in its list). Unranked sources come last.
+pub static SOURCE_RANK: Hook<Id, Option<usize>> = Hook::new("servers.source-rank");
 /// Tag color of a source (index into the kit's tag colors), so every screen
 /// shows a source in the same color. Without an answer the id picks one.
 pub static SOURCE_HUE: Hook<Id, Option<usize>> = Hook::new("servers.source-hue");
-/// Extra sort orders for the list: `(label, key)`; lower keys first.
-pub type SortKey = (&'static str, fn(&Snapshot, &Server) -> i64);
-pub static SORT_KEYS: Hook<(), Vec<SortKey>> = Hook::new("servers.sort-keys");
+/// The sort key of a column: lower keys first in its natural order.
+pub type SortKey = fn(&Snapshot, &Server) -> i64;
+/// Sortable columns, by column id (filled by [`column`]).
+pub(crate) static SORT_KEYS: Hook<(), Option<(&'static str, SortKey)>> =
+    Hook::new("servers.sort-keys");
 /// Keep row order stable (e.g. while a check updates ratings).
 pub static FREEZE: Hook<(), bool> = Hook::new("servers.freeze");
 /// Backup servers for the connected one (the hook input). With an answer and
@@ -299,27 +266,23 @@ pub struct Failover {
     pub url: String,
     pub interval_secs: u32,
 }
-pub static FAILOVER: Hook<Id, Option<Failover>> = Hook::new("servers.failover");
+pub static FAILOVER: Hook<Id, Option<Failover>> = Hook::exclusive("servers.failover");
 /// Why nothing is connected (e.g. "Auto select · No server answers…"), shown in
 /// the connection card instead of the generic hint.
-pub static IDLE: Hook<(), Option<String>> = Hook::new("servers.idle");
+pub static IDLE: Hook<(), Option<String>> = Hook::exclusive("servers.idle");
 
 pub fn exclusion(snap: &Snapshot, s: &Server) -> Option<Exclusion> {
-    snap.hooks(&EXCLUDE, s).into_iter().flatten().next()
+    snap.first(&EXCLUDE, s)
 }
-pub fn source_label(snap: &Snapshot, id: Id) -> String {
-    snap.hooks(&SOURCE_LABEL, &id)
-        .into_iter()
-        .flatten()
-        .next()
+pub(crate) fn source_label(snap: &Snapshot, id: Id) -> String {
+    snap.first(&SOURCE_LABEL, &id)
         .unwrap_or_else(|| "Subscription".into())
 }
+pub fn source_rank(snap: &Snapshot, id: Id) -> Option<usize> {
+    snap.first(&SOURCE_RANK, &id)
+}
 pub fn source_hue(snap: &Snapshot, id: Id) -> usize {
-    snap.hooks(&SOURCE_HUE, &id)
-        .into_iter()
-        .flatten()
-        .next()
-        .unwrap_or_else(|| hue_of(id))
+    snap.first(&SOURCE_HUE, &id).unwrap_or_else(|| hue_of(id))
 }
 /// The preferred tag color of an id (stable across runs).
 pub fn hue_of(id: Id) -> usize {
@@ -329,13 +292,18 @@ pub fn hue_of(id: Id) -> usize {
         % kit::palette::TAG_HUES
 }
 /// The colored tag of a source, truncated to `max_width`.
-pub fn source_tag(ui: &mut egui::Ui, snap: &Snapshot, id: Id, max_width: f32) -> egui::Response {
+pub(crate) fn source_tag(
+    ui: &mut egui::Ui,
+    snap: &Snapshot,
+    id: Id,
+    max_width: f32,
+) -> egui::Response {
     let label = source_label(snap, id);
     kit::tag(ui, &label, source_hue(snap, id), max_width)
 }
 /// Sort key that orders "Auto 2" before "Auto 10" (case-insensitive,
 /// ignoring leading emoji).
-pub fn natural_key(s: &str) -> Vec<(String, u64)> {
+pub(crate) fn natural_key(s: &str) -> Vec<(String, u64)> {
     // Leading flags and emoji ("🇫🇮 Helsinki") do not decide the order.
     let s = s.trim_start_matches(|c: char| !c.is_alphanumeric());
     let mut out = Vec::new();
@@ -358,9 +326,12 @@ pub fn natural_key(s: &str) -> Vec<(String, u64)> {
     }
     out
 }
-pub fn selected(snap: &Snapshot) -> Option<Server> {
-    let id = (*snap.get(&SELECTED))?;
+/// The server with this id.
+pub fn server(snap: &Snapshot, id: Id) -> Option<Server> {
     snap.get(&SERVERS).iter().find(|s| s.id == id).cloned()
+}
+pub fn selected(snap: &Snapshot) -> Option<Server> {
+    server(snap, (*snap.get(&SELECTED))?)
 }
 
 // ---- UI zones ---------------------------------------------------------------
@@ -368,8 +339,6 @@ pub fn selected(snap: &Snapshot) -> Option<Server> {
 /// Inline controls in the Servers toolbar (toggles, task buttons).
 pub static TOOLBAR: Slot<()> =
     Slot::new("servers.toolbar", "Servers page toolbar: compact controls");
-/// Full-width blocks under the toolbar (editors opened from the toolbar).
-pub static TOOLS: Slot<()> = Slot::new("servers.tools", "Servers page: blocks under the toolbar");
 /// Fixed-width cells on the right of every row. Draw a caption when `header`.
 /// Fill it through [`column`].
 pub static COLUMNS: Slot<Cell> =
@@ -390,6 +359,12 @@ pub struct Cell {
     pub(crate) wide: bool,
     /// The server can't be used: its cells are muted.
     pub(crate) excluded: bool,
+    /// Header row: the list's sort (column id and direction).
+    pub(crate) sort: kit::Sort<&'static str>,
+}
+/// Where a clicked column caption leaves its id for the page.
+pub(crate) fn sort_click() -> egui::Id {
+    egui::Id::unique("servers-sort-click")
 }
 
 /// An extra column of the server list (see [`column`]).
@@ -403,6 +378,8 @@ pub struct Column {
     pub help: &'static str,
     /// Hidden when the list is narrow (a phone): only the most useful columns stay.
     pub secondary: bool,
+    /// Click the caption to sort by this key (lower first; again to reverse).
+    pub sort: Option<SortKey>,
 }
 /// Add a column to the server list: `cell` draws one server's value. The list
 /// draws the title, keeps the columns aligned and drops secondary ones on
@@ -412,11 +389,22 @@ pub fn column(
     c: Column,
     cell: impl Fn(&mut egui::Ui, &mut UiCx, &Server) + Send + Sync + 'static,
 ) {
+    if let Some(key) = c.sort {
+        let id = c.id;
+        p.hook(&SORT_KEYS, move |_, _| Some((id, key)));
+    }
     p.fill(&COLUMNS, c.id, c.order, move |ui, cx, props: &Cell| {
         if c.secondary && !props.wide {
             return;
         }
         kit::cell_right(ui, 60., |ui| match &props.server {
+            None if c.sort.is_some() => {
+                let r = ui.scope(|ui| kit::sort_caption(ui, c.title, props.sort.of(c.id), true));
+                if r.inner {
+                    ui.data_mut(|d| d.insert_temp(sort_click(), c.id));
+                }
+                r.response.on_hover_text(c.help);
+            }
             None => drop(kit::caption(ui, c.title).on_hover_text(c.help)),
             Some(s) => {
                 if props.excluded {
@@ -430,12 +418,6 @@ pub fn column(
 
 fn setup(p: &mut Setup) -> Result<()> {
     p.collection(&SERVERS);
-    p.persist(
-        &DEFINITIONS,
-        outbound::register,
-        outbound::read,
-        outbound::sync,
-    );
     p.setting(&SELECTED);
 
     p.handle(replace_source);
@@ -445,7 +427,7 @@ fn setup(p: &mut Setup) -> Result<()> {
     p.on(|cx: Cx, _: Changed| async move {
         let snap = cx.snapshot();
         if let Some(s) = selected(&snap)
-            && let Some(e) = exclusion(&snap, &s).filter(|e| e.disconnect)
+            && let Some(e) = exclusion(&snap, &s).filter(|e| e.permanent)
         {
             cx.call(Select::auto(None, Some(s.id))).await?;
             cx.notify(&format!("Disconnected {}: {}", s.name, e.reason));
@@ -476,11 +458,8 @@ async fn remove_source(cx: Cx, RemoveSource(source): RemoveSource) -> Result<()>
             return Ok(());
         }
         w.update(&SERVERS, |l| l.retain(|s| s.source != source));
-        w.update(&DEFINITIONS, |d| {
-            Arc::make_mut(d).retain(|id, _| !removed.contains(id))
-        });
         if w.get(&SELECTED).is_some_and(|id| removed.contains(&id)) {
-            w.set(&SELECTED, None);
+            set_selected(w, None, true);
         }
         w.emit(ServersChanged {
             source,
@@ -513,51 +492,40 @@ async fn select(cx: Cx, op: Select) -> Result<()> {
         if op.auto.is_some_and(|expected| expected != from) {
             return Err(Error::new("cancelled", "The selection changed meanwhile."));
         }
-        if from != op.id {
-            w.set(&SELECTED, op.id);
-            w.emit(SelectionChanged {
-                from,
-                to: op.id,
-                auto: op.auto.is_some(),
-            });
-        }
+        set_selected(w, op.id, op.auto.is_some());
         Ok(())
     })
     .await
+}
+
+/// The only writer of [`SELECTED`]: every change emits [`SelectionChanged`].
+fn set_selected(w: &mut rproxy_kernel::Write<'_>, to: Option<Id>, auto: bool) {
+    let from = *w.get(&SELECTED);
+    if from != to {
+        w.set(&SELECTED, to);
+        w.emit(SelectionChanged { from, to, auto });
+    }
 }
 
 /// Every server as a mihomo proxy, and the main group that routes through the
 /// selected one (a fallback group when a plugin offers backups).
 fn fragment(snap: &Snapshot) -> Fragment {
     let servers = snap.get(&SERVERS);
-    let defs = snap.get(&DEFINITIONS);
     let proxies: Vec<mihomo::Proxy> = servers
         .iter()
-        .filter_map(|s| {
-            let def = defs.get(&s.id)?;
-            Some(mihomo::Proxy {
-                name: s.id.to_string(),
-                protocol: s.protocol.to_string(),
-                server: s.address.clone(),
-                port: s.port,
-                options: def.options(),
-            })
+        .map(|s| mihomo::Proxy {
+            name: s.id.to_string(),
+            protocol: s.protocol.to_string(),
+            server: s.address.clone(),
+            port: s.port,
+            options: s.options.0.as_ref().clone(),
+            dialer: None,
         })
         .collect();
-    let known: HashSet<Id> = servers
-        .iter()
-        .filter(|s| defs.contains_key(&s.id))
-        .map(|s| s.id)
-        .collect();
+    let known: HashSet<Id> = servers.iter().map(|s| s.id).collect();
     let selected = (*snap.get(&SELECTED)).filter(|id| known.contains(id));
     let failover = selected
-        .and_then(|id| {
-            snap.hooks(&FAILOVER, &id)
-                .into_iter()
-                .flatten()
-                .next()
-                .map(|f| (id, f))
-        })
+        .and_then(|id| snap.first(&FAILOVER, &id).map(|f| (id, f)))
         .map(|(id, mut f)| {
             let mut seen = HashSet::from([id]);
             f.backups.retain(|b| known.contains(b) && seen.insert(*b));
@@ -587,10 +555,18 @@ fn fragment(snap: &Snapshot) -> Fragment {
             selected: selected.map(|id| Target::Proxy(id.to_string())),
         },
     };
+    let mut labels: Vec<(String, String)> = servers
+        .iter()
+        .map(|s| (s.id.to_string(), s.name.clone()))
+        .collect();
+    labels.push((MAIN.into(), "proxy".into()));
+    // The core's final rule: whatever no other rule caught.
+    labels.push(("Match".into(), "Everything else".into()));
     Fragment {
         groups: vec![main],
         proxies,
         rules: vec![(Stage::Final, CoreRule::Match(route(snap)))],
+        labels,
         ..Default::default()
     }
 }
@@ -613,18 +589,21 @@ fn successor(old: &Server, fresh: &[Server]) -> Option<Id> {
 }
 
 /// `(label, value)` lines of a property list.
-pub type Properties = Vec<(String, String)>;
+pub(crate) type Properties = Vec<(String, String)>;
 /// Safe, displayable properties of a server's outbound settings:
 /// `(common, rare)`; rare ones belong under "More details".
-pub fn details(snap: &Snapshot, s: &Server) -> (Properties, Properties) {
-    let defs = snap.get(&DEFINITIONS);
-    let Some(def) = defs.get(&s.id) else {
-        return (vec![], vec![]);
+pub(crate) fn details(s: &Server) -> (Properties, Properties) {
+    let text = |key: &str| {
+        s.options
+            .0
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
     };
-    let f = &def.fields;
+    let tls = s.options.0.get("tls").and_then(|v| v.as_bool()) == Some(true);
     let mut common = vec![(
         "TLS".to_string(),
-        if f.tls == Some(true) || s.protocol.implies_tls() {
+        if tls || s.protocol.implies_tls() {
             "On"
         } else {
             "Off"
@@ -633,22 +612,14 @@ pub fn details(snap: &Snapshot, s: &Server) -> (Properties, Properties) {
     )];
     let mut rare = Vec::new();
     for (label, value, is_rare) in [
-        ("Transport", &f.network, false),
-        (
-            "SNI",
-            if f.sni.is_some() {
-                &f.sni
-            } else {
-                &f.server_name
-            },
-            false,
-        ),
-        ("Fingerprint", &f.fingerprint, true),
-        ("Cipher", &f.cipher, true),
-        ("Flow", &f.flow, true),
+        ("Transport", text("network"), false),
+        ("SNI", text("sni").or_else(|| text("servername")), false),
+        ("Fingerprint", text("client-fingerprint"), true),
+        ("Cipher", text("cipher"), true),
+        ("Flow", text("flow"), true),
     ] {
-        if let Some(v) = value.as_ref().filter(|v| !v.is_empty()) {
-            if is_rare { &mut rare } else { &mut common }.push((label.into(), v.clone()));
+        if let Some(v) = value {
+            if is_rare { &mut rare } else { &mut common }.push((label.into(), v.to_owned()));
         }
     }
     for (label, outer, key) in [
@@ -660,8 +631,9 @@ pub fn details(snap: &Snapshot, s: &Server) -> (Properties, Properties) {
         ("Reality key", "reality-opts", "public-key"),
         ("Reality short ID", "reality-opts", "short-id"),
     ] {
-        if let Some(v) = def
-            .extra
+        if let Some(v) = s
+            .options
+            .0
             .get(outer)
             .and_then(|o| o.get(key))
             .and_then(|v| v.as_str())
@@ -687,6 +659,7 @@ mod tests {
             protocol: Protocol::Vless,
             address: address.into(),
             port,
+            options: Default::default(),
         };
         let old = server("Berlin", "a.example", 443);
         let renamed = server("Berlin 2", "A.example", 443);

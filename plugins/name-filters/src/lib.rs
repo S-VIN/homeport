@@ -1,6 +1,6 @@
 //! # name-filters
 //! Exclude servers whose names match a pattern (`*` matches any text).
-//! Adds a Filters button to the Servers toolbar and answers `servers::EXCLUDE`.
+//! Its own page holds the patterns; the Servers header links to it. Answers `servers::EXCLUDE`.
 use plugin_servers::{self as servers, Exclusion};
 use rproxy_kernel::{kit, prelude::*, ui::Column, ui::ListEditor};
 
@@ -65,90 +65,84 @@ fn setup(p: &mut Setup) -> Result<()> {
             .map(|f| Exclusion {
                 reason: format!("Excluded by name: {}", f.pattern),
                 group: "Excluded by name",
-                disconnect: true,
+                permanent: true,
             })
     });
-    let tool = Tool {
-        id: "filters",
-        label: "Exclude by name",
-        icon: Icon::Filter,
-        order: 50,
-    };
-    p.tool(
-        &servers::TOOLBAR,
-        &servers::TOOLS,
-        tool,
-        |snap| snap.get(&FILTERS).len(),
-        |ui, cx| {
-            let snap = cx.snapshot().clone();
-            let hidden = snap
-                .get(&servers::SERVERS)
-                .iter()
-                .filter(|s| {
-                    snap.get(&FILTERS)
-                        .iter()
-                        .any(|f| wildcard(&f.pattern, &s.name))
-                })
-                .count();
-            if hidden > 0 {
-                kit::hint(
-                    ui,
-                    format!("{} excluded", kit::plural(hidden, "server", "servers")),
-                );
-            }
-            let names: Vec<String> = cx
-                .get(&servers::SERVERS)
-                .iter()
-                .map(|s| s.name.clone())
-                .collect();
-            ListEditor::new(&FILTERS)
-                .unordered()
-                .no_headers()
-                .subtitle(move |rows, i| hint(&rows[i].pattern, &names))
-                .add_form(
-                    "Add pattern",
-                    || Filter {
-                        id: Id::random(),
-                        pattern: String::new(),
-                    },
-                    |ui, f, width| {
-                        let r = kit::input(
-                            ui,
-                            "pattern",
-                            &mut f.pattern,
-                            "Name pattern, e.g. *test*",
-                            width,
-                            false,
-                        )
-                        .on_hover_text(
-                            "Excludes matching names. Matches the whole name; * matches any text.",
-                        );
-                        kit::submitted(ui, &r) && !f.pattern.trim().is_empty()
-                    },
-                )
-                .column(Column::edit("Pattern", "Name pattern", |f: &mut Filter| {
-                    &mut f.pattern
-                }))
-                .column(
-                    Column::custom("Matches", 90., |ui, cx, f: &Filter| {
-                        let n = cx
-                            .get(&servers::SERVERS)
-                            .iter()
-                            .filter(|s| wildcard(&f.pattern, &s.name))
-                            .count();
-                        kit::hint(ui, kit::plural(n, "server", "servers"));
-                    })
-                    .right(),
-                )
-                .empty(
-                    Icon::Filter,
-                    "No exclusions",
-                    "Hide servers whose names match, like exclude-filter in Clash: e.g. *test*.",
-                )
-                .show(ui, cx);
+    // The Servers header keeps a shortcut with the number of patterns.
+    p.fill(&servers::TOOLBAR, "filters", 50, |ui, cx, _| {
+        let n = cx.get(&FILTERS).len();
+        if kit::tool_button(ui, Icon::Filter, "Exclude by name", n, false).clicked() {
+            cx.navigate("name-filters");
+        }
+    });
+    p.page_fn(
+        PageSpec {
+            id: "name-filters",
+            title: "Exclude by name",
+            icon: Icon::Filter,
+            order: 42,
         },
+        page,
     );
     Ok(())
+}
+
+fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
+    let snap = cx.snapshot().clone();
+    let filters = snap.get(&FILTERS);
+    let names: Vec<String> = snap
+        .get(&servers::SERVERS)
+        .iter()
+        .map(|s| s.name.clone())
+        .collect();
+    let hidden = names
+        .iter()
+        .filter(|n| filters.iter().any(|f| wildcard(&f.pattern, n)))
+        .count();
+    let counter = match (filters.len(), hidden) {
+        (0, _) => String::new(),
+        (n, h) => format!(
+            "{} · {} excluded",
+            kit::plural(n, "pattern", "patterns"),
+            kit::plural(h, "server", "servers")
+        ),
+    };
+    kit::page_header(ui, "Exclude by name", &counter, |_| {});
+    let matches = names.clone();
+    ListEditor::new(&FILTERS)
+        .unordered()
+        .subtitle(move |rows, i| hint(&rows[i].pattern, &names))
+        .add_form(
+            "Add pattern",
+            || Filter {
+                id: Id::random(),
+                pattern: String::new(),
+            },
+            |ui, f, width| {
+                let r = kit::input(
+                    ui,
+                    "pattern",
+                    &mut f.pattern,
+                    "Name pattern, e.g. *test*",
+                    width,
+                    false,
+                )
+                .on_hover_text("Matches the whole name; * matches any text. Case is ignored.");
+                kit::submitted(ui, &r) && !f.pattern.trim().is_empty()
+            },
+        )
+        .column(Column::edit("Pattern", "Name pattern", |f: &mut Filter| {
+            &mut f.pattern
+        }))
+        .column(
+            Column::custom("Matches", 90., move |ui, _, f: &Filter| {
+                let n = matches.iter().filter(|n| wildcard(&f.pattern, n)).count();
+                kit::hint(ui, kit::plural(n, "server", "servers"));
+            })
+            .right(),
+        )
+        .empty(Icon::Filter, "No exclusions", "Add a name pattern above.")
+        .show(ui, cx);
 }
 
 /// A pattern without `*` matches whole names only: when it finds nothing but

@@ -250,9 +250,11 @@ pub fn task_button(
             + 6.
             + 20.
     };
-    let sample = match running.and_then(|r| r.1) {
-        Some(t) => format!("{t}/{t}"),
-        None => "888/888".into(),
+    // One width idle and running ("Stop 12/82"), so neighbors do not move;
+    // only a count of three digits widens it.
+    let sample = match running.and_then(|r| r.1).filter(|t| *t >= 100) {
+        Some(t) => format!("Stop {t}/{t}"),
+        None => "Stop 88/88".into(),
     };
     let width = measure(ui, idle).max(measure(ui, &sample)).ceil();
     let response = match running {
@@ -263,7 +265,7 @@ pub fn task_button(
             .show(ui),
         Some((done, total)) => {
             let text = match total {
-                Some(t) => format!("{done}/{t}"),
+                Some(t) => format!("Stop {done}/{t}"),
                 None => "Stop".into(),
             };
             Button::secondary(&text)

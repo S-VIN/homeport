@@ -1,6 +1,11 @@
 //! Explicit configuration exchange. Temporary files are private and removed on drop;
 //! no scheduled copies or backup directory are created.
-use crate::{Error, Host, Kernel, Result, store::Store};
+use crate::{
+    Error, Host, Kernel, Record, Result, State,
+    state::{OrderRow, PluginRow, SettingRow},
+    store::Store,
+};
+use serde::{Serialize, de::DeserializeOwned};
 use std::{io::Write, path::Path, sync::Arc};
 
 pub const MAX_BYTES: usize = 32 * 1024 * 1024;
@@ -76,6 +81,71 @@ impl Host {
             size: bytes.len(),
             file,
         }))
+    }
+}
+
+/// A new configuration for another rproxy installation (a server being set
+/// up), in the format of [`Host::export_configuration`]. It holds only what
+/// is put in; everything else starts with its defaults there.
+///
+/// ```ignore
+/// let bytes = Profile::new()?.enable("vless-inbound")?.setting(&CONFIG, &settings)?.finish()?;
+/// ```
+pub struct Profile {
+    store: Store,
+    dir: tempfile::TempDir,
+}
+impl Profile {
+    pub fn new() -> Result<Self> {
+        let dir = tempfile::tempdir().map_err(io)?;
+        let store = Store::open(dir.path().join("profile.sqlite3"))?;
+        store.register::<SettingRow>()?;
+        store.register::<PluginRow>()?;
+        store.register::<OrderRow>()?;
+        Ok(Self { store, dir })
+    }
+    /// Turn on a plugin that is off by default.
+    pub fn enable(self, plugin: &str) -> Result<Self> {
+        let row = PluginRow {
+            id: plugin.into(),
+            enabled: true,
+        };
+        self.store.transaction(|tx| tx.put(&row))?;
+        Ok(self)
+    }
+    /// The value of a setting (`Setup::setting` / `editable_setting`).
+    pub fn setting<T: Serialize>(self, state: &State<T>, value: &T) -> Result<Self> {
+        let row = SettingRow {
+            id: state.name.into(),
+            json: serde_json::to_string(value).map_err(|e| Error::msg(e.to_string()))?,
+        };
+        self.store.transaction(|tx| tx.put(&row))?;
+        Ok(self)
+    }
+    /// The items of a list (`Setup::list` with its default table), in order.
+    pub fn list<T: Record + DeserializeOwned>(
+        self,
+        state: &State<Vec<T>>,
+        items: &[T],
+    ) -> Result<Self> {
+        self.store.register::<T>()?;
+        self.store.transaction(|tx| {
+            for (position, item) in items.iter().enumerate() {
+                tx.put(item)?;
+                tx.put(&OrderRow {
+                    id: format!("{}|{}", state.name, item.id()),
+                    list: state.name.into(),
+                    position: position as u32,
+                })?;
+            }
+            Ok(())
+        })?;
+        Ok(self)
+    }
+    pub fn finish(self) -> Result<Vec<u8>> {
+        let path = self.dir.path().join(FILE_NAME);
+        self.store.backup_to(&path)?;
+        std::fs::read(path).map_err(io)
     }
 }
 

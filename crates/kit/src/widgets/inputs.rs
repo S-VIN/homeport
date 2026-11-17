@@ -13,7 +13,9 @@ pub fn input(
         ui.add(
             egui::TextEdit::singleline(value)
                 .desired_width(width.max(24.))
-                .min_size(vec2(0., CONTROL))
+                // Keep the asked width when the row is short of room: a layout
+                // that measures its controls must see their real size.
+                .min_size(vec2(width.max(24.), CONTROL))
                 .hint_text(placeholder)
                 .password(secret)
                 .margin(egui::Margin::symmetric(8, 5)),
@@ -191,6 +193,40 @@ impl<'a> Fields<'a> {
         });
         self
     }
+    /// A combo box over `(value, label)` pairs that sets a text value;
+    /// `placeholder` shows while the value is none of them.
+    pub fn options(
+        mut self,
+        id: &'static str,
+        value: &'a mut String,
+        options: Vec<(String, String)>,
+        placeholder: &'a str,
+    ) -> Self {
+        let text = options
+            .iter()
+            .map(|(_, l)| l.clone())
+            .chain([placeholder.to_owned()])
+            .max_by_key(|t| t.chars().count())
+            .unwrap_or_default();
+        let draw = move |ui: &mut Ui, width: f32| {
+            let shown = options
+                .iter()
+                .find(|(v, _)| v == value)
+                .map_or(placeholder, |(_, l)| l.as_str());
+            select(ui, id, shown, width, |ui| {
+                for (v, label) in &options {
+                    if ui.selectable_label(value == v, label).clicked() {
+                        *value = v.clone();
+                    }
+                }
+            });
+        };
+        self.items.push(Field::Fixed {
+            text,
+            draw: Box::new(draw),
+        });
+        self
+    }
     /// Draw the row; true when Enter was pressed in an input.
     pub fn show(self, ui: &mut Ui) -> bool {
         let gap = theme::HORIZONTAL_GAP;
@@ -205,7 +241,7 @@ impl<'a> Fields<'a> {
                 + 44.)
                 .clamp(90., 240.)
         };
-        let fixed: f32 = self
+        let natural: f32 = self
             .items
             .iter()
             .map(|f| {
@@ -220,9 +256,23 @@ impl<'a> Fields<'a> {
             .items
             .iter()
             .filter(|f| matches!(f, Field::Input { .. }))
-            .count()
-            .max(1) as f32;
-        let rest = ((self.width - fixed) / inputs - gap).max(60.);
+            .count() as f32;
+        // Choices give up width (down to their share) before inputs get narrower than 80.
+        let room = self.width - inputs * (80. + gap);
+        let scale = if natural > room && natural > 0. {
+            (room / natural).max(0.5)
+        } else {
+            1.
+        };
+        let fixed = natural * scale;
+        // `width` ends where the next control starts after one more gap, so
+        // the fields together leave out the last gap only.
+        let rest = if inputs > 0. {
+            ((self.width - fixed + gap) / inputs - gap).max(60.)
+        } else {
+            0.
+        };
+        let fit = move |text: &str| (fit(text) + gap) * scale - gap;
         let mut submitted = false;
         for field in self.items {
             match field {

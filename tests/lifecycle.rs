@@ -36,8 +36,9 @@ fn alive(pid: u32) -> bool {
 }
 fn app(dir: &Path) -> App {
     App(Command::new(env!("CARGO_BIN_EXE_rproxy"))
-        .args(["web", "--listen", "127.0.0.1:0", "--data-dir"])
-        .arg(dir)
+        .arg("web")
+        .env("RPROXY_LISTEN", "127.0.0.1:0")
+        .env("RPROXY_DATA_DIR", dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -77,4 +78,46 @@ fn killing_application_reaps_core_and_allows_a_clean_relaunch() {
             sleep(Duration::from_millis(20));
         }
     }
+}
+
+/// The tunnel supervisor is the same code started by the system's
+/// administrator prompt; without the prompt it runs with ordinary rights.
+#[test]
+fn closing_the_lease_stops_the_tunnel_supervisor_and_reaps_its_core() {
+    use std::{io::Read, net::TcpListener, os::unix::fs::PermissionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let (ticket, pid_file) = (dir.path().join("lease"), dir.path().join("pid"));
+    fs::write(&ticket, "ticket").unwrap();
+    let core = dir.path().join("core with ' quotes");
+    fs::write(&core, "#!/bin/sh\necho $$ > \"$2/pid\"\nexec sleep 60\n").unwrap();
+    fs::set_permissions(&core, fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut supervisor = App(Command::new(env!("CARGO_BIN_EXE_rproxy"))
+        .args(["--core-supervisor", "--lease"])
+        .arg(listener.local_addr().unwrap().port().to_string())
+        .args([&ticket, &core])
+        .arg("-d")
+        .arg(dir.path())
+        .spawn()
+        .unwrap());
+    let (mut lease, _) = listener.accept().unwrap();
+    let mut received = [0; 6];
+    lease.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"ticket");
+    let until = Instant::now() + Duration::from_secs(10);
+    let pid: u32 = loop {
+        if let Ok(pid) = fs::read_to_string(&pid_file)
+            .unwrap_or_default()
+            .trim()
+            .parse()
+        {
+            break pid;
+        }
+        assert!(Instant::now() < until, "core did not start");
+        sleep(Duration::from_millis(10));
+    };
+    assert!(alive(pid));
+    drop(lease); // Also what a crash of the application does.
+    assert!(supervisor.0.wait().unwrap().success());
+    assert!(!alive(pid), "core survived its owner");
 }

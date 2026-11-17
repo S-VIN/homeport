@@ -85,8 +85,6 @@ pub(crate) struct SessionState {
     pub theme: Option<crate::kernel::Theme>,
     pub now: f64,
     pub wide: bool,
-    /// Height of the toast strip in the last frame (its room is reserved first).
-    pub toast_height: f32,
     /// Where the Activity chip was drawn (the popover anchors to it).
     pub activity_chip: Option<egui::Rect>,
     /// Status chips that didn't fit the bar (by contribution index): the "+N"
@@ -117,7 +115,6 @@ impl SessionState {
             theme: None,
             now: 0.,
             wide: false,
-            toast_height: 0.,
             activity_chip: None,
             last_saved: None,
         }
@@ -170,9 +167,6 @@ impl<'a> UiCx<'a> {
         let r = f(self);
         self.plugin = prev;
         r
-    }
-    pub fn kernel(&self) -> &Arc<Kernel> {
-        self.k
     }
     pub fn snapshot(&self) -> &Snapshot {
         &self.snap
@@ -352,23 +346,23 @@ impl<'a> UiCx<'a> {
         idle: &str,
         enabled: bool,
         make: impl FnOnce() -> O,
-    ) {
+    ) -> egui::Response {
         let op = make();
         let run = self.job_for(&op);
-        if crate::kit::task_button(
+        let r = crate::kit::task_button(
             ui,
             icon,
             idle,
             run.as_ref().map(|r| (r.done, r.total)),
             enabled,
-        )
-        .clicked()
-        {
+        );
+        if r.clicked() {
             match run {
                 Some(r) => self.cancel(r.id),
                 None => self.run(op),
             }
         }
+        r
     }
     pub fn notify(&mut self, text: &str) {
         self.k.notify(self.cx().plugin_name(), text)
@@ -387,11 +381,9 @@ impl<'a> UiCx<'a> {
         self.s.page
     }
     /// Open or close the panels popover (narrow windows) with the calling
-    /// plugin's panel (all panels when it has none). Chips use [`Self::toggle_panels_from`].
-    pub fn toggle_panels(&mut self) {
-        self.toggle_panels_at(None);
-    }
-    fn toggle_panels_at(&mut self, rect: Option<egui::Rect>) {
+    /// plugin's panel (all panels when it has none), anchored to `chip`.
+    pub(crate) fn toggle_panels_from(&mut self, chip: &egui::Response) {
+        let rect = chip.rect;
         let same = self.s.panel_anchor.is_some_and(|a| a.plugin == self.plugin);
         if self.s.panels_open && same {
             self.s.panels_open = false;
@@ -401,7 +393,7 @@ impl<'a> UiCx<'a> {
         self.s.activity_open = false;
         self.s.panel_anchor = Some(PanelAnchor {
             plugin: self.plugin,
-            rect: rect.unwrap_or(egui::Rect::NOTHING),
+            rect,
         });
     }
     /// A chip in the status bar. A click opens the plugin's panel under the
@@ -430,16 +422,14 @@ impl<'a> UiCx<'a> {
                 .iter()
                 .find(|e| mine(e.plugin))
                 .map(|e| e.spec.id);
+            // A chip opens its own panel (or page), never the others'.
             match page {
                 Some(page) if self.wide() || !panel => self.navigate(page),
-                _ => self.toggle_panels_from(&r),
+                _ if panel => self.toggle_panels_from(&r),
+                _ => {}
             }
         }
         r
-    }
-    /// [`Self::toggle_panels`] for a chip's response: the popover anchors to it.
-    pub fn toggle_panels_from(&mut self, chip: &egui::Response) {
-        self.toggle_panels_at(Some(chip.rect));
     }
     pub fn wide(&self) -> bool {
         self.s.wide
@@ -470,7 +460,7 @@ impl<'a> UiCx<'a> {
         }
     }
     /// Number of contributions to a zone.
-    pub fn slot_len<P: 'static>(&self, slot: &Slot<P>) -> usize {
+    pub(crate) fn slot_len<P: 'static>(&self, slot: &Slot<P>) -> usize {
         self.k.reg.contributions(slot).len()
     }
 }

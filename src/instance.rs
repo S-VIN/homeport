@@ -23,7 +23,7 @@ pub struct Instance {
     _lock: File,
     state: Arc<State>,
 }
-/// Desktop identity is independent of package location and --data-dir.
+/// Desktop identity is independent of package location and RPROXY_DATA_DIR.
 /// Flatpak is granted only this shared runtime subdirectory by its manifest.
 pub fn desktop_directory() -> io::Result<std::path::PathBuf> {
     use std::path::PathBuf;
