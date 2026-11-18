@@ -61,7 +61,7 @@ pub(super) fn toasts(
         cx.k.reg
             .pages
             .iter()
-            .map(|e| (e.spec.id, e.spec.title))
+            .map(|e| (e.id, e.spec.title))
             .collect();
     egui::Area::new(egui::Id::unique("toasts"))
         .order(egui::Order::Foreground)

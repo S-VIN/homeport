@@ -4,8 +4,8 @@ use egui::{
     Event, Pos2, Rect,
     epaint::{Primitive, Shape},
 };
+use homeport_kernel::{Host, Session};
 use image::ImageEncoder;
-use rproxy_kernel::{Host, Session};
 use serde_json::json;
 use std::{path::Path, sync::Arc, time::Instant};
 
@@ -39,14 +39,21 @@ impl Ui {
         }
     }
     fn frame(&mut self, events: Vec<Event>) {
-        let servers = self.host.kernel().snapshot().get(&plugin_servers::SERVERS);
+        self.traffic();
+        self.draw(events);
+    }
+    /// Sample connections, when the Connections plugin runs.
+    fn traffic(&mut self) {
+        let k = self.host.kernel();
+        if !k.plugins().iter().any(|p| p.id == "connections") {
+            return;
+        }
+        let servers = k.snapshot().get(&plugin_servers::SERVERS);
         let server = servers
             .first()
             .map(|s| s.id.to_string())
             .unwrap_or_else(|| "DIRECT".into());
-        self.host
-            .kernel()
-            .cx_for("connections")
+        k.cx_for("connections")
             .update_live(&plugin_connections::TRAFFIC, |t| {
                 t.online = !self.offline;
                 t.down_rate = if self.offline { 0 } else { 1_240_000 };
@@ -78,6 +85,8 @@ impl Ui {
                     t.conns.clear();
                 }
             });
+    }
+    fn draw(&mut self, events: Vec<Event>) {
         self.tick += 0.1;
         let mut out = self.ctx.run_ui(
             egui::RawInput {
@@ -202,6 +211,23 @@ impl Ui {
         };
         if tab(self).is_none() {
             self.click("More");
+            // A long More menu on a short screen scrolls.
+            for _ in 0..10 {
+                if self.tab(label).is_some() {
+                    break;
+                }
+                self.frame(vec![
+                    Event::PointerMoved(Pos2::new(self.size.x - 80., self.size.y - 90.)),
+                    Event::MouseWheel {
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0., -100.),
+                        modifiers: Default::default(),
+                    },
+                ]);
+                self.settle();
+            }
         }
         let pos = self
             .tab(label)
@@ -254,19 +280,21 @@ impl Ui {
 #[tokio::test(flavor = "multi_thread")]
 async fn shell_navigation_connections_and_configuration_fit_supported_sizes() {
     let dir = tempfile::tempdir().unwrap();
-    let host = Host::start(rproxy::catalog(), dir.path()).await.unwrap();
-    let source = rproxy_kernel::Id::random();
+    let host = Host::start_enabled(homeport::catalog(), dir.path())
+        .await
+        .unwrap();
+    let source = homeport_kernel::Id::random();
     let proxies = plugin_subscriptions::formats::uri::parse_links("vless://00000000-0000-0000-0000-000000000001@example.org:443?security=tls#%F0%9F%87%AB%F0%9F%87%AE%20Helsinki%20%E2%9A%A1\nvless://00000000-0000-0000-0000-000000000002@example.net:443?security=tls#%F0%9F%87%A9%F0%9F%87%AA%20Frankfurt\nvless://00000000-0000-0000-0000-000000000003@example.com:443?security=tls#%F0%9F%9A%80%20A%20very%20long%20server%20name%20that%20must%20truncate").unwrap();
     host.kernel()
         .cx_for("servers")
         .call(plugin_servers::ReplaceFromSource {
             source,
             proxies,
-            still_current: None,
+            guard: None,
         })
         .await
         .unwrap();
-    let directory = std::env::var_os("RPROXY_CAPTURE_DIR");
+    let directory = std::env::var_os("HOMEPORT_CAPTURE_DIR");
     for size in [[480., 540.], [640., 560.], [1040., 600.], [375., 540.]] {
         for dark in [false, true] {
             let mut ui = Ui::new(host.clone(), size, dark);
@@ -294,6 +322,11 @@ async fn shell_navigation_connections_and_configuration_fit_supported_sizes() {
                     );
                     assert!(a.right() < size[0] && b.right() < size[0]);
                     assert!(ui.shapes.iter().any(|s| matches!(&s.shape,Shape::Text(t) if t.galley.rows.iter().any(|r| r.glyphs.iter().any(|g| g.is_color)))),"emoji should be drawn in color");
+                }
+                if page == "Servers" {
+                    // Added columns: the primary one always, secondary ones off a phone.
+                    assert!(ui.text("Rating").is_some(), "{size:?}");
+                    assert_eq!(ui.text("Latency").is_some(), size[0] >= 480., "{size:?}");
                 }
                 if page == "Settings" {
                     assert!(ui.text("Backups").is_none());
@@ -329,12 +362,9 @@ async fn shell_navigation_connections_and_configuration_fit_supported_sizes() {
                 ui.capture(Path::new(dir), "Connections-empty");
             }
             ui.empty = false;
-            ui.ctx.data_mut(|d| {
-                d.insert_temp(
-                    egui::Id::unique("connections-filter"),
-                    "no-match".to_owned(),
-                )
-            });
+            ui.frame(vec![]);
+            ui.click("Filter by host, rule or server");
+            ui.frame(vec![Event::Text("no-match".to_owned())]);
             ui.frame(vec![]);
             assert!(ui.text("Nothing matches").is_some());
             if let Some(dir) = &directory {
@@ -380,30 +410,26 @@ async fn shell_navigation_connections_and_configuration_fit_supported_sizes() {
 
 #[derive(Clone)]
 struct PopupReviewJob(usize);
-impl rproxy_kernel::Op for PopupReviewJob {
+impl homeport_kernel::Op for PopupReviewJob {
     type Reply = ();
-    fn job(&self) -> Option<rproxy_kernel::JobSpec> {
-        Some(rproxy_kernel::JobSpec::keyed(
+    fn job(&self) -> Option<homeport_kernel::JobSpec> {
+        Some(homeport_kernel::JobSpec::keyed(
             self.0.to_string(),
             format!("Refresh subscription {} · Helsinki ⚡", self.0),
         ))
     }
 }
-static POPUP_REVIEW_PLUGIN: rproxy_kernel::Plugin = rproxy_kernel::Plugin {
+static POPUP_REVIEW_PLUGIN: homeport_kernel::Plugin = homeport_kernel::Plugin {
     id: "popup-review",
     name: "Popup review fixture",
-    description: "",
-    category: rproxy_kernel::categories::NETWORK,
-    requires: &[],
     required: true,
-    default_enabled: true,
-    platforms: rproxy_kernel::Platform::ALL,
     setup: |p| {
-        p.handle(|_: rproxy_kernel::Cx, job: PopupReviewJob| async move {
-            Err(rproxy_kernel::Error::msg(format!("Subscription {} could not refresh: the remote server returned an invalid response. Your previous servers are kept. Check the subscription URL and refresh again. Provider detail: {}", job.0, "invalid-response-".repeat(5))))
+        p.handle(|_: homeport_kernel::Cx, job: PopupReviewJob| async move {
+            Err(homeport_kernel::Error::msg(format!("Subscription {} could not refresh: the remote server returned an invalid response. Your previous servers are kept. Check the subscription URL and refresh again. Provider detail: {}", job.0, "invalid-response-".repeat(5))))
         });
         Ok(())
     },
+    ..homeport_kernel::Plugin::DEFAULT
 };
 
 impl Ui {
@@ -461,19 +487,19 @@ impl Ui {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn popup_review_scenarios() {
-    use rproxy_kernel::list::Add;
+    use homeport_kernel::list::Add;
     let dir = tempfile::tempdir().unwrap();
-    if let Ok(identity) = std::env::var("RPROXY_TEST_IDENTITY_DIR") {
+    if let Ok(identity) = std::env::var("HOMEPORT_TEST_IDENTITY_DIR") {
         std::fs::copy(
             Path::new(&identity).join("device-id"),
             dir.path().join("device-id"),
         )
         .unwrap();
     }
-    let mut catalog = rproxy::catalog();
+    let mut catalog = homeport::catalog();
     catalog.push(&POPUP_REVIEW_PLUGIN);
-    let host = Host::start(catalog, dir.path()).await.unwrap();
-    let urls=std::env::var("RPROXY_TEST_SUBSCRIPTION_URLS").unwrap_or_else(|_| "vless://00000000-0000-0000-0000-000000000001@example.org:443?security=tls#Helsinki%20%E2%9A%A1\nvless://00000000-0000-0000-0000-000000000002@example.net:443?security=tls#Frankfurt%20%F0%9F%9A%80".into());
+    let host = Host::start_enabled(catalog, dir.path()).await.unwrap();
+    let urls=std::env::var("HOMEPORT_TEST_SUBSCRIPTION_URLS").unwrap_or_else(|_| "vless://00000000-0000-0000-0000-000000000001@example.org:443?security=tls#Helsinki%20%E2%9A%A1\nvless://00000000-0000-0000-0000-000000000002@example.net:443?security=tls#Frankfurt%20%F0%9F%9A%80".into());
     let cx = host.kernel().cx_for("subscriptions");
     for url in urls.lines() {
         cx.call(Add::new(
@@ -534,7 +560,7 @@ async fn popup_review_scenarios() {
     })
     .await
     .unwrap();
-    let directory = std::env::var_os("RPROXY_CAPTURE_DIR");
+    let directory = std::env::var_os("HOMEPORT_CAPTURE_DIR");
     for size in [[375., 320.], [375., 540.], [640., 360.], [1040., 600.]] {
         for dark in [false, true] {
             for scenario in [
@@ -560,7 +586,7 @@ async fn popup_review_scenarios() {
                 "deploy",
                 "system-proxy-help",
             ] {
-                if std::env::var("RPROXY_CAPTURE_SCENARIOS")
+                if std::env::var("HOMEPORT_CAPTURE_SCENARIOS")
                     .is_ok_and(|only| !only.split(',').any(|s| s == scenario))
                 {
                     continue;
@@ -591,7 +617,7 @@ async fn popup_review_scenarios() {
                     "checks"=>ui.navigate("Tests"),
                     "deploy"=>ui.navigate("Install to server"),
                     "system-proxy-help"=>{ui.navigate("Local proxy");ui.reveal("System proxy");ui.hover("System proxy");},
-                    "subscription-tooltip"=>{ui.navigate("Subscriptions");let label=if std::env::var_os("RPROXY_TEST_SUBSCRIPTION_URLS").is_some(){"allvsub.cc"}else{"Helsinki ⚡"}; if ui.text(label).is_some(){ui.hover(label);}else{continue;}},
+                    "subscription-tooltip"=>{ui.navigate("Subscriptions");let label=if std::env::var_os("HOMEPORT_TEST_SUBSCRIPTION_URLS").is_some(){"allvsub.cc"}else{"Helsinki ⚡"}; if ui.text(label).is_some(){ui.hover(label);}else{continue;}},
                     "connection-tooltip" if size[0]<960.=>{ui.frame(vec![Event::PointerMoved(Pos2::new(70.,16.))]);for _ in 0..12 { ui.frame(vec![]); }},
                     "server-tooltip"|"server-details"=>{
                         // Phones show the row's Connect as an icon: find the row by a server name.
@@ -657,23 +683,25 @@ async fn popup_review_scenarios() {
 #[tokio::test(flavor = "multi_thread")]
 async fn native_quit_is_explicit_and_recreated_windows_preserve_drafts() {
     let dir = tempfile::tempdir().unwrap();
-    let host = Host::start(rproxy::catalog(), dir.path()).await.unwrap();
+    let host = Host::start_enabled(homeport::catalog(), dir.path())
+        .await
+        .unwrap();
     for size in [[375., 540.], [640., 560.]] {
         for dark in [false, true] {
             let mut ui = Ui::new(host.clone(), size, dark);
             ui.settle();
             ui.navigate("Settings");
             assert!(
-                ui.text("Quit rproxy").is_none(),
+                ui.text("Quit homeport").is_none(),
                 "web sessions cannot quit the host"
             );
             ui.session.set_exit_available(true);
             ui.settle();
-            ui.reveal("Quit rproxy");
-            if let Some(path) = std::env::var_os("RPROXY_CAPTURE_DIR") {
+            ui.reveal("Quit homeport");
+            if let Some(path) = std::env::var_os("HOMEPORT_CAPTURE_DIR") {
                 ui.capture(Path::new(&path), "Native-settings-quit");
             }
-            ui.click("Quit rproxy");
+            ui.click("Quit homeport");
             assert!(ui.session.take_exit_request());
             assert!(!ui.session.take_exit_request());
             assert!(
@@ -696,4 +724,52 @@ async fn native_quit_is_explicit_and_recreated_windows_preserve_drafts() {
         }
     }
     host.shutdown().await;
+}
+
+/// The app runs with any plugin set: each optional plugin alone (with the
+/// required ones) and the full catalog without each optional plugin; every
+/// page, the status bar and the panels draw.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_page_draws_with_other_plugin_sets() {
+    const PAGES: [&str; 13] = [
+        "Servers",
+        "Subscriptions",
+        "Tests",
+        "Exclude by name",
+        "Routing",
+        "Connections",
+        "Logs",
+        "Local proxy",
+        "Chain exit",
+        "VLESS inbound",
+        "Install to server",
+        "Plugins",
+        "Settings",
+    ];
+    let all = homeport::catalog();
+    let optional: Vec<_> = all.iter().filter(|p| !p.required).map(|p| p.id).collect();
+    let mut sets: Vec<Vec<_>> = Vec::new();
+    for id in &optional {
+        sets.push(
+            all.iter()
+                .copied()
+                .filter(|p| p.required || p.id == *id)
+                .collect(),
+        );
+        sets.push(all.iter().copied().filter(|p| p.id != *id).collect());
+    }
+    for set in sets {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Host::start_enabled(set, dir.path()).await.unwrap();
+        let mut ui = Ui::new(host.clone(), [1040., 600.], false);
+        for _ in 0..4 {
+            ui.frame(vec![]);
+        }
+        for page in PAGES {
+            if ui.tab(page).is_some() {
+                ui.navigate(page);
+            }
+        }
+        host.shutdown().await;
+    }
 }

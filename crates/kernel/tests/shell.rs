@@ -1,4 +1,4 @@
-use rproxy_kernel::{Host, egui};
+use homeport_kernel::{Host, egui};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_kernel_draws_the_shell() {
@@ -27,7 +27,7 @@ async fn empty_kernel_draws_the_shell() {
 }
 
 mod saved {
-    use rproxy_kernel::{Host, egui, prelude::*};
+    use homeport_kernel::{Host, egui, prelude::*};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Table)]
@@ -45,11 +45,14 @@ mod saved {
         id: "saved",
         name: "Saved",
         category: categories::SERVERS,
+        migrations: &[(
+            "001-notes.sql",
+            "CREATE TABLE test_saved_notes (id TEXT NOT NULL PRIMARY KEY, text TEXT NOT NULL) STRICT;",
+        )],
         setup: |p| {
             p.list(&NOTES);
             p.page_fn(
                 PageSpec {
-                    id: "notes",
                     title: "Notes",
                     icon: Icon::Servers,
                     order: 10,
@@ -91,7 +94,9 @@ mod saved {
     #[tokio::test(flavor = "multi_thread")]
     async fn saved_stays_after_the_page_takes_the_outcome() {
         let dir = tempfile::tempdir().unwrap();
-        let host = Host::start(vec![&NOTES_PLUGIN], dir.path()).await.unwrap();
+        let host = Host::start_enabled(vec![&NOTES_PLUGIN], dir.path())
+            .await
+            .unwrap();
         let ctx = egui::Context::default();
         let mut session = host.session(&ctx);
         let mut frame = |time: f64| {

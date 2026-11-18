@@ -16,15 +16,22 @@ pub struct JobSpec {
     pub label: String,
     /// Frequent background work: only failures appear in Activity.
     pub quiet: bool,
-    /// When a run with the same key is active: `false` joins it (the new op is
-    /// dropped), `true` runs the new op right after it (at most one waits per key).
-    pub queue: bool,
-    /// When a run with the same key is active: cancel it and run the new op
-    /// right after (the newest request wins, e.g. a subscription link edited
-    /// while it loads).
-    pub latest: bool,
-    /// Page that shows the details when the job fails (a toast offers to open it).
+    /// What a request does while a run with the same key is active.
+    pub repeat: Repeat,
+    /// Plugin whose page shows the details when the job fails (a toast offers to open it).
     pub page: Option<&'static str>,
+}
+/// What a new request does while a job with the same key runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Repeat {
+    /// It joins the running job (the new op is dropped).
+    #[default]
+    Join,
+    /// It runs right after the running job (at most one waits per key; the newest).
+    Queue,
+    /// It cancels the running job and runs right after it (the newest request
+    /// wins, e.g. a subscription link edited while it loads).
+    Latest,
 }
 impl JobSpec {
     /// One job per op type: a second request joins the running one.
@@ -33,8 +40,7 @@ impl JobSpec {
             key: String::new(),
             label: label.into(),
             quiet: false,
-            queue: false,
-            latest: false,
+            repeat: Repeat::Join,
             page: None,
         }
     }
@@ -43,27 +49,24 @@ impl JobSpec {
     pub fn keyed(key: impl Into<String>, label: impl Into<String>) -> Self {
         Self {
             key: key.into(),
-            label: label.into(),
-            quiet: false,
-            queue: false,
-            latest: false,
-            page: None,
+            ..Self::new(label)
         }
     }
     pub fn queued(mut self) -> Self {
-        self.queue = true;
+        self.repeat = Repeat::Queue;
         self
     }
     pub fn latest(mut self) -> Self {
-        self.latest = true;
+        self.repeat = Repeat::Latest;
         self
     }
     pub fn quiet(mut self) -> Self {
         self.quiet = true;
         self
     }
-    pub fn page(mut self, page: &'static str) -> Self {
-        self.page = Some(page);
+    /// Failures offer to open `plugin`'s page.
+    pub fn page(mut self, plugin: &'static crate::Plugin) -> Self {
+        self.page = Some(plugin.id);
         self
     }
 }
@@ -78,6 +81,15 @@ pub trait Op: Send + 'static {
     /// with progress and cancellation.
     fn job(&self) -> Option<JobSpec> {
         None
+    }
+    /// A queued run ([`JobSpec::queued`]) still waiting takes in the next
+    /// request: by default the newer one replaces it. Override to combine
+    /// them, say, to keep the most important reason of all.
+    fn merge(self, newer: Self) -> Self
+    where
+        Self: Sized,
+    {
+        newer
     }
 }
 

@@ -1,5 +1,5 @@
 #![cfg(target_arch = "wasm32")]
-use rproxy_remote::*;
+use homeport_remote::*;
 use wasm_bindgen_test::*;
 
 #[derive(serde::Deserialize)]

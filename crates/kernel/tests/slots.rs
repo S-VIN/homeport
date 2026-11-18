@@ -1,6 +1,6 @@
 //! Extension points for plugins that change other plugins: `replace`,
 //! `wrap_view` and `hide` edit another plugin's contributions to a zone.
-use rproxy_kernel::{Host, egui, prelude::*};
+use homeport_kernel::{Host, egui, prelude::*};
 
 static ROW: Slot<()> = Slot::new("base.row", "Test zone on the base page.");
 
@@ -21,7 +21,6 @@ static BASE: Plugin = Plugin {
         });
         p.page_fn(
             PageSpec {
-                id: "base",
                 title: "Base",
                 icon: Icon::Servers,
                 order: 10,
@@ -38,7 +37,7 @@ static EXTRA: Plugin = Plugin {
     id: "extra",
     name: "Extra",
     category: categories::SERVERS,
-    requires: &["base"],
+    requires: &[&BASE],
     setup: |p| {
         p.replace(&ROW, "base/one", |ui, _, _| {
             ui.label("replaced one");
@@ -64,7 +63,9 @@ fn texts(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
 #[tokio::test(flavor = "multi_thread")]
 async fn plugins_edit_other_plugins_contributions() {
     let dir = tempfile::tempdir().unwrap();
-    let host = Host::start(vec![&BASE, &EXTRA], dir.path()).await.unwrap();
+    let host = Host::start_enabled(vec![&BASE, &EXTRA], dir.path())
+        .await
+        .unwrap();
 
     let ctx = egui::Context::default();
     let mut session = host.session(&ctx);

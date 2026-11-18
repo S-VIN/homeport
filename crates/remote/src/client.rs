@@ -43,7 +43,7 @@ fn file_dialog(ws: &WebSocket, dialog: crate::FileDialog) {
 #[wasm_bindgen]
 pub async fn start(canvas: web_sys::HtmlCanvasElement) -> Result<(), JsValue> {
     std::panic::set_hook(Box::new(|info| {
-        let text = format!("rproxy client crashed: {info}");
+        let text = format!("homeport client crashed: {info}");
         web_sys::console::error_1(&text.clone().into());
         status(Some(&text));
     }));
@@ -174,7 +174,7 @@ fn status(text: Option<&str>) {
 impl Client {
     fn new(ctx: &egui::Context, canvas: &web_sys::HtmlCanvasElement) -> Self {
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
-        status(Some("Connecting to rproxy…"));
+        status(Some("Connecting to homeport…"));
         let wheel_at: Rc<Cell<Option<egui::Pos2>>> = Rc::default();
         let (at, c, target) = (wheel_at.clone(), ctx.clone(), canvas.clone());
         let wheel =
@@ -211,7 +211,7 @@ impl eframe::App for Client {
         let closed = self.socket.as_ref().is_none_or(|s| s.inbox.borrow().closed);
         if closed {
             if self.shown {
-                status(Some("Connection to rproxy lost. Reconnecting…"));
+                status(Some("Connection to homeport lost. Reconnecting…"));
                 self.shown = false;
             }
             if now >= self.retry_at {

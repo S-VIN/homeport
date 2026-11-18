@@ -1,7 +1,7 @@
 //! Temporarily point OS proxy settings at a listener. Restore each original
-//! value only while it still equals the value written by rproxy.
+//! value only while it still equals the value written by homeport.
 //!
-//! What rproxy changed is also kept in a journal file, so a crash, a logoff or
+//! What homeport changed is also kept in a journal file, so a crash, a logoff or
 //! a killed process is undone at the next start.
 #[cfg(unix)]
 use std::process::Command;
@@ -23,7 +23,7 @@ struct Change {
 }
 static CHANGES: Mutex<Vec<Change>> = Mutex::new(Vec::new());
 
-/// The journal: the address and, per setting key, the value before and the value rproxy wrote.
+/// The journal: the address and, per setting key, the value before and the value homeport wrote.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Journal {
     address: SocketAddr,
@@ -57,7 +57,7 @@ fn restore(changes: &mut Vec<Change>) -> Result<(), String> {
     let mut failed = Vec::new();
     while let Some(change) = changes.pop() {
         match (change.setting.read)() {
-            Ok(current) if current != change.ours => {} // Changed outside rproxy: respect the new value.
+            Ok(current) if current != change.ours => {} // Changed outside homeport: respect the new value.
             Ok(_) if (change.setting.write)(change.before.as_deref()) => {}
             _ => failed.push(change),
         }
@@ -75,7 +75,7 @@ fn restore(changes: &mut Vec<Change>) -> Result<(), String> {
 /// A failed application rolls back the fields already written. `journal` is the
 /// file that survives a crash; a journal left by an earlier run is restored first.
 pub fn apply(journal: &Path, address: Option<SocketAddr>) -> Result<String, String> {
-    if rproxy_kernel::Platform::is_flatpak() || rproxy_kernel::Platform::is_docker() {
+    if homeport_kernel::Platform::is_flatpak() || homeport_kernel::Platform::is_docker() {
         return Err("System proxy control is unavailable in Flatpak and Docker.".into());
     }
     let mut changes = CHANGES.lock().map_err(|_| "System proxy lock failed.")?;
@@ -296,10 +296,10 @@ mod platform {
                                 "--key",
                                 key,
                                 "--default",
-                                "__rproxy_missing__",
+                                "__homeport_missing__",
                             ],
                         )
-                        .map(|v| (v != "__rproxy_missing__").then_some(v))
+                        .map(|v| (v != "__homeport_missing__").then_some(v))
                     }),
                     write: Box::new(move |v| {
                         let mut args = vec![
@@ -354,7 +354,7 @@ mod platform {
     fn read_proxy(get: &str, service: &str) -> Result<Option<String>, String> {
         let raw = output("networksetup", &[get, service])?;
         if value(&raw, "Authenticated Proxy Enabled:") == "1" {
-            return Err("An authenticated system proxy is configured. Configure your apps to use an rproxy proxy port directly to preserve its credentials.".into());
+            return Err("An authenticated system proxy is configured. Configure your apps to use an homeport proxy port directly to preserve its credentials.".into());
         }
         let on = if value(&raw, "Enabled:") == "Yes" {
             "on"

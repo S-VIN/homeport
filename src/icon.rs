@@ -5,12 +5,12 @@ pub enum Link {
     Selected,
     Failed,
 }
-pub fn status(host: &rproxy_kernel::Host) -> Link {
-    use rproxy_kernel::shell::TrayLink;
+pub fn status(host: &homeport_kernel::Host) -> Link {
+    use homeport_kernel::shell::TrayLink;
     let Some(k) = host.try_kernel() else {
         return Link::Idle;
     };
-    let answers = k.snapshot().hooks(&rproxy_kernel::shell::TRAY, &());
+    let answers = k.snapshot().hooks(&homeport_kernel::shell::TRAY, &());
     if !k.core_status().running() || answers.contains(&Some(TrayLink::Failed)) {
         Link::Failed
     } else if answers.contains(&Some(TrayLink::Connected)) {
@@ -26,7 +26,7 @@ pub fn icon(link: Link) -> egui::IconData {
         Link::Failed => include_bytes!("../assets/logos/red.png"),
     };
     let img = image::load_from_memory(bytes)
-        .expect("bundled rproxy icon")
+        .expect("bundled homeport icon")
         .into_rgba8();
     egui::IconData {
         width: img.width(),

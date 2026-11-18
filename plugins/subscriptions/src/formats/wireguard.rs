@@ -2,8 +2,8 @@
 //! AmneziaWG and WireGuard apps export them. A config pasted into the one-line
 //! subscription field arrives with its lines joined by spaces; both forms parse.
 use crate::{LINK, Parse};
+use homeport_kernel::prelude::*;
 use plugin_servers::Proxy;
-use rproxy_kernel::prelude::*;
 use serde_json::{Map, Value, json};
 use std::net::IpAddr;
 
@@ -21,7 +21,7 @@ pub(crate) fn register(p: &mut Setup) {
     p.handle(|_: Cx, op: Parse| async move { Ok(vec![parse(&op.body, None)?]) })
         .claim(|_, op| is_config(&op.body).then_some(Claim::content(85)));
     p.hook(&LINK, |_, raw| {
-        is_config(raw).then(|| parse(raw, None).map(drop).map_err(|e| e.message))
+        is_config(raw).then(|| parse(raw, None).map(drop))
     });
 }
 

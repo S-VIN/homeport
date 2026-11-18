@@ -5,13 +5,13 @@
 //!
 //! The core is polled once a second by a service into a live state (not
 //! saved, no transaction); the UI repaints when it changes.
-use plugin_servers::{self as servers, Server};
-use rproxy_kernel::{
+use homeport_kernel::{
     core::Labels,
     kit::{self, theme},
     prelude::*,
     shell::panel_title,
 };
+use plugin_servers::{self as servers, Server};
 use std::{
     collections::HashMap,
     time::{Duration, Instant},
@@ -21,7 +21,7 @@ pub static PLUGIN: Plugin = Plugin {
     id: "connections",
     name: "Connections",
     description: "Live connections and traffic: what goes where, by which rule, through which server.",
-    requires: &["servers"],
+    requires: &[&plugin_servers::PLUGIN],
     setup,
     ..Plugin::DEFAULT
 };
@@ -156,41 +156,41 @@ impl Op for Close {
 
 fn setup(p: &mut Setup) -> Result<()> {
     p.live(&TRAFFIC, Traffic::default);
-    p.service(
-        "poll",
-        |_| Some(()),
-        |cx: Cx, ()| async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(1));
-            let (mut idle, mut clock) = (0, Clock::default());
-            loop {
-                tick.tick().await;
-                // Nobody watching (a server without an open browser tab): sample
-                // every 10 s, enough for the session totals.
-                idle = if cx.ui_open() { 0 } else { (idle + 1) % 10 };
-                if idle != 0 {
-                    continue;
-                }
-                match cx.core().connections().await {
-                    Ok(v) => cx.update_live(&TRAFFIC, |t| {
-                        t.update(&v, &mut clock);
-                        t.online = true;
-                    }),
-                    Err(_) => {
-                        clock.sampled = None;
-                        cx.update_live(&TRAFFIC, |t| {
-                            t.online = false;
-                            t.up_rate = 0;
-                            t.down_rate = 0;
-                        })
-                    }
+    p.task("poll", |cx: Cx| async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let (mut idle, mut clock) = (0, Clock::default());
+        loop {
+            tick.tick().await;
+            // Nobody watching (a server without an open browser tab): sample
+            // every 10 s, enough for the session totals.
+            idle = if cx.ui_open() { 0 } else { (idle + 1) % 10 };
+            if idle != 0 {
+                continue;
+            }
+            match cx.core().connections().await {
+                Ok(v) => cx.update_live(&TRAFFIC, |t| {
+                    t.update(&v, &mut clock);
+                    t.online = true;
+                }),
+                Err(_) => {
+                    clock.sampled = None;
+                    cx.update_live(&TRAFFIC, |t| {
+                        t.online = false;
+                        t.up_rate = 0;
+                        t.down_rate = 0;
+                    })
                 }
             }
-        },
-    );
+        }
+    });
     p.handle(|cx: Cx, Close(id): Close| async move {
         match id {
             Some(id) => cx.core().close_connection(&id).await,
-            None => cx.core().close_all().await,
+            None => {
+                cx.core().close_all().await?;
+                info!("Closed all connections");
+                Ok(())
+            }
         }
     });
     ui(p);
@@ -222,15 +222,11 @@ fn age(started: Instant) -> String {
 }
 
 fn ui(p: &mut Setup) {
-    p.page_fn(
-        PageSpec {
-            id: "connections",
-            title: "Connections",
-            icon: Icon::Activity,
-            order: 35,
-        },
-        page,
-    );
+    p.page::<ConnectionsPage>(PageSpec {
+        title: "Connections",
+        icon: Icon::Activity,
+        order: 35,
+    });
     p.fill(&STATUS, "traffic", 40, traffic_chip);
     p.fill(&PANELS, "traffic", 30, traffic_panel);
     p.fill(&servers::DETAILS, "traffic", 30, |ui, cx, s: &Server| {
@@ -242,7 +238,18 @@ fn ui(p: &mut Setup) {
     });
 }
 
-fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
+/// The filter, kept per window.
+#[derive(Default)]
+struct ConnectionsPage {
+    filter: String,
+}
+impl Page for ConnectionsPage {
+    fn ui(&mut self, ui: &mut egui::Ui, cx: &mut UiCx) {
+        page(ui, cx, &mut self.filter);
+    }
+}
+
+fn page(ui: &mut egui::Ui, cx: &mut UiCx, filter: &mut String) {
     let labels = cx.core().labels();
     let t = cx.live(&TRAFFIC);
     let online = t.online;
@@ -252,8 +259,9 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
         "Core offline".into()
     };
     let mut close_all = false;
-    kit::page_header(ui, "Connections", &counter, |ui| {
-        close_all = kit::Button::ghost("Close all")
+    cx.page_header(ui, &counter, |ui, _| {
+        close_all = kit::Button::secondary("Close all")
+            .icon(Icon::Close)
             .tone(kit::Tone::Danger)
             .enabled(online && !t.conns.is_empty())
             .show(ui)
@@ -277,19 +285,17 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
             ],
         );
     });
-    ui.add_space(theme::SECTION_GAP);
-    let filter_id = egui::Id::unique("connections-filter");
-    let mut filter: String = ui.data(|d| d.get_temp(filter_id)).unwrap_or_default();
-    kit::input(
-        ui,
-        "filter",
-        &mut filter,
-        "Filter by host, rule or server",
-        ui.available_width(),
-        false,
-    );
-    ui.data_mut(|d| d.insert_temp(filter_id, filter.clone()));
-    ui.add_space(theme::SPACE_M);
+    // Nothing to filter yet.
+    if !t.conns.is_empty() || !filter.is_empty() {
+        kit::input(
+            ui,
+            "filter",
+            filter,
+            "Filter by host, rule or server",
+            ui.available_width(),
+        );
+        ui.add_space(theme::SPACE_M);
+    }
     let needle = filter.trim().to_lowercase();
     let matches = |c: &Conn, route: &str| {
         needle.is_empty()
@@ -339,7 +345,7 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
             kit::empty(ui, Icon::Filter, "Nothing matches");
             ui.vertical_centered(|ui| {
                 if kit::Button::secondary("Clear filter").show(ui).clicked() {
-                    ui.data_mut(|d| d.insert_temp(filter_id, String::new()));
+                    filter.clear();
                 }
             });
         }
@@ -359,14 +365,11 @@ fn connection_row(ui: &mut egui::Ui, cx: &mut UiCx, c: &Conn, via: &str, online:
     kit::row(ui, ("conn", &c.id), false, |ui, _| {
         kit::row_line(ui, 54., |ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let close = kit::icon_button_ex(
-                    ui,
-                    Icon::Close,
-                    "Close this connection",
-                    online,
-                    kit::Emphasis::Quiet,
-                    true,
-                );
+                let close = kit::IconButton::new(Icon::Close, "Close this connection")
+                    .enabled(online)
+                    .emphasis(kit::Emphasis::Quiet)
+                    .danger()
+                    .show(ui);
                 if close.clicked() {
                     cx.submit(("close", &c.id), Close(Some(c.id.clone())));
                 }
@@ -436,7 +439,7 @@ fn traffic_chip(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
 fn traffic_panel(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
     let t = cx.live(&TRAFFIC);
     // The Connections page shows the same numbers in its own tiles.
-    if !t.online || !t.active() || cx.page() == "connections" {
+    if !t.online || !t.active() || cx.on_page(&PLUGIN) {
         return;
     }
     panel_title(ui, "Traffic", |ui| {
@@ -459,7 +462,7 @@ fn traffic_panel(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
         .show(ui)
         .clicked()
     {
-        cx.navigate("connections");
+        cx.navigate(&PLUGIN);
     }
 }
 

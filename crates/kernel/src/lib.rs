@@ -1,4 +1,4 @@
-//! # rproxy kernel
+//! # homeport kernel
 //!
 //! The kernel holds no proxy features. It provides the mechanisms plugins are built from:
 //!
@@ -16,10 +16,11 @@
 //! draws the desktop window and every browser session.
 // Stored plugin callbacks are boxed closures; their full types are the API.
 #![allow(clippy::type_complexity)]
-extern crate self as rproxy_kernel;
+extern crate self as homeport_kernel;
 
 pub mod board;
 mod changes;
+pub mod columns;
 pub mod configuration;
 pub mod core;
 mod host;
@@ -27,6 +28,7 @@ mod id;
 pub mod jobs;
 mod kernel;
 pub mod list;
+pub mod logging;
 mod op;
 mod plugin;
 mod setup;
@@ -38,15 +40,17 @@ pub mod ui;
 pub mod updates;
 
 pub use board::{Phase, Run, RunId};
+pub use columns::Columns;
+pub use homeport_derive::Table;
+pub use homeport_kit as kit;
+pub use homeport_kit::egui;
+pub use homeport_mihomo as mihomo;
 pub use host::{Host, Session};
 pub use id::{Id, hex, now, random_bytes};
-pub use kernel::{Cx, Input, Kernel, LiveMark, Notice, NoticeAction, Started};
-pub use op::{Claim, JobSpec, Next, Op, Rank};
+pub use kernel::{Cx, Guard, Input, Kernel, LiveMark, Notice, NoticeAction, Started};
+pub use log;
+pub use op::{Claim, JobSpec, Next, Op, Rank, Repeat};
 pub use plugin::{Category, Platform, Plugin, categories};
-pub use rproxy_derive::Table;
-pub use rproxy_kit as kit;
-pub use rproxy_kit::egui;
-pub use rproxy_mihomo as mihomo;
 pub use setup::Setup;
 pub use slot::{Hook, Slot};
 pub use state::{Changed, Record, Snapshot, State, Write};
@@ -90,6 +94,11 @@ impl Error {
     pub fn msg(message: impl Into<String>) -> Self {
         Self::new("error", message)
     }
+    /// The work was dropped on purpose (stopped, or made stale meanwhile):
+    /// the caller shows no error toast.
+    pub fn cancel(message: impl Into<String>) -> Self {
+        Self::new("cancelled", message)
+    }
     pub fn cancelled(&self) -> bool {
         self.code == "cancelled"
     }
@@ -110,11 +119,21 @@ impl From<&str> for Error {
         Self::msg(m)
     }
 }
-/// For `p.migrate` steps and custom persistence: `sql.execute(..)?`.
+/// For custom persistence: `sql.execute(..)?`.
 impl From<store::rusqlite::Error> for Error {
     fn from(e: store::rusqlite::Error) -> Self {
         Self::new("storage", e.to_string())
     }
+}
+
+/// The `*.sql` files of the crate's `migrations/` folder in name order, for
+/// [`Plugin::migrations`]. The crate's `build.rs` is
+/// `include!("../../crates/kernel/build/migrations.rs");`.
+#[macro_export]
+macro_rules! migrations {
+    () => {
+        include!(concat!(env!("OUT_DIR"), "/migrations.rs"))
+    };
 }
 
 /// `bail!("text {x}")` returns a user-facing error.
@@ -130,8 +149,9 @@ pub mod prelude {
     pub use crate::mihomo::{self, Fragment, Rule as CoreRule, Stage, Target};
     pub use crate::shell::{PANELS, SETTINGS_SECTIONS, STATUS};
     pub use crate::{
-        Category, Changed, Claim, Cx, Error, Hook, Id, JobSpec, Next, Op, Page, PageSpec, Platform,
-        Plugin, Rank, Record, Request, Result, Set, Setup, Slot, Snapshot, Started, State, Table,
-        UiCx, Update, Write, bail, categories, choices, hex, now, random_bytes,
+        Category, Changed, Claim, Columns, Cx, Error, Hook, Id, JobSpec, Next, Op, Page, PageSpec,
+        Platform, Plugin, Rank, Record, Request, Result, Set, Setup, Slot, Snapshot, Started,
+        State, Table, UiCx, Update, Write, bail, categories, choices, hex, now, random_bytes,
     };
+    pub use log::{debug, error, info, warn};
 }

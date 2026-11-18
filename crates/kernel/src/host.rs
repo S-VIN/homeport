@@ -30,11 +30,36 @@ pub struct Host {
 }
 
 /// File name of the plugin-era database inside the data directory.
-pub const DATABASE: &str = "rproxy-plugins.sqlite3";
+pub const DATABASE: &str = "homeport-plugins.sqlite3";
 
 impl Host {
     /// Lock `dir`, open the database and start the kernel with the enabled plugins.
     pub async fn start(catalog: Vec<&'static Plugin>, dir: &Path) -> Result<Arc<Host>> {
+        Self::start_from(catalog, dir, None).await
+    }
+    /// [`Self::start`] with every plugin of `catalog` on in a new installation
+    /// (tests); an existing one keeps its choices.
+    pub async fn start_enabled(catalog: Vec<&'static Plugin>, dir: &Path) -> Result<Arc<Host>> {
+        let preset: String = catalog
+            .iter()
+            .map(|p| {
+                format!(
+                    "INSERT INTO kernel_plugins (id, enabled) VALUES ('{}', 1);\n",
+                    p.id
+                )
+            })
+            .collect();
+        let file = tempfile::NamedTempFile::new().map_err(crate::configuration::io)?;
+        fs::write(file.path(), preset).map_err(crate::configuration::io)?;
+        Self::start_from(catalog, dir, Some(file.path())).await
+    }
+    /// [`Self::start`]; a new installation (no database yet) runs the SQL
+    /// script in the file `preset` once (see [`crate::configuration::seed`]).
+    pub async fn start_from(
+        catalog: Vec<&'static Plugin>,
+        dir: &Path,
+        preset: Option<&Path>,
+    ) -> Result<Arc<Host>> {
         let io = |e: std::io::Error| Error::msg(e.to_string());
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true);
@@ -48,9 +73,15 @@ impl Host {
             .open(dir.join("instance.lock"))
             .map_err(io)?;
         lock.try_lock().map_err(|_| {
-            Error::msg("This data directory is already open in another rproxy instance.")
+            Error::msg("This data directory is already open in another homeport instance.")
         })?;
         let path = dir.join(DATABASE);
+        if let Some(preset) = preset.filter(|_| !path.exists()) {
+            let sql = fs::read_to_string(preset).map_err(|e| {
+                Error::msg(format!("Cannot read the preset {}: {e}", preset.display()))
+            })?;
+            crate::configuration::seed(&catalog, &sql, &path)?;
+        }
         let mut options = fs::OpenOptions::new();
         options.create(true).truncate(false).write(true);
         #[cfg(unix)]
@@ -77,7 +108,7 @@ impl Host {
 
     async fn launch(&self) -> Result<()> {
         if self.closing.load(Ordering::Acquire) {
-            return Err(Error::msg("rproxy is shutting down."));
+            return Err(Error::msg("homeport is shutting down."));
         }
         let me = self.me.clone();
         let restart = Arc::new(move || {
@@ -113,7 +144,7 @@ impl Host {
         .await?;
         if self.closing.load(Ordering::Acquire) {
             k.shutdown().await;
-            return Err(Error::msg("rproxy is shutting down."));
+            return Err(Error::msg("homeport is shutting down."));
         }
         // Repaint every open session when state, jobs or notices change.
         let mut changes = k.changes();
@@ -151,6 +182,7 @@ impl Host {
             if self.closing.load(Ordering::Acquire) {
                 return;
             }
+            log::info!("Restarting to apply plugin changes");
             let old = self.current.write().unwrap().take();
             if let Some(k) = old {
                 k.shutdown().await;
@@ -162,6 +194,9 @@ impl Host {
     /// Start a kernel from the saved profile; a failure is shown instead of the UI.
     async fn relaunch(&self) {
         let result = self.launch().await;
+        if let Err(e) = &result {
+            log::error!("Could not start: {e}");
+        }
         *self.failure.lock().unwrap() = result.err().map(|e| e.message);
         self.repaint();
     }
@@ -177,7 +212,7 @@ impl Host {
     async fn import_inner(&self, config: Arc<crate::configuration::Import>) -> Result<()> {
         let _r = self.restarting.lock().await;
         if self.closing.load(Ordering::Acquire) {
-            return Err(Error::msg("rproxy is shutting down."));
+            return Err(Error::msg("homeport is shutting down."));
         }
         let previous = tempfile::tempdir().map_err(crate::configuration::io)?;
         let rollback = previous.path().join("rollback.sqlite3");
@@ -217,6 +252,7 @@ impl Host {
             )));
         }
         *self.failure.lock().unwrap() = None;
+        log::info!("Configuration imported; settings and lists replaced");
         if let Some(k) = self.try_kernel() {
             k.notify(
                 "Configuration imported",
@@ -232,6 +268,7 @@ impl Host {
         let _r = self.restarting.lock().await;
         let old = self.current.write().unwrap().take();
         if let Some(k) = old {
+            log::info!("Shutting down");
             k.shutdown().await;
         }
     }
@@ -284,7 +321,7 @@ impl Session {
     }
     /// The native window closed but the session waits for the next one: free
     /// the old context (fonts, atlas, GPU handles) and stop repainting it, so
-    /// plugins see no open UI while rproxy sits in the tray.
+    /// plugins see no open UI while homeport sits in the tray.
     pub fn detach(&mut self) {
         self.move_to(&egui::Context::default());
         self.host
@@ -319,7 +356,10 @@ impl Session {
                     ui.add_space(ui.available_height() / 3.);
                     match failure {
                         Some(e) => {
-                            ui.label(crate::kit::bold("rproxy could not start its plugins", 15.));
+                            ui.label(crate::kit::bold(
+                                "homeport could not start its plugins",
+                                15.,
+                            ));
                             ui.label(e);
                             if crate::kit::action(ui, "Try again", true) {
                                 let h = self.host.clone();

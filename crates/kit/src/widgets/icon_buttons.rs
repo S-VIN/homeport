@@ -19,52 +19,84 @@ pub enum Emphasis {
 
 /// 26×26 ghost icon button with a tooltip and an accessible label.
 pub fn icon_button(ui: &mut Ui, icon: Icon, label: &str, enabled: bool) -> Response {
-    icon_button_ex(ui, icon, label, enabled, Emphasis::Normal, false)
+    IconButton::new(icon, label).enabled(enabled).show(ui)
 }
-/// Icon button for row actions; `danger` turns it red on hover only.
-pub fn icon_button_ex(
-    ui: &mut Ui,
+/// [`icon_button`] for row actions:
+/// `IconButton::new(Icon::Close, "Close").emphasis(Emphasis::Quiet).danger().show(ui)`.
+pub struct IconButton<'a> {
     icon: Icon,
-    label: &str,
+    label: &'a str,
     enabled: bool,
     emphasis: Emphasis,
     danger: bool,
-) -> Response {
-    let p = theme::palette(ui);
-    let (rect, response) = ui.allocate_exact_size(
-        vec2(CONTROL, CONTROL),
-        if enabled {
-            Sense::click()
-        } else {
-            Sense::hover()
-        },
-    );
-    let active = enabled && (response.hovered() || response.has_focus());
-    let ink = if !enabled {
-        p.faint.gamma_multiply(0.6)
-    } else if active {
-        if danger { p.danger } else { p.foreground }
-    } else if emphasis == Emphasis::Quiet {
-        quiet_ink(&p)
-    } else {
-        p.muted
-    };
-    if active {
-        let fill = if danger { p.soft(p.danger) } else { p.subtle };
-        ui.painter().rect_filled(rect, RADIUS_CONTROL, fill);
+}
+impl<'a> IconButton<'a> {
+    pub fn new(icon: Icon, label: &'a str) -> Self {
+        Self {
+            icon,
+            label,
+            enabled: true,
+            emphasis: Emphasis::Normal,
+            danger: false,
+        }
     }
-    let size = if matches!(icon, Icon::Up | Icon::Down) {
-        14.
-    } else {
-        crate::icons::SIZE
-    };
-    crate::icons::paint_sized(ui.painter(), rect.center(), icon, size, ink);
-    focus_ring(ui, &response);
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
-    if enabled {
-        response.on_hover_text(label)
-    } else {
-        response
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+    pub fn emphasis(mut self, emphasis: Emphasis) -> Self {
+        self.emphasis = emphasis;
+        self
+    }
+    /// Red under the pointer only (delete, close).
+    pub fn danger(mut self) -> Self {
+        self.danger = true;
+        self
+    }
+    pub fn show(self, ui: &mut Ui) -> Response {
+        let Self {
+            icon,
+            label,
+            enabled,
+            emphasis,
+            danger,
+        } = self;
+        let p = theme::palette(ui);
+        let (rect, response) = ui.allocate_exact_size(
+            vec2(CONTROL, CONTROL),
+            if enabled {
+                Sense::click()
+            } else {
+                Sense::hover()
+            },
+        );
+        let active = enabled && (response.hovered() || response.has_focus());
+        let ink = if !enabled {
+            p.faint.gamma_multiply(0.6)
+        } else if active {
+            if danger { p.danger } else { p.foreground }
+        } else if emphasis == Emphasis::Quiet {
+            quiet_ink(&p)
+        } else {
+            p.muted
+        };
+        if active {
+            let fill = if danger { p.soft(p.danger) } else { p.subtle };
+            ui.painter().rect_filled(rect, RADIUS_CONTROL, fill);
+        }
+        let size = if matches!(icon, Icon::Up | Icon::Down) {
+            14.
+        } else {
+            crate::icons::SIZE
+        };
+        crate::icons::paint_sized(ui.painter(), rect.center(), icon, size, ink);
+        focus_ring(ui, &response);
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
+        if enabled {
+            response.on_hover_text(label)
+        } else {
+            response
+        }
     }
 }
 

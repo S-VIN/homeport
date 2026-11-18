@@ -1,5 +1,5 @@
 //! A saved tunnel must not prevent ordinary proxy use when authorization fails.
-use rproxy_kernel::{Host, prelude::*};
+use homeport_kernel::{Host, prelude::*};
 
 #[derive(Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Settings {
@@ -12,9 +12,9 @@ static PLUGIN: Plugin = Plugin {
     name: "Tunnel test",
     setup: |p| {
         p.editable_setting(&SETTINGS);
-        p.core(|s| rproxy_kernel::mihomo::Fragment {
+        p.core(|s| homeport_kernel::mihomo::Fragment {
             tun: (!s.get(&SETTINGS).off)
-                .then_some(rproxy_kernel::mihomo::Tun { strict_route: true }),
+                .then_some(homeport_kernel::mihomo::Tun { strict_route: true }),
             ..Default::default()
         });
         Ok(())
@@ -26,7 +26,9 @@ static PLUGIN: Plugin = Plugin {
 async fn saved_tun_authorization_failure_keeps_the_core_available_and_is_not_retried_on_writes() {
     let dir = tempfile::tempdir().unwrap();
     // Library hosts have no interactive supervisor configured.
-    let host = Host::start(vec![&PLUGIN], dir.path()).await.unwrap();
+    let host = Host::start_enabled(vec![&PLUGIN], dir.path())
+        .await
+        .unwrap();
     let k = host.kernel();
     let cx = k.cx_for("tun-test");
     assert!(k.core_status().running());

@@ -1,9 +1,9 @@
 [package]
-name = "rproxy-kit"
+name = "homeport-kit"
 version = "0.2.0"
 edition = "2024"
 publish = false
-description = "rproxy design system for egui: tokens, palette, fonts, icons, widgets"
+description = "homeport design system for egui: tokens, palette, fonts, icons, widgets"
 
 [dependencies]
 egui = { workspace = true }

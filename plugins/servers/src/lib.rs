@@ -1,22 +1,28 @@
 //! # servers (required)
 //!
 //! The outbound catalog every other plugin builds on: servers grouped by
-//! source, the manual selection and the main route of mihomo.
+//! source, the manual selection and the main route of mihomo, server tests
+//! with their rating ([`checks`]) and Auto select on them ([`auto`]).
 //!
 //! Extension points for other plugins:
-//! * ops [`ReplaceFromSource`], [`RemoveSource`], [`Select`];
-//! * hooks [`EXCLUDE`] (why a server must not be used), [`SOURCE_LABEL`],
-//!   [`SOURCE_HUE`], [`SOURCE_RANK`], [`ROUTE`], [`FAILOVER`], [`IDLE`],
+//! * ops [`ReplaceFromSource`], [`RemoveSource`], [`Select`], [`CheckAll`];
+//! * tests: checks that count in the rating ([`CHECKS`], [`add_check`]) and
+//!   the way tests reach a server ([`TEST_PATH`]);
+//! * hooks [`EXCLUDE`] (why a server must not be used), [`SOURCE`] (label,
+//!   color and priority of a source), [`ROUTE`], [`FAILOVER`], [`IDLE`],
 //!   [`FREEZE`]; columns ([`column`]) may sort the list;
 //! * UI zones on the Servers page: [`TOOLBAR`], [`COLUMNS`],
 //!   [`DETAILS`] and in the connection card: [`CONNECTION`].
+pub mod auto;
+mod checks;
 mod import;
 mod link;
 mod ui;
 
+pub use checks::*;
+use homeport_kernel::{prelude::*, shell::TrayLink};
 pub use import::{Options, Proxy};
 pub use link::is_link;
-use rproxy_kernel::{prelude::*, shell::TrayLink};
 use std::collections::HashSet;
 
 pub static PLUGIN: Plugin = Plugin {
@@ -25,6 +31,7 @@ pub static PLUGIN: Plugin = Plugin {
     description: "Server catalog, manual connection and the main route.",
     category: categories::SERVERS,
     required: true,
+    migrations: homeport_kernel::migrations!(),
     setup,
     ..Plugin::DEFAULT
 };
@@ -80,6 +87,23 @@ pub fn route(snap: &Snapshot) -> Target {
     snap.first(&ROUTE, &())
         .unwrap_or_else(|| Target::Group(MAIN.into()))
 }
+/// How proxied traffic leaves, for a status line: tone, icon and text
+/// ("Via the selected server", "Blocked: no server is selected").
+pub fn route_text(snap: &Snapshot) -> (kit::Tone, Icon, &'static str) {
+    match route(snap) {
+        Target::Reject => (kit::Tone::Danger, Icon::Error, "Blocked"),
+        Target::Direct => (kit::Tone::Success, Icon::Exit, "Leaves from this device"),
+        Target::Group(g) if g == MAIN && selected(snap).is_none() => (
+            kit::Tone::Danger,
+            Icon::Error,
+            "Blocked: no server is selected",
+        ),
+        Target::Group(g) if g == MAIN => {
+            (kit::Tone::Neutral, Icon::Routing, "Via the selected server")
+        }
+        _ => (kit::Tone::Neutral, Icon::Routing, "Via the proxy chain"),
+    }
+}
 
 // ---- ops ------------------------------------------------------------------
 
@@ -87,11 +111,10 @@ pub fn route(snap: &Snapshot) -> Target {
 pub struct ReplaceFromSource {
     pub source: Id,
     pub proxies: Vec<Proxy>,
-    /// Checked in the same write as the replacement: `false` drops a stale
-    /// response (say, the subscription link changed while it was loading).
-    pub still_current: Option<SourceCheck>,
+    /// Checked in the same write as the replacement: drops a stale response
+    /// (say, the subscription link changed while it was loading).
+    pub guard: Option<homeport_kernel::Guard>,
 }
-pub type SourceCheck = Box<dyn FnOnce(&rproxy_kernel::Write<'_>) -> bool + Send>;
 #[derive(Clone, Debug, Default)]
 pub struct Replaced {
     pub added: Vec<Id>,
@@ -140,11 +163,8 @@ async fn replace_source(cx: Cx, op: ReplaceFromSource) -> Result<Replaced> {
         }
     }
     cx.write(move |w| {
-        if !op.still_current.is_none_or(|check| check(w)) {
-            return Err(Error::new(
-                "cancelled",
-                "Subscription changed while loading",
-            ));
+        if let Some(guard) = &op.guard {
+            guard.check(w)?;
         }
         let before: Vec<Id> = w
             .get(&SERVERS)
@@ -234,24 +254,26 @@ pub struct Exclusion {
     pub reason: String,
     pub group: &'static str,
     /// The user's choice (e.g. a name filter): the server is never tested and
-    /// is disconnected when selected. Otherwise (e.g. it failed a test) it is
-    /// only avoided and tested again.
+    /// is disconnected when selected. Otherwise (e.g. it failed a test)
+    /// automatic choices avoid it and tests retry it; the user may still connect.
     pub permanent: bool,
 }
 pub static EXCLUDE: Hook<Server, Option<Exclusion>> = Hook::new("servers.exclude");
-/// Human label of a source id (e.g. the subscription host).
-pub static SOURCE_LABEL: Hook<Id, Option<String>> = Hook::new("servers.source-label");
-/// Priority of a source for automatic choices: lower first (e.g. the
-/// subscription's position in its list). Unranked sources come last.
-pub static SOURCE_RANK: Hook<Id, Option<usize>> = Hook::new("servers.source-rank");
-/// Tag color of a source (index into the kit's tag colors), so every screen
-/// shows a source in the same color. Without an answer the id picks one.
-pub static SOURCE_HUE: Hook<Id, Option<usize>> = Hook::new("servers.source-hue");
-/// The sort key of a column: lower keys first in its natural order.
-pub type SortKey = fn(&Snapshot, &Server) -> i64;
-/// Sortable columns, by column id (filled by [`column`]).
-pub(crate) static SORT_KEYS: Hook<(), Option<(&'static str, SortKey)>> =
-    Hook::new("servers.sort-keys");
+/// What the owner of a source (e.g. a subscription) says about it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SourceInfo {
+    /// What the source is, e.g. "Subscription" (names its field and filter).
+    pub kind: &'static str,
+    /// Human label, e.g. the subscription host.
+    pub label: String,
+    /// Tag color (index into the kit's tag colors): every screen shows the
+    /// source in the same color.
+    pub hue: usize,
+    /// Priority for automatic choices, lower first (e.g. the position in the list).
+    pub rank: usize,
+}
+/// About a source id; see [`source`] for the answer without an owner.
+pub static SOURCE: Hook<Id, Option<SourceInfo>> = Hook::new("servers.source");
 /// Keep row order stable (e.g. while a check updates ratings).
 pub static FREEZE: Hook<(), bool> = Hook::new("servers.freeze");
 /// Backup servers for the connected one (the hook input). With an answer and
@@ -274,15 +296,15 @@ pub static IDLE: Hook<(), Option<String>> = Hook::exclusive("servers.idle");
 pub fn exclusion(snap: &Snapshot, s: &Server) -> Option<Exclusion> {
     snap.first(&EXCLUDE, s)
 }
-pub(crate) fn source_label(snap: &Snapshot, id: Id) -> String {
-    snap.first(&SOURCE_LABEL, &id)
-        .unwrap_or_else(|| "Subscription".into())
-}
-pub fn source_rank(snap: &Snapshot, id: Id) -> Option<usize> {
-    snap.first(&SOURCE_RANK, &id)
-}
-pub fn source_hue(snap: &Snapshot, id: Id) -> usize {
-    snap.first(&SOURCE_HUE, &id).unwrap_or_else(|| hue_of(id))
+/// [`SOURCE`], or for a source nobody describes: "Source", a color its id
+/// picks and the last rank.
+pub fn source(snap: &Snapshot, id: Id) -> SourceInfo {
+    snap.first(&SOURCE, &id).unwrap_or_else(|| SourceInfo {
+        kind: "Source",
+        label: "Source".into(),
+        hue: hue_of(id),
+        rank: usize::MAX,
+    })
 }
 /// The preferred tag color of an id (stable across runs).
 pub fn hue_of(id: Id) -> usize {
@@ -298,8 +320,8 @@ pub(crate) fn source_tag(
     id: Id,
     max_width: f32,
 ) -> egui::Response {
-    let label = source_label(snap, id);
-    kit::tag(ui, &label, source_hue(snap, id), max_width)
+    let SourceInfo { label, hue, .. } = source(snap, id);
+    kit::tag(ui, &label, hue, max_width)
 }
 /// Sort key that orders "Auto 2" before "Auto 10" (case-insensitive,
 /// ignoring leading emoji).
@@ -339,10 +361,14 @@ pub fn selected(snap: &Snapshot) -> Option<Server> {
 /// Inline controls in the Servers toolbar (toggles, task buttons).
 pub static TOOLBAR: Slot<()> =
     Slot::new("servers.toolbar", "Servers page toolbar: compact controls");
-/// Fixed-width cells on the right of every row. Draw a caption when `header`.
-/// Fill it through [`column`].
-pub static COLUMNS: Slot<Cell> =
-    Slot::new("servers.columns", "Servers rows: extra fixed-width columns");
+/// Under "No servers yet": ways to get servers.
+pub static EMPTY: Slot<()> = Slot::new(
+    "servers.empty",
+    "Servers page without servers: ways to add some",
+);
+/// Columns on the right of every row (rating, latency…): `p.column(&COLUMNS, …)`.
+pub static COLUMNS: Columns<Server> =
+    Columns::new("servers.columns", "Servers rows: extra columns");
 /// Sections in an expanded server row.
 pub static DETAILS: Slot<Server> =
     Slot::new("servers.details", "Expanded server: extra properties");
@@ -352,70 +378,6 @@ pub static CONNECTION: Slot<Server> = Slot::new(
     "Connection card: lines about the selected server",
 );
 
-/// What a column contribution draws: a caption (`server == None`) or a cell.
-pub struct Cell {
-    /// `None` in the header row.
-    pub(crate) server: Option<Server>,
-    pub(crate) wide: bool,
-    /// The server can't be used: its cells are muted.
-    pub(crate) excluded: bool,
-    /// Header row: the list's sort (column id and direction).
-    pub(crate) sort: kit::Sort<&'static str>,
-}
-/// Where a clicked column caption leaves its id for the page.
-pub(crate) fn sort_click() -> egui::Id {
-    egui::Id::unique("servers-sort-click")
-}
-
-/// An extra column of the server list (see [`column`]).
-pub struct Column {
-    /// Unique within the plugin.
-    pub id: &'static str,
-    /// Lower is further left.
-    pub order: i32,
-    pub title: &'static str,
-    /// Tooltip of the title.
-    pub help: &'static str,
-    /// Hidden when the list is narrow (a phone): only the most useful columns stay.
-    pub secondary: bool,
-    /// Click the caption to sort by this key (lower first; again to reverse).
-    pub sort: Option<SortKey>,
-}
-/// Add a column to the server list: `cell` draws one server's value. The list
-/// draws the title, keeps the columns aligned and drops secondary ones on
-/// narrow screens.
-pub fn column(
-    p: &mut Setup,
-    c: Column,
-    cell: impl Fn(&mut egui::Ui, &mut UiCx, &Server) + Send + Sync + 'static,
-) {
-    if let Some(key) = c.sort {
-        let id = c.id;
-        p.hook(&SORT_KEYS, move |_, _| Some((id, key)));
-    }
-    p.fill(&COLUMNS, c.id, c.order, move |ui, cx, props: &Cell| {
-        if c.secondary && !props.wide {
-            return;
-        }
-        kit::cell_right(ui, 60., |ui| match &props.server {
-            None if c.sort.is_some() => {
-                let r = ui.scope(|ui| kit::sort_caption(ui, c.title, props.sort.of(c.id), true));
-                if r.inner {
-                    ui.data_mut(|d| d.insert_temp(sort_click(), c.id));
-                }
-                r.response.on_hover_text(c.help);
-            }
-            None => drop(kit::caption(ui, c.title).on_hover_text(c.help)),
-            Some(s) => {
-                if props.excluded {
-                    ui.multiply_opacity(0.45);
-                }
-                cell(ui, cx, s)
-            }
-        });
-    });
-}
-
 fn setup(p: &mut Setup) -> Result<()> {
     p.collection(&SERVERS);
     p.setting(&SELECTED);
@@ -423,25 +385,23 @@ fn setup(p: &mut Setup) -> Result<()> {
     p.handle(replace_source);
     p.handle(remove_source);
     p.handle(select);
-    // A filter that excludes the connected server disconnects it.
-    p.on(|cx: Cx, _: Changed| async move {
-        let snap = cx.snapshot();
-        if let Some(s) = selected(&snap)
-            && let Some(e) = exclusion(&snap, &s).filter(|e| e.permanent)
-        {
-            cx.call(Select::auto(None, Some(s.id))).await?;
-            cx.notify(&format!("Disconnected {}: {}", s.name, e.reason));
-            cx.emit(Excluded {
-                server: s,
-                reason: e.reason,
-            });
-        }
-        Ok(())
-    });
+    // A filter that excludes the connected server disconnects it, also one
+    // turned on while the app was closed.
+    p.watch(excluded_selection, |cx: Cx, _| disconnect_excluded(cx));
+    p.on(|cx: Cx, _: Started| disconnect_excluded(cx));
     p.core(fragment);
-    p.hook(&rproxy_kernel::shell::TRAY, |snap, _| {
-        snap.get(&SELECTED).map(|_| TrayLink::Connected)
+    // Red when the connected server failed its last test.
+    p.hook(&homeport_kernel::shell::TRAY, |snap, _| {
+        let id = (*snap.get(&SELECTED))?;
+        Some(
+            match health(snap, id).is_some_and(|h| h.rating == Some(0)) {
+                true => TrayLink::Failed,
+                false => TrayLink::Connected,
+            },
+        )
     });
+    checks::register(p);
+    auto::setup(p);
     ui::register(p);
     Ok(())
 }
@@ -480,7 +440,8 @@ async fn select(cx: Cx, op: Select) -> Result<()> {
             .find(|s| s.id == id)
             .cloned()
             .ok_or_else(|| Error::msg("Server no longer exists."))?;
-        if let Some(e) = exclusion(&snap, &server) {
+        // A manual choice may override a failed test, never a filter.
+        if let Some(e) = exclusion(&snap, &server).filter(|e| e.permanent || op.auto.is_some()) {
             bail!("{}", e.reason);
         }
         if !cx.core().status().running() {
@@ -490,16 +451,46 @@ async fn select(cx: Cx, op: Select) -> Result<()> {
     cx.write(move |w| {
         let from = *w.get(&SELECTED);
         if op.auto.is_some_and(|expected| expected != from) {
-            return Err(Error::new("cancelled", "The selection changed meanwhile."));
+            return Err(Error::cancel("The selection changed meanwhile."));
+        }
+        if op
+            .id
+            .is_some_and(|id| !w.get(&SERVERS).iter().any(|s| s.id == id))
+        {
+            bail!("Server no longer exists.");
         }
         set_selected(w, op.id, op.auto.is_some());
         Ok(())
     })
-    .await
+    .await?;
+    // Policies say why they switch themselves.
+    if op.auto.is_none() {
+        match op.id.and_then(|id| server(&cx.snapshot(), id)) {
+            Some(s) => info!("Connected to {}", s.name),
+            None => info!("Disconnected"),
+        }
+    }
+    Ok(())
+}
+
+/// The connected server, when the user's choice (a filter) excludes it.
+fn excluded_selection(snap: &Snapshot) -> Option<(Server, String)> {
+    let s = selected(snap)?;
+    let e = exclusion(snap, &s).filter(|e| e.permanent)?;
+    Some((s, e.reason))
+}
+async fn disconnect_excluded(cx: Cx) -> Result<()> {
+    let Some((s, reason)) = excluded_selection(&cx.snapshot()) else {
+        return Ok(());
+    };
+    cx.call(Select::auto(None, Some(s.id))).await?;
+    cx.notify(&format!("Disconnected {}: {reason}", s.name));
+    cx.emit(Excluded { server: s, reason });
+    Ok(())
 }
 
 /// The only writer of [`SELECTED`]: every change emits [`SelectionChanged`].
-fn set_selected(w: &mut rproxy_kernel::Write<'_>, to: Option<Id>, auto: bool) {
+fn set_selected(w: &mut homeport_kernel::Write<'_>, to: Option<Id>, auto: bool) {
     let from = *w.get(&SELECTED);
     if from != to {
         w.set(&SELECTED, to);
@@ -601,12 +592,13 @@ pub(crate) fn details(s: &Server) -> (Properties, Properties) {
             .filter(|v| !v.is_empty())
     };
     let tls = s.options.0.get("tls").and_then(|v| v.as_bool()) == Some(true);
+    let reality = s.options.0.contains_key("reality-opts");
     let mut common = vec![(
         "TLS".to_string(),
-        if tls || s.protocol.implies_tls() {
-            "On"
-        } else {
-            "Off"
+        match (reality, tls || s.protocol.implies_tls()) {
+            (true, _) => "REALITY",
+            (false, true) => "On",
+            (false, false) => "Off",
         }
         .to_string(),
     )];

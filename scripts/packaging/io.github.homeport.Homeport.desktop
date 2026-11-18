@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=homeport
+Comment=Proxy manager
+Exec=homeport
+Icon=io.github.homeport.Homeport
+Terminal=false
+Categories=Network;
+StartupWMClass=io.github.homeport.Homeport

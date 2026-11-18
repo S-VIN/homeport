@@ -1,4 +1,4 @@
-use super::{Table, db, quoted};
+use super::{Table, db};
 use crate::{Error, Result};
 use rusqlite::{Connection, ToSql, types::FromSql};
 
@@ -38,8 +38,6 @@ pub struct Column {
     pub name: &'static str,
     pub sql_type: &'static str,
     pub nullable: bool,
-    /// SQL literal for rows that existed before the column (`#[column(default)]`).
-    pub default: Option<&'static str>,
 }
 impl Column {
     pub const fn of<T: ColumnType>(name: &'static str) -> Self {
@@ -47,76 +45,42 @@ impl Column {
             name,
             sql_type: T::SQL_TYPE,
             nullable: T::NULLABLE,
-            default: None,
         }
-    }
-    pub const fn with_default(mut self, default: &'static str) -> Self {
-        self.default = Some(default);
-        self
-    }
-    fn definition(&self, key: &str) -> String {
-        let null = if self.nullable { "" } else { " NOT NULL" };
-        let pk = if self.name == key { " PRIMARY KEY" } else { "" };
-        let default = self
-            .default
-            .map(|d| format!(" DEFAULT {d}"))
-            .unwrap_or_default();
-        format!("{} {}{null}{default}{pk}", quoted(self.name), self.sql_type)
     }
 }
 
-/// Bring the table in line with `T`.
-///
-/// The lenient pass (before migrations) only adds new columns that need no
-/// data (nullable or with a default) to a table that exists, and leaves
-/// everything else to the migrations: a renamed table, a changed column, a
-/// column that has to be filled. The strict pass (after them) creates missing
-/// tables and refuses anything that still differs.
-pub(super) fn ensure<T: Table>(conn: &Connection, name: &str, strict: bool) -> Result<()> {
-    let table = quoted(name);
+/// The table, created by migration scripts, has exactly the columns of `T`:
+/// same names, types, nullability and primary key.
+pub(super) fn verify<T: Table>(conn: &Connection, name: &str) -> Result<()> {
     let existing = columns_of(conn, name)?;
-    if existing.is_empty() {
-        if strict {
-            let definitions: Vec<_> = T::COLUMNS.iter().map(|c| c.definition(T::KEY)).collect();
-            conn.execute(
-                &format!("CREATE TABLE {table} ({}) STRICT", definitions.join(", ")),
-                [],
-            )
-            .map_err(db)?;
-        }
-        return Ok(());
-    }
-    let migration = |column: &str| {
+    let wrong = |what: String| {
         Error::new(
             "schema",
-            format!("Column {table}.{column} requires an explicit migration"),
+            format!("Table {name} {what}: change it with a migration script."),
         )
     };
-    if strict {
-        for (name, ty, required, pk) in &existing {
-            let column = T::COLUMNS
-                .iter()
-                .find(|c| c.name == name)
-                .ok_or_else(|| migration(name))?;
-            let key = i32::from(column.name == T::KEY);
-            if ty != column.sql_type || *required == column.nullable || *pk != key {
-                return Err(migration(name));
-            }
+    if existing.is_empty() {
+        return Err(wrong("does not exist".into()));
+    }
+    for (column, ty, required, pk) in &existing {
+        let Some(c) = T::COLUMNS.iter().find(|c| c.name == column) else {
+            return Err(wrong(format!("has column {column}, which its type lacks")));
+        };
+        let key = i32::from(c.name == T::KEY);
+        if ty != c.sql_type || *required == c.nullable || *pk != key {
+            let null = if c.nullable { "" } else { " NOT NULL" };
+            let primary = if key == 1 { " PRIMARY KEY" } else { "" };
+            return Err(wrong(format!(
+                "declares {column} differently from its type ({} {}{null}{primary})",
+                column, c.sql_type
+            )));
         }
     }
-    for column in T::COLUMNS
+    if let Some(c) = T::COLUMNS
         .iter()
-        .filter(|c| !existing.iter().any(|(n, ..)| n == c.name))
+        .find(|c| !existing.iter().any(|(n, ..)| n == c.name))
     {
-        if column.nullable || column.default.is_some() {
-            let sql = format!(
-                "ALTER TABLE {table} ADD COLUMN {}",
-                column.definition(T::KEY)
-            );
-            conn.execute(&sql, []).map_err(db)?;
-        } else if strict {
-            return Err(migration(column.name));
-        }
+        return Err(wrong(format!("lacks column {}", c.name)));
     }
     Ok(())
 }

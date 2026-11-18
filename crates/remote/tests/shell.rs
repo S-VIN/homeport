@@ -1,10 +1,10 @@
 use egui::epaint::Primitive;
-use rproxy_remote::{Frame, Scene, host::Encoder, unpack};
+use homeport_remote::{Frame, Scene, host::Encoder, unpack};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn kernel_shell_survives_the_wire() {
     let dir = tempfile::tempdir().unwrap();
-    let host = rproxy_kernel::Host::start(vec![], dir.path())
+    let host = homeport_kernel::Host::start(vec![], dir.path())
         .await
         .unwrap();
     let ctx = egui::Context::default();

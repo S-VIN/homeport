@@ -1,15 +1,16 @@
 //! # name-filters
 //! Exclude servers whose names match a pattern (`*` matches any text).
 //! Its own page holds the patterns; the Servers header links to it. Answers `servers::EXCLUDE`.
+use homeport_kernel::{kit, prelude::*, ui::Column, ui::ListEditor};
 use plugin_servers::{self as servers, Exclusion};
-use rproxy_kernel::{kit, prelude::*, ui::Column, ui::ListEditor};
 
 pub static PLUGIN: Plugin = Plugin {
     id: "name-filters",
     name: "Exclude by name",
     description: "Hide and never use servers whose names match a pattern, e.g. *test* or RU*.",
     category: categories::SERVERS,
-    requires: &["servers"],
+    requires: &[&plugin_servers::PLUGIN],
+    migrations: homeport_kernel::migrations!(),
     setup,
     ..Plugin::DEFAULT
 };
@@ -71,16 +72,15 @@ fn setup(p: &mut Setup) -> Result<()> {
     // The Servers header keeps a shortcut with the number of patterns.
     p.fill(&servers::TOOLBAR, "filters", 50, |ui, cx, _| {
         let n = cx.get(&FILTERS).len();
-        if kit::tool_button(ui, Icon::Filter, "Exclude by name", n, false).clicked() {
-            cx.navigate("name-filters");
+        if kit::tool_button(ui, Icon::Filter, "Exclude by name", n).clicked() {
+            cx.navigate(&PLUGIN);
         }
     });
     p.page_fn(
         PageSpec {
-            id: "name-filters",
             title: "Exclude by name",
             icon: Icon::Filter,
-            order: 42,
+            order: 52,
         },
         page,
     );
@@ -107,7 +107,7 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
             kit::plural(h, "server", "servers")
         ),
     };
-    kit::page_header(ui, "Exclude by name", &counter, |_| {});
+    cx.page_header(ui, &counter, |_, _| {});
     let matches = names.clone();
     ListEditor::new(&FILTERS)
         .unordered()
@@ -125,7 +125,6 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
                     &mut f.pattern,
                     "Name pattern, e.g. *test*",
                     width,
-                    false,
                 )
                 .on_hover_text("Matches the whole name; * matches any text. Case is ignored.");
                 kit::submitted(ui, &r) && !f.pattern.trim().is_empty()

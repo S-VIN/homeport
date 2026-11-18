@@ -7,8 +7,28 @@ pub fn input(
     value: &mut String,
     placeholder: &str,
     width: f32,
+) -> Response {
+    text_input(ui, id, value, placeholder, width, false)
+}
+/// [`input`] that hides what is typed.
+pub fn password(
+    ui: &mut Ui,
+    id: impl egui::AsIdSalt,
+    value: &mut String,
+    placeholder: &str,
+    width: f32,
+) -> Response {
+    text_input(ui, id, value, placeholder, width, true)
+}
+fn text_input(
+    ui: &mut Ui,
+    id: impl egui::AsIdSalt,
+    value: &mut String,
+    placeholder: &str,
+    width: f32,
     secret: bool,
 ) -> Response {
+    let width = width * super::settings::stretch(ui);
     ui.push_id(id, |ui| {
         ui.add(
             egui::TextEdit::singleline(value)
@@ -107,7 +127,7 @@ pub fn field(
     let mut draft: String = ui
         .data(|d| d.get_temp(key))
         .unwrap_or_else(|| saved.to_owned());
-    let r = input(ui, id, &mut draft, placeholder, width, false);
+    let r = input(ui, id, &mut draft, placeholder, width);
     let mut out = None;
     if r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         draft = saved.to_owned();
@@ -257,6 +277,8 @@ impl<'a> Fields<'a> {
             .iter()
             .filter(|f| matches!(f, Field::Input { .. }))
             .count() as f32;
+        // Too narrow (a phone): one field per line, full width, in the same order.
+        let stacked = inputs > 0. && natural > 0. && self.width - natural < inputs * (160. + gap);
         // Choices give up width (down to their share) before inputs get narrower than 80.
         let room = self.width - inputs * (80. + gap);
         let scale = if natural > room && natural > 0. {
@@ -267,31 +289,46 @@ impl<'a> Fields<'a> {
         let fixed = natural * scale;
         // `width` ends where the next control starts after one more gap, so
         // the fields together leave out the last gap only.
-        let rest = if inputs > 0. {
+        let rest = if stacked {
+            self.width
+        } else if inputs > 0. {
             ((self.width - fixed + gap) / inputs - gap).max(60.)
         } else {
             0.
         };
-        let fit = move |text: &str| (fit(text) + gap) * scale - gap;
-        let mut submitted = false;
-        for field in self.items {
-            match field {
-                Field::Input {
-                    id,
-                    value,
-                    placeholder,
-                    help,
-                } => {
-                    let r = input(ui, id, value, placeholder, rest, false);
-                    let r = if help.is_empty() {
-                        r
-                    } else {
-                        r.on_hover_text(help)
-                    };
-                    submitted |= self::submitted(ui, &r);
-                }
-                Field::Fixed { text, draw } => draw(ui, fit(&text)),
+        let width = self.width;
+        let fit = move |text: &str| {
+            if stacked {
+                width
+            } else {
+                (fit(text) + gap) * scale - gap
             }
+        };
+        let mut submitted = false;
+        let mut draw = |ui: &mut Ui, field: Field<'a>| match field {
+            Field::Input {
+                id,
+                value,
+                placeholder,
+                help,
+            } => {
+                let r = input(ui, id, value, placeholder, rest);
+                let r = if help.is_empty() {
+                    r
+                } else {
+                    r.on_hover_text(help)
+                };
+                submitted |= self::submitted(ui, &r);
+            }
+            Field::Fixed { text, draw } => draw(ui, fit(&text)),
+        };
+        if stacked {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = theme::SPACE_S;
+                self.items.into_iter().for_each(|f| draw(ui, f));
+            });
+        } else {
+            self.items.into_iter().for_each(|f| draw(ui, f));
         }
         submitted
     }

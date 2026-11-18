@@ -5,6 +5,6 @@ edition = "2024"
 publish = false
 
 [dependencies]
-rproxy-kernel = { path = "../../crates/kernel" }
+homeport-kernel = { path = "../../crates/kernel" }
 plugin-servers = { path = "../servers" }
 serde = { workspace = true }

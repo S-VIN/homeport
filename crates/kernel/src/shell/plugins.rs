@@ -5,13 +5,13 @@ use super::*;
 pub(super) fn plugin_link(cx: &UiCx, plugin: usize) -> Option<(&'static str, String)> {
     let reg = &cx.k.reg;
     if let Some(page) = reg.pages.iter().find(|e| e.plugin == plugin) {
-        return Some((page.spec.id, format!("Open {}", page.spec.title)));
+        return Some((page.id, format!("Open {}", page.spec.title)));
     }
     // A zone on another plugin's page ("servers.toolbar" → the Servers page).
     for (slot, _) in reg.fills.iter().filter(|(_, p)| *p == plugin) {
         let owner = slot.split('.').next().unwrap_or_default();
-        if let Some(page) = reg.pages.iter().find(|e| reg.plugins[e.plugin].id == owner) {
-            return Some((page.spec.id, format!("Open {}", page.spec.title)));
+        if let Some(page) = reg.pages.iter().find(|e| e.id == owner) {
+            return Some((page.id, format!("Open {}", page.spec.title)));
         }
     }
     reg.fills
@@ -62,7 +62,19 @@ pub(super) fn plugin_manager(ui: &mut egui::Ui, cx: &mut UiCx) {
                     ui,
                     pl.id,
                     |ui| {
-                        ui.label(RichText::new(pl.name).color(p.foreground));
+                        // The name opens the plugin's UI; no extra line per row.
+                        let name = ui.add(
+                            egui::Label::new(RichText::new(pl.name).color(p.foreground))
+                                .sense(egui::Sense::click()),
+                        );
+                        if let Some((page, text)) = &link {
+                            let name = name
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text(text);
+                            if name.clicked() {
+                                navigate = Some(*page);
+                            }
+                        }
                         if !pl.description.is_empty() {
                             let what = RichText::new(pl.description)
                                 .size(theme::SMALL)
@@ -77,10 +89,6 @@ pub(super) fn plugin_manager(ui: &mut egui::Ui, cx: &mut UiCx) {
                             );
                         } else if let Some(why) = &reason {
                             kit::tone_text(ui, format!("Inactive · {why}"), Tone::Warning);
-                        } else if let Some((page, text)) = &link
-                            && ui.link(text).clicked()
-                        {
-                            navigate = Some(*page);
                         }
                     },
                     |ui| {

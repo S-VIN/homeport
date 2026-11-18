@@ -9,10 +9,43 @@ pub mod uri;
 pub mod wireguard;
 pub mod xray;
 
-pub(crate) fn register(p: &mut rproxy_kernel::prelude::Setup) {
+pub(crate) fn register(p: &mut homeport_kernel::prelude::Setup) {
     uri::register(p);
     xray::register(p);
     clash::register(p);
     wireguard::register(p);
     amnezia::register(p);
+}
+
+/// The servers of a document that could be read; the others are skipped with
+/// one warning in the log. Fails only when there were servers and none could
+/// be read (the last working list is kept then). `name` labels each server.
+pub fn usable(
+    items: impl IntoIterator<Item = (String, homeport_kernel::Result<Vec<plugin_servers::Proxy>>)>,
+) -> homeport_kernel::Result<Vec<plugin_servers::Proxy>> {
+    const NAMED: usize = 3;
+    let (mut good, mut bad, mut read) = (Vec::new(), Vec::new(), 0);
+    for (name, item) in items {
+        read += 1;
+        match item {
+            Ok(p) => good.extend(p),
+            Err(e) => bad.push(format!("{name}: {e}")),
+        }
+    }
+    if good.is_empty() && !bad.is_empty() {
+        return Err(homeport_kernel::Error::msg(bad.swap_remove(0)));
+    }
+    if !bad.is_empty() {
+        let more = match bad.len().saturating_sub(NAMED) {
+            0 => String::new(),
+            n => format!(" and {n} more"),
+        };
+        homeport_kernel::log::warn!(
+            "Skipped {} of {} servers: {}{more}",
+            bad.len(),
+            read,
+            bad[..bad.len().min(NAMED)].join("; ")
+        );
+    }
+    Ok(good)
 }

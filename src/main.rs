@@ -1,4 +1,4 @@
-//! rproxy: one process owns the kernel, plugins and mihomo. The desktop window
+//! homeport: one process owns the kernel, plugins and mihomo. The desktop window
 //! and every browser tab draw the same egui UI; browsers only paint frames.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 #[cfg(all(feature = "desktop", target_os = "linux"))]
@@ -14,8 +14,8 @@ mod native_tray;
 #[cfg(all(feature = "desktop", target_os = "linux"))]
 use desktop::{Link, Tray, WindowControl, WindowEvent};
 
-use rproxy_kernel::{Host, Session};
-use rproxy_remote::host::{Asset, Frontend, FrontendSession};
+use homeport_kernel::{Host, Session};
+use homeport_remote::host::{Asset, Frontend, FrontendSession};
 use std::{path::PathBuf, sync::Arc};
 use tokio::runtime::Runtime;
 
@@ -24,11 +24,13 @@ use std::{sync::atomic::Ordering, time::Duration};
 
 type LaunchResult = Result<(), Box<dyn std::error::Error>>;
 
-const USAGE: &str = "Usage: rproxy [desktop|background|web]";
+const USAGE: &str = "Usage: homeport [desktop|background|web]";
 /// The profile folder instead of the user data directory (Docker, tests).
-const DATA_DIR_ENV: &str = "RPROXY_DATA_DIR";
+const DATA_DIR_ENV: &str = "HOMEPORT_DATA_DIR";
 /// IP:PORT of the web UI; in desktop mode it serves the browser next to the window.
-const LISTEN_ENV: &str = "RPROXY_LISTEN";
+const LISTEN_ENV: &str = "HOMEPORT_LISTEN";
+/// Path of the preset a new installation starts from (overrides the packaged one).
+const PRESET_ENV: &str = "HOMEPORT_PRESET";
 
 const ASSETS: &[Asset] = &[
     Asset {
@@ -39,7 +41,7 @@ const ASSETS: &[Asset] = &[
     Asset {
         path: "/icon.svg",
         mime: "image/svg+xml",
-        bytes: include_bytes!("../assets/logos/rproxy-blue.svg"),
+        bytes: include_bytes!("../assets/logos/homeport-blue.svg"),
     },
     Asset {
         path: "/icon.png",
@@ -47,14 +49,14 @@ const ASSETS: &[Asset] = &[
         bytes: include_bytes!("../assets/logos/blue.png"),
     },
     Asset {
-        path: "/rproxy_remote.js",
+        path: "/homeport_remote.js",
         mime: "text/javascript",
-        bytes: include_bytes!("../web/pkg/rproxy_remote.js"),
+        bytes: include_bytes!("../web/pkg/homeport_remote.js"),
     },
     Asset {
-        path: "/rproxy_remote_bg.wasm",
+        path: "/homeport_remote_bg.wasm",
         mime: "application/wasm",
-        bytes: include_bytes!("../web/pkg/rproxy_remote_bg.wasm"),
+        bytes: include_bytes!("../web/pkg/homeport_remote_bg.wasm"),
     },
 ];
 
@@ -69,12 +71,12 @@ impl FrontendSession for WebSession {
     fn ui(&mut self, ui: &mut egui::Ui) {
         self.0.ui(ui)
     }
-    fn file_dialog(&mut self) -> Option<rproxy_remote::FileDialog> {
-        use rproxy_kernel::configuration::{FILE_NAME, FileAction};
+    fn file_dialog(&mut self) -> Option<homeport_remote::FileDialog> {
+        use homeport_kernel::configuration::{FILE_NAME, FileAction};
         match self.0.take_file_action()? {
-            FileAction::Import => Some(rproxy_remote::FileDialog::Open),
+            FileAction::Import => Some(homeport_remote::FileDialog::Open),
             FileAction::Export => match self.0.host().export_configuration() {
-                Ok(bytes) => Some(rproxy_remote::FileDialog::Save {
+                Ok(bytes) => Some(homeport_remote::FileDialog::Save {
                     name: FILE_NAME.into(),
                     bytes,
                 }),
@@ -85,12 +87,12 @@ impl FrontendSession for WebSession {
             },
         }
     }
-    fn file_reply(&mut self, reply: rproxy_remote::FileReply) {
-        use rproxy_remote::FileReply;
+    fn file_reply(&mut self, reply: homeport_remote::FileReply) {
+        use homeport_remote::FileReply;
         self.0.file_finished(match reply {
             FileReply::Finished => Ok(None),
             FileReply::Opened { name, bytes } => Ok(Some((name, bytes))),
-            FileReply::Failed(e) => Err(rproxy_kernel::Error::msg(e)),
+            FileReply::Failed(e) => Err(homeport_kernel::Error::msg(e)),
         });
     }
 }
@@ -114,19 +116,37 @@ fn data_dir() -> std::io::Result<PathBuf> {
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
-    base.map(|p| p.join("rproxy"))
+    base.map(|p| p.join("homeport"))
         .ok_or_else(|| std::io::Error::other("Missing user data directory"))
+}
+
+/// The SQL script a new installation starts with (presets/): `HOMEPORT_PRESET`,
+/// or the `preset.sql` a package ships beside the executable (macOS: in
+/// Resources). Without one every optional plugin is off and lists are empty.
+fn preset() -> std::io::Result<Option<PathBuf>> {
+    if let Some(path) = std::env::var_os(PRESET_ENV).filter(|p| !p.is_empty()) {
+        return Ok(Some(PathBuf::from(path)));
+    }
+    let exe = std::env::current_exe()?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| std::io::Error::other("Missing executable directory"))?;
+    Ok(
+        [dir.join("preset.sql"), dir.join("../Resources/preset.sql")]
+            .into_iter()
+            .find(|p| p.is_file()),
+    )
 }
 
 fn main() -> LaunchResult {
     let mut internal = std::env::args_os().skip(1);
     if internal
         .next()
-        .is_some_and(|arg| arg == rproxy_kernel::mihomo::supervisor::ARG)
+        .is_some_and(|arg| arg == homeport_kernel::mihomo::supervisor::ARG)
     {
-        return rproxy_kernel::mihomo::supervisor::run(internal).map_err(Into::into);
+        return homeport_kernel::mihomo::supervisor::run(internal).map_err(Into::into);
     }
-    rproxy_kernel::mihomo::supervisor::configure(std::env::current_exe()?);
+    homeport_kernel::mihomo::supervisor::configure(std::env::current_exe()?);
     // One optional word picks the mode; everything else comes from the environment.
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let (web, background) = match args.iter().map(|a| a.to_str()).collect::<Vec<_>>()[..] {
@@ -144,6 +164,7 @@ fn main() -> LaunchResult {
     }
     if web {
         attach_console();
+        homeport_kernel::Platform::set_headless();
     }
     let dir = match std::env::var_os(DATA_DIR_ENV).filter(|p| !p.is_empty()) {
         Some(d) => PathBuf::from(d),
@@ -174,18 +195,17 @@ fn main() -> LaunchResult {
     let listener = listen
         .map(|addr| rt.block_on(tokio::net::TcpListener::bind(addr)))
         .transpose()?;
-    // A login item starts the desktop app; the web UI does not offer one.
-    let catalog = rproxy::catalog()
-        .into_iter()
-        .filter(|p| !web || p.id != "autostart")
-        .collect();
-    let host = rt.block_on(Host::start(catalog, &dir))?;
+    let host = rt.block_on(Host::start_from(
+        homeport::catalog(),
+        &dir,
+        preset()?.as_deref(),
+    ))?;
     let server = listener
         .map(|l| -> std::io::Result<_> {
             let addr = l.local_addr()?;
-            println!("Web interface: http://{addr}");
-            let mut app = rproxy_remote::host::router(Arc::new(Web(host.clone())), ASSETS);
-            let configured_origin = std::env::var("RPROXY_PUBLIC_ORIGIN")
+            homeport_kernel::log::info!("Web interface: http://{addr}");
+            let mut app = homeport_remote::host::router(Arc::new(Web(host.clone())), ASSETS);
+            let configured_origin = std::env::var("HOMEPORT_PUBLIC_ORIGIN")
                 .ok()
                 .map(|v| public_origin(&v))
                 .transpose()?;
@@ -237,7 +257,7 @@ fn main() -> LaunchResult {
 }
 
 /// Windows: the app has no console of its own (GUI subsystem). Started from a
-/// terminal, `rproxy web` prints there, and Ctrl+C stops it.
+/// terminal, `homeport web` prints there, and Ctrl+C stops it.
 fn attach_console() {
     #[cfg(windows)]
     // SAFETY: no arguments to validate; failing (no parent console) is harmless.
@@ -262,7 +282,7 @@ async fn signal() {
 }
 
 #[cfg(feature = "desktop")]
-type FileSelection = rproxy_kernel::Result<Option<(String, Vec<u8>)>>;
+type FileSelection = homeport_kernel::Result<Option<(String, Vec<u8>)>>;
 #[cfg(feature = "desktop")]
 type SharedWindowState = std::rc::Rc<std::cell::RefCell<WindowState>>;
 #[cfg(feature = "desktop")]
@@ -335,14 +355,14 @@ impl Window {
         let host = state.session.host().clone();
         let ctx = ctx.clone();
         tokio::spawn(async move {
-            use rproxy_kernel::configuration::{FILE_NAME, FileAction, MAX_BYTES};
+            use homeport_kernel::configuration::{FILE_NAME, FileAction, MAX_BYTES};
             let started = std::time::Instant::now();
             // Without a portal (or zenity) rfd returns at once, as if cancelled.
             let closed = move || -> FileSelection {
                 if cfg!(target_os = "linux")
                     && started.elapsed() < std::time::Duration::from_millis(300)
                 {
-                    return Err(rproxy_kernel::Error::msg(
+                    return Err(homeport_kernel::Error::msg(
                         "No dialog? Install xdg-desktop-portal-gtk or zenity.",
                     ));
                 }
@@ -350,7 +370,7 @@ impl Window {
             };
             let result = async {
                 let dialog =
-                    rfd::AsyncFileDialog::new().add_filter("rproxy configuration", &["sqlite3"]);
+                    rfd::AsyncFileDialog::new().add_filter("homeport configuration", &["sqlite3"]);
                 match action {
                     FileAction::Export => {
                         let Some(file) = dialog
@@ -378,15 +398,15 @@ impl Window {
                         use tokio::io::AsyncReadExt;
                         let input = tokio::fs::File::open(file.path())
                             .await
-                            .map_err(|e| rproxy_kernel::Error::msg(e.to_string()))?;
+                            .map_err(|e| homeport_kernel::Error::msg(e.to_string()))?;
                         let mut bytes = Vec::new();
                         input
                             .take(MAX_BYTES as u64 + 1)
                             .read_to_end(&mut bytes)
                             .await
-                            .map_err(|e| rproxy_kernel::Error::msg(e.to_string()))?;
+                            .map_err(|e| homeport_kernel::Error::msg(e.to_string()))?;
                         if bytes.len() > MAX_BYTES {
-                            return Err(rproxy_kernel::Error::msg(
+                            return Err(homeport_kernel::Error::msg(
                                 "Configuration exceeds the 32 MiB file limit.",
                             ));
                         }
@@ -506,7 +526,7 @@ fn windows(
     let activation = control.clone();
     instance.on_open(move || activation.send(WindowEvent::Open));
     let mut tray = rt.block_on(Tray::start(control.clone()));
-    // At login the panel's tray host may start after rproxy: wait up to 10 s
+    // At login the panel's tray host may start after homeport: wait up to 10 s
     // before falling back to showing the window.
     for _ in 0..20 {
         if tray.is_some() || !background {
@@ -558,8 +578,8 @@ fn windows(
             }
             let opts = eframe::NativeOptions {
                 viewport: egui::ViewportBuilder::default()
-                    .with_app_id("io.github.rproxy.Rproxy")
-                    .with_title("rproxy")
+                    .with_app_id("io.github.homeport.Homeport")
+                    .with_title("homeport")
                     .with_decorations(true)
                     .with_inner_size([640., 560.])
                     .with_min_inner_size([375., 360.])
@@ -571,7 +591,7 @@ fn windows(
             let slot = retained.clone();
             let host = host.clone();
             eframe::run_native(
-                "rproxy",
+                "homeport",
                 opts,
                 Box::new(move |cc| {
                     {
@@ -629,8 +649,8 @@ fn windows(
     let host = host.clone();
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_app_id("io.github.rproxy.Rproxy")
-            .with_title("rproxy")
+            .with_app_id("io.github.homeport.Homeport")
+            .with_title("homeport")
             .with_decorations(true)
             .with_inner_size([640., 560.])
             .with_min_inner_size([375., 360.])
@@ -638,7 +658,7 @@ fn windows(
         ..Default::default()
     };
     eframe::run_native(
-        "rproxy",
+        "homeport",
         opts,
         Box::new(move |cc| {
             let context = cc.egui_ctx.clone();
@@ -702,7 +722,7 @@ fn allowed_origin(
 fn public_origin(value: &str) -> std::io::Result<String> {
     let invalid = || {
         std::io::Error::other(
-            "RPROXY_PUBLIC_ORIGIN must be an HTTPS origin without credentials, query or fragment",
+            "HOMEPORT_PUBLIC_ORIGIN must be an HTTPS origin without credentials, query or fragment",
         )
     };
     let url = url::Url::parse(value).map_err(|_| invalid())?;

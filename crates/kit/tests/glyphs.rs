@@ -83,7 +83,7 @@ fn ui_symbols_have_glyphs() {
         ui_chars(&root.join(dir), &mut chars);
     }
     let ctx = egui::Context::default();
-    rproxy_kit::theme::install_fonts(&ctx);
+    homeport_kit::theme::install_fonts(&ctx);
     let mut out = ctx.run_ui(Default::default(), |_| {});
     out.textures_delta.clear();
     let missing: Vec<String> = ctx.fonts_mut(|f| {
@@ -107,7 +107,7 @@ fn ui_symbols_have_glyphs() {
 #[test]
 fn emoji_are_color_glyphs() {
     let ctx = egui::Context::default();
-    rproxy_kit::theme::install_fonts(&ctx);
+    homeport_kit::theme::install_fonts(&ctx);
     ctx.run_ui(Default::default(), |_| {})
         .textures_delta
         .clear();

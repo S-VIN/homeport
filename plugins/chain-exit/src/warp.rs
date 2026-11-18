@@ -1,7 +1,7 @@
 //! Cloudflare WARP as an exit: a free WireGuard account registered by the app.
 //! Traffic leaves from a Cloudflare address, like the 1.1.1.1 app's users.
 use base64::{Engine, engine::general_purpose::STANDARD};
-use rproxy_kernel::{Cx, Error, Result, mihomo, random_bytes};
+use homeport_kernel::{Cx, Error, Result, mihomo, random_bytes};
 use serde_json::{Value, json};
 use std::time::Duration;
 

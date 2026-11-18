@@ -1,7 +1,7 @@
 //! Xray client configurations (JSON profiles with `outbounds`): VLESS, Shadowsocks, Hysteria 2.
 use crate::Parse;
+use homeport_kernel::prelude::*;
 use plugin_servers::Proxy;
-use rproxy_kernel::prelude::*;
 use serde_json::{Map, Value, json};
 
 pub(crate) fn register(p: &mut Setup) {
@@ -14,15 +14,19 @@ pub(crate) fn register(p: &mut Setup) {
         });
 }
 
-/// Parse an Xray document (one profile or a list of profiles).
+/// Parse an Xray document (one profile or a list of profiles); a server that
+/// cannot be read is skipped (see [`super::usable`]).
 pub fn parse(body: &str) -> Result<Vec<Proxy>> {
     let doc: Value = serde_json::from_str(body.trim_start_matches('\u{feff}'))
         .map_err(|_| invalid("Invalid Xray JSON."))?;
-    profiles(&doc)?
-        .into_iter()
-        .enumerate()
-        .map(|(i, v)| Proxy::from_value(v, i + 1))
-        .collect()
+    super::usable(profiles(&doc)?.into_iter().map(|(name, servers)| {
+        let servers = servers.and_then(|all| {
+            (all.into_iter().enumerate())
+                .map(|(i, v)| Proxy::from_value(v, i + 1))
+                .collect()
+        });
+        (name, servers)
+    }))
 }
 
 fn invalid(m: impl Into<String>) -> Error {
@@ -59,27 +63,26 @@ fn transfer(src: &mut Object, dst: &mut Value, mapping: &[(&str, &str)]) {
         }
     }
 }
+/// Settings left after reading: newer Xray options homeport does not know.
+/// The server works without them, as in other clients that skip them.
 fn consumed(src: &Object) -> Result<()> {
-    if src.is_empty() {
-        Ok(())
-    } else {
-        Err(invalid(
-            "Unsupported Xray extension. The last working subscription was kept.",
-        ))
-    }
-}
-fn protocol_options(value: &Value, supported: &[&str]) -> Result<()> {
-    let options = value
-        .as_object()
-        .ok_or_else(|| invalid("Expected an Xray settings object."))?;
-    if options.keys().any(|key| !supported.contains(&key.as_str())) {
-        return Err(invalid(
-            "Unsupported Xray protocol extension. The last working subscription was kept.",
-        ));
+    if !src.is_empty() {
+        let keys: Vec<&str> = src.keys().map(String::as_str).collect();
+        debug!("Ignored Xray settings: {}", keys.join(", "));
     }
     Ok(())
 }
-pub fn profiles(doc: &Value) -> Result<Vec<Value>> {
+/// Left-over settings that change what goes over the wire (say, obfuscation):
+/// without them the server cannot work.
+fn understood(src: &Object) -> Result<()> {
+    match src.keys().next() {
+        None => Ok(()),
+        Some(key) => Err(invalid(format!("Unsupported Xray setting {key}."))),
+    }
+}
+/// Every server of the document as mihomo maps, by name; one that cannot be
+/// read is an error of its own.
+pub fn profiles(doc: &Value) -> Result<Vec<(String, Result<Vec<Value>>)>> {
     let mut result = Vec::new();
     for profile in doc
         .as_array()
@@ -91,113 +94,108 @@ pub fn profiles(doc: &Value) -> Result<Vec<Value>> {
         } else {
             std::slice::from_ref(profile)
         };
-        for out in outbounds {
-            let cfg = &out["settings"];
-            let stream = &out["streamSettings"];
-            let mut add = |endpoint: &Value, mut p: Value| -> Result<()> {
-                p["name"] = profile["remarks"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| out["tag"].as_str().filter(|s| !s.is_empty()))
-                    .map(|s| json!(s))
-                    .unwrap_or_else(|| endpoint["address"].clone());
-                p["server"] = endpoint["address"].clone();
-                p["port"] = endpoint["port"].clone();
-                p["udp"] = json!(true);
-                transport(&mut p, stream)?;
-                result.push(p);
-                Ok(())
-            };
-            match out["protocol"].as_str() {
-                Some("freedom" | "dns" | "loopback" | "blackhole") => {}
-                Some("vless") => {
-                    for endpoint in array(cfg, "vnext")? {
-                        for user in array(endpoint, "users")? {
-                            let uuid = user["id"]
-                                .as_str()
-                                .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                                .ok_or_else(|| invalid("Invalid VLESS UUID."))?;
-                            let mut p = json!({"type":"vless","uuid":uuid});
-                            let mut fields = object(user)?;
-                            transfer(
-                                &mut fields,
-                                &mut p,
-                                &[("flow", "flow"), ("encryption", "encryption")],
-                            );
-                            if p["flow"] == "xtls-rprx-vision-udp443" {
-                                return Err(invalid("Unsupported VLESS flow."));
-                            }
-                            for k in ["id", "email", "level"] {
-                                fields.remove(k);
-                            }
-                            consumed(&fields)?;
-                            add(endpoint, p)?;
-                        }
-                    }
-                }
-                Some("shadowsocks") => {
-                    for ep in cfg["servers"]
-                        .as_array()
-                        .map(Vec::as_slice)
-                        .unwrap_or(std::slice::from_ref(cfg))
-                    {
-                        let cipher = ep["method"]
-                            .as_str()
-                            .ok_or_else(|| invalid("Missing Shadowsocks cipher."))?
-                            .to_lowercase();
-                        let cipher = match cipher.as_str() {
-                            "plain" => "none",
-                            "chacha20-poly1305" | "aead_chacha20_poly1305" => {
-                                "chacha20-ietf-poly1305"
-                            }
-                            "xchacha20-poly1305" | "aead_xchacha20_poly1305" => {
-                                "xchacha20-ietf-poly1305"
-                            }
-                            "aead_aes_128_gcm" => "aes-128-gcm",
-                            "aead_aes_256_gcm" => "aes-256-gcm",
-                            s => s,
-                        };
-                        let mut p = json!({"type":"ss","cipher":cipher,"password":ep["password"].as_str().ok_or_else(||invalid("Missing Shadowsocks password."))?});
-                        if let Some(v) = ep.get("uot") {
-                            p["udp-over-tcp"] = json!(boolean(v)?);
-                        }
-                        if let Some(v) = ep.get("uotVersion").or(ep.get("UoTVersion")) {
-                            p["udp-over-tcp-version"] = v.clone();
-                        }
-                        protocol_options(
-                            ep,
-                            &[
-                                "address",
-                                "port",
-                                "method",
-                                "password",
-                                "uot",
-                                "uotVersion",
-                                "UoTVersion",
-                                "email",
-                                "level",
-                            ],
-                        )?;
-                        add(ep, p)?;
-                    }
-                }
-                Some("hysteria")
-                    if cfg["version"] == 2
-                        && stream["hysteriaSettings"]
-                            .get("version")
-                            .is_none_or(|v| v == 2) =>
-                {
-                    protocol_options(cfg, &["address", "port", "version", "email", "level"])?;
-                    let password = stream["hysteriaSettings"]["auth"]
-                        .as_str()
-                        .ok_or_else(|| invalid("Missing Hysteria 2 password."))?;
-                    add(cfg, json!({"type":"hysteria2","password":password}))?;
-                }
-                _ => return Err(invalid("Unsupported Xray outbound protocol.")),
+        for (i, out) in outbounds.iter().enumerate() {
+            let mut servers = Vec::new();
+            let read = outbound(profile, out, &mut servers).map(|()| servers);
+            // Direct, DNS and block outbounds of a full profile are not servers.
+            if read.as_ref().is_ok_and(Vec::is_empty) {
+                continue;
             }
+            let name =
+                out_name(profile, out).map_or_else(|| format!("Server {}", i + 1), str::to_owned);
+            result.push((name, read));
         }
     }
     Ok(result)
+}
+/// The server's name in the profile, for error messages.
+fn out_name<'a>(profile: &'a Value, out: &'a Value) -> Option<&'a str> {
+    (profile["remarks"].as_str().filter(|s| !s.is_empty()))
+        .or_else(|| out["tag"].as_str().filter(|s| !s.is_empty()))
+}
+fn outbound(profile: &Value, out: &Value, result: &mut Vec<Value>) -> Result<()> {
+    let cfg = &out["settings"];
+    let stream = &out["streamSettings"];
+    let mut add = |endpoint: &Value, mut p: Value| -> Result<()> {
+        p["name"] = out_name(profile, out)
+            .map(|s| json!(s))
+            .unwrap_or_else(|| endpoint["address"].clone());
+        p["server"] = endpoint["address"].clone();
+        p["port"] = endpoint["port"].clone();
+        p["udp"] = json!(true);
+        transport(&mut p, stream)?;
+        result.push(p);
+        Ok(())
+    };
+    match out["protocol"].as_str() {
+        Some("freedom" | "dns" | "loopback" | "blackhole") => {}
+        Some("vless") => {
+            for endpoint in array(cfg, "vnext")? {
+                for user in array(endpoint, "users")? {
+                    let uuid = user["id"]
+                        .as_str()
+                        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                        .ok_or_else(|| invalid("Invalid VLESS UUID."))?;
+                    let mut p = json!({"type":"vless","uuid":uuid});
+                    let mut fields = object(user)?;
+                    transfer(
+                        &mut fields,
+                        &mut p,
+                        &[("flow", "flow"), ("encryption", "encryption")],
+                    );
+                    if p["flow"] == "xtls-rprx-vision-udp443" {
+                        return Err(invalid("Unsupported VLESS flow."));
+                    }
+                    for k in ["id", "email", "level"] {
+                        fields.remove(k);
+                    }
+                    consumed(&fields)?;
+                    add(endpoint, p)?;
+                }
+            }
+        }
+        Some("shadowsocks") => {
+            for ep in cfg["servers"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(std::slice::from_ref(cfg))
+            {
+                let cipher = ep["method"]
+                    .as_str()
+                    .ok_or_else(|| invalid("Missing Shadowsocks cipher."))?
+                    .to_lowercase();
+                let cipher = match cipher.as_str() {
+                    "plain" => "none",
+                    "chacha20-poly1305" | "aead_chacha20_poly1305" => "chacha20-ietf-poly1305",
+                    "xchacha20-poly1305" | "aead_xchacha20_poly1305" => "xchacha20-ietf-poly1305",
+                    "aead_aes_128_gcm" => "aes-128-gcm",
+                    "aead_aes_256_gcm" => "aes-256-gcm",
+                    s => s,
+                };
+                let mut p = json!({"type":"ss","cipher":cipher,"password":ep["password"].as_str().ok_or_else(||invalid("Missing Shadowsocks password."))?});
+                if let Some(v) = ep.get("uot") {
+                    p["udp-over-tcp"] = json!(boolean(v)?);
+                }
+                if let Some(v) = ep.get("uotVersion").or(ep.get("UoTVersion")) {
+                    p["udp-over-tcp-version"] = v.clone();
+                }
+                add(ep, p)?;
+            }
+        }
+        Some("hysteria")
+            if cfg["version"] == 2
+                && stream["hysteriaSettings"]
+                    .get("version")
+                    .is_none_or(|v| v == 2) =>
+        {
+            let password = stream["hysteriaSettings"]["auth"]
+                .as_str()
+                .ok_or_else(|| invalid("Missing Hysteria 2 password."))?;
+            add(cfg, json!({"type":"hysteria2","password":password}))?;
+        }
+        _ => return Err(invalid("Unsupported Xray outbound protocol.")),
+    }
+    Ok(())
 }
 fn transport(p: &mut Value, stream: &Value) -> Result<()> {
     let mut fields = object(stream)?;
@@ -258,6 +256,16 @@ fn transport(p: &mut Value, stream: &Value) -> Result<()> {
     if hy {
         tls.remove("fingerprint");
     }
+    // ECH: the config itself, or where to look it up (the core asks DNS then).
+    // How hard to insist on the lookup has no mihomo equivalent.
+    tls.remove("echForceQuery");
+    if let Some(list) = tls.remove("echConfigList") {
+        let list = list.as_str().unwrap_or_default();
+        p["ech-opts"] = match list.contains("://") {
+            true => json!({"enable": true}),
+            false => json!({"enable": true, "config": list}),
+        };
+    }
     transfer(
         &mut tls,
         p,
@@ -302,8 +310,8 @@ fn transport(p: &mut Value, stream: &Value) -> Result<()> {
                 ),
             ],
         );
-        consumed(&quic)?;
-        consumed(&mask)?;
+        understood(&quic)?;
+        understood(&mask)?;
     } else {
         let raw = fields.remove(&format!("{net}Settings")).unwrap_or_default();
         let mut opts = object(&raw)?;
@@ -427,5 +435,42 @@ fn transport(p: &mut Value, stream: &Value) -> Result<()> {
 fn stringify(v: &mut Value, k: &str) {
     if v[k].is_number() {
         v[k] = Value::String(v[k].to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GERMANY: &str = r#"{"remarks":"Germany","outbounds":[{"protocol":"vless","mux":{"enabled":true},"settings":{"vnext":[{"address":"de.example","port":443,"users":[{"id":"5783a3e7-e373-51cd-8642-c83782b807c5","encryption":"none","flow":""}]}]},"streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"de.example","fingerprint":"chrome","alpn":["h2"],"echForceQuery":"none","newOption":1},"xhttpSettings":{"path":"/x","mode":"auto"}}}]}"#;
+
+    #[test]
+    fn unknown_settings_are_ignored() {
+        let servers = parse(&format!("[{GERMANY}]")).unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "Germany");
+        assert!(!servers[0].options.contains_key("ech-opts"));
+    }
+
+    #[test]
+    fn ech_config_list_turns_ech_on() {
+        let body = GERMANY.replace(r#""newOption":1"#, r#""echConfigList":"AEX+DQ""#);
+        let servers = parse(&body).unwrap();
+        assert_eq!(
+            servers[0].options["ech-opts"],
+            json!({"enable": true, "config": "AEX+DQ"})
+        );
+    }
+
+    #[test]
+    fn a_broken_server_is_skipped_and_the_rest_kept() {
+        let broken = GERMANY
+            .replace("Germany", "Broken")
+            .replace(r#""flow":"""#, r#""flow":"xtls-rprx-vision-udp443""#);
+        let servers = parse(&format!("[{GERMANY},{broken}]")).unwrap();
+        let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Germany"]);
+        let e = parse(&format!("[{broken}]")).unwrap_err();
+        assert_eq!(e.message, "Broken: Unsupported VLESS flow.");
     }
 }

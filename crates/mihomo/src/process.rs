@@ -124,6 +124,26 @@ pub struct Controller {
     http: Client,
     base: String,
 }
+/// mihomo's own reason (`{"message": "…"}`) when it gives one.
+fn rejected(status: u16, body: &str) -> String {
+    #[derive(Deserialize)]
+    struct Message {
+        message: String,
+    }
+    match serde_json::from_str::<Message>(body) {
+        Ok(Message { message }) if !message.trim().is_empty() => {
+            let message = message.trim().trim_end_matches('.');
+            let mut chars = message.chars();
+            let first = chars.next().map(|c| c.to_uppercase().to_string());
+            format!("{}{}.", first.unwrap_or_default(), chars.as_str())
+        }
+        _ => format!(
+            "Mihomo rejected the request (HTTP {status}). {}",
+            body.trim()
+        ),
+    }
+}
+
 impl Controller {
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
         let r = req
@@ -132,11 +152,7 @@ impl Controller {
             .map_err(|_| "Mihomo control socket is unavailable.".to_string())?;
         if !r.status().is_success() {
             let status = r.status().as_u16();
-            let body = r.text().await.unwrap_or_default();
-            return Err(format!(
-                "Mihomo rejected the request (HTTP {status}). {}",
-                body.trim()
-            ));
+            return Err(rejected(status, &r.text().await.unwrap_or_default()));
         }
         Ok(r)
     }
@@ -196,11 +212,7 @@ impl Controller {
             503 => return Ok(Delay::Failed),
             200 => {}
             status => {
-                let body = r.text().await.unwrap_or_default();
-                return Err(format!(
-                    "Mihomo rejected the request (HTTP {status}). {}",
-                    body.trim()
-                ));
+                return Err(rejected(status, &r.text().await.unwrap_or_default()));
             }
         }
         let d: D = r.json().await.map_err(|e| e.to_string())?;
@@ -473,10 +485,7 @@ impl Mihomo {
                 let _ = fs::remove_file(&core);
             }
             if core != bundled() {
-                eprintln!(
-                    "rproxy: {} failed ({error}); trying the next core.",
-                    core.display()
-                );
+                log::warn!("{} failed ({error}); trying the next core", core.display());
             }
         }
         Err(error)
@@ -484,7 +493,7 @@ impl Mihomo {
     async fn launch(reserved_ports: &[u16], home: &Path, core: &Path, tun: bool) -> Result<Self> {
         fs::create_dir_all(home).map_err(|e| format!("Cannot create {}: {e}", home.display()))?;
         let mut builder = tempfile::Builder::new();
-        builder.prefix("rproxy-");
+        builder.prefix("homeport-");
         #[cfg(unix)]
         builder.permissions(fs::Permissions::from_mode(0o700));
         // A tunnel core runs on the host as root, which does not see a
@@ -559,7 +568,7 @@ impl Mihomo {
                     cmd.env(key, value);
                 }
             }
-            // RPROXY_MIHOMO_LOG=debug|info|warning shows the core's log on stderr.
+            // HOMEPORT_MIHOMO_LOG=debug|info|warning shows the core's log on stderr.
             if config::log_level() == "silent" {
                 cmd.stdout(Stdio::null()).stderr(Stdio::null());
             } else {

@@ -23,7 +23,7 @@ pub struct Instance {
     _lock: File,
     state: Arc<State>,
 }
-/// Desktop identity is independent of package location and RPROXY_DATA_DIR.
+/// Desktop identity is independent of package location and HOMEPORT_DATA_DIR.
 /// Flatpak is granted only this shared runtime subdirectory by its manifest.
 pub fn desktop_directory() -> io::Result<std::path::PathBuf> {
     use std::path::PathBuf;
@@ -37,7 +37,7 @@ pub fn desktop_directory() -> io::Result<std::path::PathBuf> {
     #[cfg(target_os = "macos")]
     let base =
         std::env::var_os("HOME").map(|p| PathBuf::from(p).join("Library/Application Support"));
-    base.map(|p| p.join("rproxy").join("desktop-instance"))
+    base.map(|p| p.join("homeport").join("desktop-instance"))
         .ok_or_else(|| io::Error::other("Missing user runtime directory"))
 }
 impl Instance {
@@ -72,7 +72,7 @@ impl Instance {
                     }
                     if Instant::now() >= deadline {
                         return Err(io::Error::other(
-                            "rproxy is already running but is not responding. It may still be starting or shutting down.",
+                            "homeport is already running but is not responding. It may still be starting or shutting down.",
                         ));
                     }
                     std::thread::sleep(Duration::from_millis(80));

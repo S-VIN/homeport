@@ -1,10 +1,10 @@
 //! End-to-end tests with the bundled mihomo and local HTTP fixtures.
+use homeport_kernel::{Host, Id, Kernel, list::Add, list::Remove};
 use plugin_health_checks as health;
 use plugin_local_proxy::{PROXY, Proxy, SaveProxy};
 use plugin_routing::{RULES, Route, Rule};
 use plugin_servers::{SELECTED, SERVERS, Select};
 use plugin_subscriptions::{Parse, RefreshAll, SOURCES, Source};
-use rproxy_kernel::{Host, Id, Kernel, list::Add, list::Remove};
 use std::{
     sync::{
         Arc, RwLock,
@@ -96,7 +96,7 @@ async fn free_port() -> u16 {
 
 /// Start with all plugins and move the seeded listener to a free port.
 async fn start(dir: &std::path::Path) -> (Arc<Host>, Proxy) {
-    let host = Host::start(rproxy::catalog(), dir).await.unwrap();
+    let host = Host::start_enabled(homeport::catalog(), dir).await.unwrap();
     let k = host.kernel();
     // Tests run in parallel: move the proxy to a free port.
     let mut inbound = (*k.snapshot().get(&PROXY)).clone();
@@ -109,7 +109,7 @@ async fn start(dir: &std::path::Path) -> (Arc<Host>, Proxy) {
 }
 
 fn proxy_client(port: u16) -> reqwest::Client {
-    rproxy_kernel::mihomo::http()
+    homeport_kernel::mihomo::http()
         .no_proxy()
         .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).unwrap())
         .timeout(Duration::from_secs(4))
@@ -121,7 +121,9 @@ fn proxy_client(port: u16) -> reqwest::Client {
 async fn formats_are_claimed_by_their_plugins() {
     use base64::Engine;
     let dir = tempfile::tempdir().unwrap();
-    let host = Host::start(rproxy::catalog(), dir.path()).await.unwrap();
+    let host = Host::start_enabled(homeport::catalog(), dir.path())
+        .await
+        .unwrap();
     let cx = host.kernel().cx_for("subscriptions");
     let parse = |body: String| {
         let cx = cx.clone();
@@ -245,9 +247,12 @@ async fn real_core_refresh_select_route_listeners_and_restart() {
     }
     routing.call(Remove::new(&RULES, rule.id)).await.unwrap();
 
-    // A broken document keeps the last working catalog and the connection.
+    // A document without one readable server keeps the last working catalog
+    // and the connection.
     let working = body.read().unwrap().clone();
-    *body.write().unwrap() = r#"{"protocol":"shadowsocks","settings":{"address":"127.0.0.1","port":1,"method":"aes-128-gcm","password":"x","unsupportedOption":true}}"#.into();
+    *body.write().unwrap() =
+        r#"{"protocol":"shadowsocks","settings":{"address":"127.0.0.1","port":1,"password":"x"}}"#
+            .into();
     assert!(subs.call(RefreshAll).await.is_err());
     assert_eq!(*k.snapshot().get(&SELECTED), Some(server));
     assert!(k.snapshot().get(&SOURCES)[0].error.is_some());
@@ -298,7 +303,7 @@ async fn real_core_refresh_select_route_listeners_and_restart() {
         407
     );
     for scheme in ["http", "socks5h"] {
-        let c = rproxy_kernel::mihomo::http()
+        let c = homeport_kernel::mihomo::http()
             .no_proxy()
             .proxy(
                 reqwest::Proxy::all(format!("{scheme}://127.0.0.1:{port}"))
@@ -363,8 +368,8 @@ async fn health_checks_use_the_isolated_route() {
         .await
         .unwrap();
     let h = k
-        .cx_for("health-checks")
-        .call(health::CheckServer { id: server.id })
+        .cx_for("servers")
+        .call(plugin_servers::CheckServer { id: server.id })
         .await
         .unwrap()
         .unwrap();
@@ -388,9 +393,76 @@ async fn health_checks_use_the_isolated_route() {
         .await
         .unwrap();
     until(&k, "cascade", |k| {
-        k.snapshot().get(&health::HEALTH).is_empty()
+        k.snapshot().get(&plugin_servers::HEALTH).is_empty()
     })
     .await;
+    host.shutdown().await;
+}
+
+/// With a chain exit in use, servers are tested as its entry: a server that
+/// works alone fails when the exit behind it does not answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn tests_go_through_the_chain_exit() {
+    use plugin_chain_exit::{EXITS, Exit};
+    let dir = tempfile::tempdir().unwrap();
+    let (host, _) = start(dir.path()).await;
+    let k = host.kernel();
+    let (good, _) = fixture(Arc::new(RwLock::new(String::new())), 204).await;
+    let (origin, _) = fixture(Arc::new(RwLock::new(String::new())), 204).await;
+    let source = Id::random();
+    let body = format!("proxies:\n  - {{name: Good, type: http, server: 127.0.0.1, port: {good}}}");
+    let proxies = k
+        .cx_for("subscriptions")
+        .call(Parse { source, body })
+        .await
+        .unwrap();
+    let replace = plugin_servers::ReplaceFromSource {
+        source,
+        proxies,
+        guard: None,
+    };
+    k.cx_for("subscriptions").call(replace).await.unwrap();
+    k.cx_for("health-checks")
+        .call(Add::new(
+            &health::TESTS,
+            health::Test {
+                id: Id::random(),
+                url: format!("http://127.0.0.1:{origin}/generate_204"),
+                expected: health::Expected::NoContent,
+            },
+        ))
+        .await
+        .unwrap();
+    let id = k.snapshot().get(&SERVERS)[0].id;
+    let test = || k.cx_for("servers").call(plugin_servers::CheckServer { id });
+    assert!(
+        test().await.unwrap().unwrap().rating.unwrap() > 0,
+        "alone it works"
+    );
+    // An exit nothing listens on.
+    let link = format!(
+        "vless://5783a3e7-e373-51cd-8642-c83782b807c5@127.0.0.1:{}?type=tcp#Exit",
+        free_port().await
+    );
+    let exit = Exit {
+        id: Id::random(),
+        name: String::new(),
+        link,
+    };
+    k.cx_for("chain-exit")
+        .call(Add::new(&EXITS, exit))
+        .await
+        .unwrap();
+    // The first exit added comes into use right after.
+    until(&k, "exit in use", |k| {
+        k.snapshot().get(&plugin_chain_exit::ACTIVE).is_some()
+    })
+    .await;
+    let server = k.snapshot().get(&SERVERS)[0].clone();
+    let path = k.snapshot().first(&plugin_servers::TEST_PATH, &server);
+    assert_eq!(path, Some(format!("via-{id}")));
+    let h = test().await.unwrap().unwrap();
+    assert!(h.unreachable(), "through the dead exit: {h:?}");
     host.shutdown().await;
 }
 
@@ -436,7 +508,7 @@ async fn new_servers_of_every_subscription_are_tested() {
                 .call(plugin_servers::ReplaceFromSource {
                     source,
                     proxies,
-                    still_current: None,
+                    guard: None,
                 })
                 .await
                 .unwrap();
@@ -444,7 +516,7 @@ async fn new_servers_of_every_subscription_are_tested() {
     };
     tokio::join!(load("First"), load("Second"));
     // A source that loads while a full pass runs is tested after it.
-    let pass = k.cx_for("health-checks").call(health::CheckAll);
+    let pass = k.cx_for("servers").call(plugin_servers::CheckAll);
     let (passed, ()) = tokio::join!(pass, load("Third"));
     passed.unwrap();
     until(&k, "every server tested", |k| {
@@ -453,7 +525,7 @@ async fn new_servers_of_every_subscription_are_tested() {
         servers.len() == 3
             && servers
                 .iter()
-                .all(|s| health::health(&snap, s.id).is_some_and(|h| h.checked.is_some()))
+                .all(|s| plugin_servers::health(&snap, s.id).is_some_and(|h| h.checked.is_some()))
     })
     .await;
     host.shutdown().await;
@@ -462,24 +534,24 @@ async fn new_servers_of_every_subscription_are_tested() {
 #[tokio::test(flavor = "multi_thread")]
 async fn missing_dependencies_disable_dependents() {
     let dir = tempfile::tempdir().unwrap();
-    let catalog: Vec<_> = rproxy::catalog()
+    let catalog: Vec<_> = homeport::catalog()
         .into_iter()
         .filter(|p| p.id != "routing")
         .collect();
-    let host = Host::start(catalog, dir.path()).await.unwrap();
+    let host = Host::start_enabled(catalog, dir.path()).await.unwrap();
     let ids: Vec<_> = host.kernel().plugins().iter().map(|p| p.id).collect();
     assert!(
         !ids.contains(&"vless-inbound"),
         "vless-inbound requires routing"
     );
-    // Auto select and the chain only need servers.
+    // Tests and the chain only need servers.
     assert!(ids.contains(&"health-checks") && ids.contains(&"chain-exit"));
     host.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn auto_select_picks_a_healthy_server_and_manual_choice_turns_it_off() {
-    use plugin_health_checks::auto::{AUTO, SetAuto};
+    use plugin_servers::auto::{AUTO, SetAuto};
     let dir = tempfile::tempdir().unwrap();
     let (host, _) = start(dir.path()).await;
     let k = host.kernel();
@@ -517,18 +589,17 @@ async fn auto_select_picks_a_healthy_server_and_manual_choice_turns_it_off() {
         ))
         .await
         .unwrap();
-    k.cx_for("health-checks")
-        .call(health::CheckAll)
+    k.cx_for("servers")
+        .call(plugin_servers::CheckAll)
         .await
         .unwrap();
-    // The dead server is excluded and cannot be connected manually.
-    assert!(
-        k.cx_for("servers")
-            .call(Select::manual(Some(id("Dead"))))
-            .await
-            .is_err()
-    );
-    k.cx_for("health-checks").call(SetAuto(true)).await.unwrap();
+    // A failed test only warns: the dead server can still be connected by
+    // hand, and Auto select then moves to the healthy one.
+    k.cx_for("servers")
+        .call(Select::manual(Some(id("Dead"))))
+        .await
+        .unwrap();
+    k.cx_for("servers").call(SetAuto(true)).await.unwrap();
     until(&k, "automatic selection", |k| {
         *k.snapshot().get(&SELECTED) == Some(id("Good"))
     })
@@ -545,7 +616,7 @@ async fn auto_select_picks_a_healthy_server_and_manual_choice_turns_it_off() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn auto_select_fails_over_when_the_connected_server_dies() {
-    use plugin_health_checks::auto::{AUTO, SetAuto};
+    use plugin_servers::auto::{AUTO, SetAuto};
     let dir = tempfile::tempdir().unwrap();
     let (host, inbound) = start(dir.path()).await;
     let k = host.kernel();
@@ -575,11 +646,11 @@ async fn auto_select_fails_over_when_the_connected_server_dies() {
         ))
         .await
         .unwrap();
-    k.cx_for("health-checks")
-        .call(health::CheckAll)
+    k.cx_for("servers")
+        .call(plugin_servers::CheckAll)
         .await
         .unwrap();
-    k.cx_for("health-checks").call(SetAuto(true)).await.unwrap();
+    k.cx_for("servers").call(SetAuto(true)).await.unwrap();
     // Connected, with the other server as the fallback group's backup.
     until(&k, "connection with a backup", |k| {
         k.snapshot().get(&SELECTED).is_some() && !k.snapshot().get(&AUTO).backups.is_empty()

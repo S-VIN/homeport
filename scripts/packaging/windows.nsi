@@ -1,25 +1,25 @@
 # Per-user installer: package.py passes STAGE (the files), OUTPUT and VERSION.
 Unicode true
 !include "MUI2.nsh"
-Name "rproxy"
+Name "homeport"
 OutFile "${OUTPUT}"
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
-InstallDir "$LOCALAPPDATA\Programs\rproxy"
-InstallDirRegKey HKCU "Software\rproxy" "InstallDir"
+InstallDir "$LOCALAPPDATA\Programs\homeport"
+InstallDirRegKey HKCU "Software\homeport" "InstallDir"
 
-# Windows locks running executables: ask the user to quit rproxy first.
+# Windows locks running executables: ask the user to quit homeport first.
 !macro CHECK_RUNNING UN
 Function ${UN}CheckRunning
   retry:
-  StrCpy $1 "rproxy.exe"
+  StrCpy $1 "homeport.exe"
   Call ${UN}Locked
   StrCmp $0 "locked" running
   StrCpy $1 "mihomo.exe"
   Call ${UN}Locked
   StrCmp $0 "locked" running done
   running:
-  MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "rproxy is running. Quit it from its tray icon (Quit rproxy), then click Retry." /SD IDCANCEL IDRETRY retry
+  MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "homeport is running. Quit it from its tray icon (Quit homeport), then click Retry." /SD IDCANCEL IDRETRY retry
   Abort
   done:
 FunctionEnd
@@ -49,23 +49,24 @@ Section
   Call CheckRunning
   File /r "${STAGE}\*"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
-  WriteRegStr HKCU "Software\rproxy" "InstallDir" "$INSTDIR"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\rproxy" "DisplayName" "rproxy"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\rproxy" "DisplayVersion" "${VERSION}"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\rproxy" "UninstallString" '$\"$INSTDIR\Uninstall.exe$\"'
-  CreateShortcut "$SMPROGRAMS\rproxy.lnk" "$INSTDIR\rproxy.exe"
+  WriteRegStr HKCU "Software\homeport" "InstallDir" "$INSTDIR"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\homeport" "DisplayName" "homeport"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\homeport" "DisplayVersion" "${VERSION}"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\homeport" "UninstallString" '$\"$INSTDIR\Uninstall.exe$\"'
+  CreateShortcut "$SMPROGRAMS\homeport.lnk" "$INSTDIR\homeport.exe"
 SectionEnd
 
 Section "Uninstall"
   Call un.CheckRunning
-  Delete "$SMPROGRAMS\rproxy.lnk"
-  Delete "$INSTDIR\rproxy.exe"
+  Delete "$SMPROGRAMS\homeport.lnk"
+  Delete "$INSTDIR\homeport.exe"
   Delete "$INSTDIR\mihomo.exe"
+  Delete "$INSTDIR\preset.sql"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir /r "$INSTDIR\licenses"
   # Remove the payload of older installations too.
   RMDir /r "$INSTDIR\assets"
   RMDir "$INSTDIR"
-  DeleteRegKey HKCU "Software\rproxy"
-  DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\rproxy"
+  DeleteRegKey HKCU "Software\homeport"
+  DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\homeport"
 SectionEnd

@@ -196,8 +196,8 @@ pub struct Changed {
 // ---- persistence ----------------------------------------------------------
 
 pub(crate) struct Persist {
-    /// Create or update the storage; `strict` after migrations ran.
-    pub register: Box<dyn Fn(&Store, bool) -> Result<()> + Send + Sync>,
+    /// Check the storage the migration scripts made.
+    pub check: Box<dyn Fn(&Store) -> Result<()> + Send + Sync>,
     pub load: Box<dyn Fn(&Tx<'_>) -> Result<Value> + Send + Sync>,
     pub save: Box<dyn Fn(&Tx<'_>, &Value, &Value) -> Result<()> + Send + Sync>,
     /// The value to start with when the saved one cannot be read (settings).
@@ -255,7 +255,7 @@ pub(crate) fn list<T: Record + DeserializeOwned>(
     table: &'static str,
 ) -> Persist {
     Persist {
-        register: Box::new(move |s, strict| s.register_in::<T>(table, strict)),
+        check: Box::new(move |s| s.check_in::<T>(table)),
         load: Box::new(move |tx| {
             let mut rows: Vec<T> = tx.all_in(table)?;
             if ordered {
@@ -302,14 +302,41 @@ pub(crate) fn list<T: Record + DeserializeOwned>(
     }
 }
 
+/// A saved setting; fields it lacks (a preset names only what it changes)
+/// keep their defaults.
+fn read_setting<T: Serialize + DeserializeOwned + Default>(json: &str) -> Option<T> {
+    if let Ok(value) = serde_json::from_str(json) {
+        return Some(value);
+    }
+    let saved: serde_json::Value = serde_json::from_str(json).ok()?;
+    let mut value = serde_json::to_value(T::default()).ok()?;
+    merge(&mut value, saved);
+    serde_json::from_value(value).ok()
+}
+fn merge(base: &mut serde_json::Value, saved: serde_json::Value) {
+    match (base, saved) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(saved)) => {
+            for (key, value) in saved {
+                match base.get_mut(&key) {
+                    Some(slot) => merge(slot, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, saved) => *base = saved,
+    }
+}
+
 pub(crate) fn setting<T: Serialize + DeserializeOwned + Default + Send + Sync + 'static>(
     name: &'static str,
 ) -> Persist {
     Persist {
-        register: Box::new(|_, _| Ok(())),
+        check: Box::new(|_| Ok(())),
         load: Box::new(move |tx| {
             let value: T = match tx.get::<SettingRow>(name)? {
-                Some(row) => serde_json::from_str(&row.json).map_err(|_| {
+                Some(row) => read_setting(&row.json).ok_or_else(|| {
                     crate::Error::new("setting", format!("Invalid saved setting: {name}"))
                 })?,
                 None => T::default(),

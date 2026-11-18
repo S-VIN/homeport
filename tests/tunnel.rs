@@ -1,7 +1,7 @@
 //! The tunnel core's whole path — administrator prompt, lease, controller,
 //! stop — with a stand-in `pkexec`: only root can create the tunnel itself.
 #![cfg(target_os = "linux")]
-use rproxy_kernel::mihomo::{Mihomo, supervisor};
+use homeport_kernel::mihomo::{Mihomo, supervisor};
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
 
 /// Run the ignored test `child` in its own process (PATH and the configured
@@ -28,7 +28,7 @@ fn with_pkexec(answer: &str, child: &str) -> (String, usize) {
     (text, fs::read_to_string(opened).unwrap().lines().count())
 }
 fn home() -> PathBuf {
-    supervisor::configure(env!("CARGO_BIN_EXE_rproxy").into());
+    supervisor::configure(env!("CARGO_BIN_EXE_homeport").into());
     std::env::var_os("TUNNEL_TEST_HOME").unwrap().into()
 }
 
@@ -51,7 +51,7 @@ async fn authorized_child() {
     let sessions = fs::read_dir(&home).unwrap().flatten();
     assert_eq!(
         sessions
-            .filter(|e| e.file_name().to_string_lossy().starts_with("rproxy-"))
+            .filter(|e| e.file_name().to_string_lossy().starts_with("homeport-"))
             .count(),
         0,
         "session folder removed"

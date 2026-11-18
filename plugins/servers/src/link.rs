@@ -1,7 +1,7 @@
 //! Share links (`vless://`, `hysteria2://`): one server each.
 use crate::Proxy;
+use homeport_kernel::{Error, Result};
 use percent_encoding::percent_decode_str;
-use rproxy_kernel::{Error, Result};
 use serde_json::{Map, Value, json};
 use std::collections::HashSet;
 use url::Url;
@@ -161,7 +161,8 @@ fn hysteria2(raw: &str) -> Result<Value> {
             "pinSHA256" => proxy["fingerprint"] = json!(value),
             "alpn" => proxy["alpn"] = json!(value.split(',').collect::<Vec<_>>()),
             "ech" => proxy["ech-opts"] = json!({"enable":true,"config":value}),
-            _ => return Err(invalid(format!("Unsupported Hysteria 2 parameter: {key}"))),
+            // Newer client options: the server works without them.
+            _ => homeport_kernel::log::debug!("Ignored Hysteria 2 parameter {key}"),
         }
     }
     if let Some(mask) = mask {

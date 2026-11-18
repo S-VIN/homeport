@@ -1,13 +1,13 @@
 //! A VLESS node and a client on one machine, both with the real bundled mihomo:
 //! VLESS + REALITY + XHTTP end to end, the camouflage site for probes without a
 //! key, and the chain-exit chain (client → entry → node → internet).
+use homeport_kernel::{Host, Id, Kernel, Update, list::Add};
 use plugin_chain_exit as exit;
 use plugin_local_proxy::{PROXY, Proxy, SaveProxy};
 use plugin_routing::{Route, Rule};
 use plugin_servers::{SERVERS, Select};
 use plugin_subscriptions::Source;
 use plugin_vless_inbound as vless;
-use rproxy_kernel::{Host, Id, Kernel, Update, list::Add};
 use std::{
     net::SocketAddr,
     sync::{
@@ -103,7 +103,7 @@ async fn connect_proxy() -> (u16, Arc<AtomicUsize>) {
 
 /// Host with the default listener moved to a free port (tests run in parallel).
 async fn start(dir: &std::path::Path, enable: &[&str]) -> (Arc<Host>, Proxy) {
-    let host = Host::start(rproxy::catalog(), dir).await.unwrap();
+    let host = Host::start_enabled(homeport::catalog(), dir).await.unwrap();
     if !enable.is_empty() {
         for id in enable {
             host.kernel().set_plugin(id, true).unwrap();
@@ -168,7 +168,7 @@ async fn node(dir: &std::path::Path) -> (Arc<Host>, String, u16) {
 }
 
 fn via(listener: u16) -> reqwest::Client {
-    rproxy_kernel::mihomo::http()
+    homeport_kernel::mihomo::http()
         .no_proxy()
         .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{listener}")).unwrap())
         .timeout(Duration::from_secs(8))
@@ -187,7 +187,7 @@ async fn vless_node_serves_clients_and_disguises_itself() {
     );
 
     // Without a client key the node is an ordinary HTTPS website.
-    let probe = rproxy_kernel::mihomo::http()
+    let probe = homeport_kernel::mihomo::http()
         .no_proxy()
         .tls_danger_accept_invalid_certs(true)
         .resolve("node.test", SocketAddr::from(([127, 0, 0, 1], node_port)))
@@ -200,7 +200,7 @@ async fn vless_node_serves_clients_and_disguises_itself() {
         .await
         .unwrap();
     assert_eq!(page.status().as_u16(), 200);
-    assert!(page.text().await.unwrap().contains("Notes on photography"));
+    assert!(page.text().await.unwrap().contains("Programmer jokes"));
 
     // A client imports the link and reaches the internet through the node.
     let (client, inbound) = start(client_dir.path(), &[]).await;

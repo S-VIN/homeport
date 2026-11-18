@@ -183,7 +183,7 @@ impl JobContext {
     }
 }
 fn cancelled() -> Error {
-    Error::new("cancelled", "Job cancelled")
+    Error::cancel("Job cancelled")
 }
 fn missing() -> Error {
     Error::new("not_found", "Unknown run or schedule")

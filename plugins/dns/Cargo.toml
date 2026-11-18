@@ -1,0 +1,10 @@
+[package]
+name = "plugin-dns"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+homeport-kernel = { path = "../../crates/kernel" }
+serde = { workspace = true }
+url = { workspace = true }

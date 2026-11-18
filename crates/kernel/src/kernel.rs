@@ -89,13 +89,14 @@ pub struct Kernel {
     stop: tokio_util::sync::CancellationToken,
     /// Job keys with a queued follow-up run.
     /// The run waiting behind an active job of the same key (the newest request).
-    queued: Mutex<HashMap<String, Task>>,
+    /// With the cell of its op, so a newer request merges into it ([`Op::merge`]).
+    queued: Mutex<HashMap<String, (Task, Box<dyn std::any::Any + Send>)>>,
     pub data_dir: PathBuf,
     me: Weak<Kernel>,
 }
 
 pub(crate) fn is_enabled(p: &Plugin, saved: &HashMap<String, bool>) -> bool {
-    p.required || saved.get(p.id).copied().unwrap_or(p.default_enabled)
+    p.required || saved.get(p.id).copied().unwrap_or(false)
 }
 
 /// A running service: its spec (`None` while stopping), the sender whose drop
@@ -129,7 +130,7 @@ pub(crate) fn resolve(
         why.push((p.id.to_owned(), p.platforms_note().unwrap_or_default()));
         false
     });
-    let gives = |p: &Plugin, need: &str| p.id == need;
+    let gives = |p: &Plugin, need: &Plugin| p.id == need.id;
     loop {
         let before = on.len();
         let present = on.clone();
@@ -140,10 +141,7 @@ pub(crate) fn resolve(
                 .find(|r| !present.iter().any(|o| gives(o, r)))
             {
                 Some(missing) => {
-                    let name = catalog
-                        .iter()
-                        .find(|c| gives(c, missing))
-                        .map_or(*missing, |c| c.name);
+                    let name = missing.name;
                     why.push((p.id.to_owned(), format!("Needs {name}, which is off")));
                     false
                 }
@@ -178,10 +176,7 @@ impl Kernel {
         data_dir: &std::path::Path,
         all_plugins: bool,
     ) -> Result<Snapshot> {
-        store.register::<PluginRow>()?;
-        store.register::<OrderRow>()?;
-        store.register::<SettingRow>()?;
-        store.register::<crate::state::MigrationRow>()?;
+        migrate(store, &[])?;
         let saved: HashMap<String, bool> = store
             .transaction(|tx| tx.all::<PluginRow>())?
             .into_iter()
@@ -214,7 +209,14 @@ impl Kernel {
             .map_err(|e| Error::msg(format!("Plugin {} failed to start: {e}", p.name)))?;
         }
         reg.finish();
-        migrate(store, &mut reg)?;
+        migrate(store, &reg.plugins)?;
+        store.check::<PluginRow>()?;
+        store.check::<OrderRow>()?;
+        store.check::<SettingRow>()?;
+        store.check::<crate::state::MigrationRow>()?;
+        for (_, _, p) in &reg.persist {
+            (p.check)(store)?;
+        }
         let mut cells = load_cells(store, &mut reg, all_plugins)?;
         for (name, init) in &reg.live {
             cells.insert(name, Cell { value: init() });
@@ -235,6 +237,7 @@ impl Kernel {
         restore: Arc<dyn Fn(Arc<crate::configuration::Import>) + Send + Sync>,
         ui_open: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Result<Arc<Kernel>> {
+        crate::logging::init(&catalog);
         let snapshot = Self::load_configuration(&catalog, &store, &data_dir, false)?;
         let reg = snapshot.reg.clone();
         let saved: HashMap<String, bool> = store
@@ -254,7 +257,7 @@ impl Kernel {
             changes,
             http: crate::mihomo::http()
                 .no_proxy()
-                .user_agent("rproxy")
+                .user_agent("homeport")
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("HTTP client"),
@@ -263,7 +266,7 @@ impl Kernel {
             schedules: Mutex::default(),
             services: Mutex::default(),
             updates: Mutex::new(crate::updates::CoreUpdates {
-                installed: rproxy_mihomo::installed(&data_dir.join("core")).is_file(),
+                installed: homeport_mihomo::installed(&data_dir.join("core")).is_file(),
                 ..Default::default()
             }),
             catalog,
@@ -295,6 +298,8 @@ impl Kernel {
                 k.core.monitor().await;
             }
         });
+        let on: Vec<&str> = k.reg.plugins.iter().map(|p| p.name).collect();
+        log::info!("Started with {}", on.join(", "));
         for (title, warning) in &k.reg.warnings {
             k.notify_error(title, warning);
         }
@@ -351,7 +356,11 @@ impl Kernel {
                 && !e.cancelled()
                 && !cx.k.closed()
             {
-                cx.k.notify_error(&format!("{} failed", cx.plugin_name()), &e.message);
+                cx.k.notice(
+                    cx.plugin,
+                    &format!("{} failed", cx.plugin_name()),
+                    &e.message,
+                );
             }
             Some(result)
         })
@@ -369,7 +378,7 @@ impl Kernel {
     }
     fn ensure_open(&self) -> Result<()> {
         if self.closed() {
-            return Err(Error::new("closed", "rproxy is restarting."));
+            return Err(Error::new("closed", "homeport is restarting."));
         }
         Ok(())
     }
@@ -443,11 +452,15 @@ impl Kernel {
         self.ensure_open()?;
         let base = self.snapshot();
         let mut w = Write::new(&base, plugin);
-        let out = std::panic::catch_unwind(AssertUnwindSafe(|| f(&mut w)))
-            .map_err(|p| Error::new("bug", panic_text(&*p)))??;
-        for c in &self.reg.cascades {
-            c(&base, &mut w);
-        }
+        // A panic in the change or a cascade fails this write, not the writer.
+        let out = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let out = f(&mut w)?;
+            for c in &self.reg.cascades {
+                c(&base, &mut w);
+            }
+            Ok::<R, Error>(out)
+        }))
+        .map_err(|p| Error::new("bug", panic_text(&*p)))??;
         let Write {
             changed, events, ..
         } = w;
@@ -575,15 +588,12 @@ impl Kernel {
                 plugin: Some(s.plugin),
                 job: None,
             };
-            let (plugin, run, on_stop, restart) = (
-                self.reg.plugins[s.plugin].name,
-                s.run.clone(),
-                s.stop.clone(),
-                s.restart,
-            );
+            let (plugin, run, on_stop, restart) =
+                (s.plugin, s.run.clone(), s.stop.clone(), s.restart);
             let report = move |cx: &Cx, r: Result<()>| {
                 if let (Err(e), false) = (r, cx.k.closed()) {
-                    cx.k.notify_error(plugin, &e.message);
+                    let name = cx.k.reg.plugins[plugin].name;
+                    cx.k.notice(Some(plugin), name, &e.message);
                 }
             };
             let task_spec = spec.clone();
@@ -632,10 +642,11 @@ impl Kernel {
 
     // ---- notices ----------------------------------------------------------
     pub fn notify(&self, title: &str, text: &str) {
-        self.push_notice(title, text, false, None, None);
+        self.push_notice(None, title, text, false, None, None);
     }
+    /// An error toast, also written to the log.
     pub fn notify_error(&self, title: &str, text: &str) {
-        self.push_notice(title, text, true, None, None);
+        self.push_notice(None, title, text, true, None, None);
     }
     /// Redraw every window and browser session (state that lives outside `State`).
     pub fn repaint(&self) {
@@ -643,16 +654,39 @@ impl Kernel {
     }
     /// An error whose details live on `page`.
     pub fn notify_error_at(&self, title: &str, text: &str, page: Option<&'static str>) {
-        self.push_notice(title, text, true, page, None);
+        self.push_notice(None, title, text, true, page, None);
+    }
+    /// An error toast of `plugin`'s work.
+    pub(crate) fn notice(&self, plugin: Option<usize>, title: &str, text: &str) {
+        self.push_notice(plugin, title, text, true, None, None);
+    }
+    /// Write `text` to the log as `plugin`'s line (the app's when `None`).
+    pub(crate) fn log(&self, plugin: Option<usize>, level: log::Level, text: &str) {
+        match plugin {
+            Some(p) => {
+                let target = crate::logging::target(self.reg.plugins[p].id);
+                log::log!(target: &target, level, "{text}");
+            }
+            None => log::log!(level, "{text}"),
+        }
     }
     fn push_notice(
         &self,
+        plugin: Option<usize>,
         title: &str,
         text: &str,
         error: bool,
         page: Option<&'static str>,
         action: Option<NoticeAction>,
     ) {
+        if error {
+            let name = plugin.map(|p| self.reg.plugins[p].name);
+            let line = match name {
+                Some(name) if name == title => text.to_owned(),
+                _ => format!("{title}: {text}"),
+            };
+            self.log(plugin, log::Level::Error, &line);
+        }
         let id = self.next_notice.fetch_add(1, Ordering::Relaxed);
         let mut n = self.notices.lock().unwrap();
         n.push_back(Notice {
@@ -715,6 +749,10 @@ impl Kernel {
         })?;
         t.extend(changes);
         drop(t);
+        if let Some(p) = self.catalog.iter().find(|p| p.id == id) {
+            let state = if enabled { "on" } else { "off" };
+            log::info!("{} turned {state}; applies after a restart", p.name);
+        }
         self.changes.notify();
         Ok(())
     }
@@ -758,7 +796,8 @@ impl Cx {
         dir
     }
     pub fn plugin_name(&self) -> &'static str {
-        self.plugin.map_or("rproxy", |p| self.k.reg.plugins[p].name)
+        self.plugin
+            .map_or("homeport", |p| self.k.reg.plugins[p].name)
     }
     pub fn snapshot(&self) -> Snapshot {
         self.k.snapshot()
@@ -879,7 +918,13 @@ impl Cx {
                         .run()
                         .and_then(|r| r.failure_title)
                         .unwrap_or_else(|| format!("{label} failed"));
-                    cx.k.notify_error_at(&title, &e.message, page);
+                    cx.k.push_notice(cx.plugin, &title, &e.message, true, page, None);
+                }
+                // What a run someone watches found ("Test servers: 82 checked · 3 failed").
+                if let (Ok(()), Some(run)) = (&r, run.run().filter(|r| !r.quiet))
+                    && let Some(summary) = run.summary
+                {
+                    cx.k.log(cx.plugin, log::Level::Info, &format!("{label}: {summary}"));
                 }
                 r
             }
@@ -892,52 +937,67 @@ impl Cx {
         let spec = op.job().unwrap_or_else(|| {
             crate::JobSpec::keyed(crate::Id::random().to_string(), short_name::<O>())
         });
-        let (key, queue, latest) = (self.job_key(&op, &spec.key), spec.queue, spec.latest);
+        let (key, repeat) = (self.job_key(&op, &spec.key), spec.repeat);
         let cell = Arc::new(Mutex::new(Some(op)));
+        let take = cell.clone();
         let task = self.task_with(key.clone(), spec, None, move || {
-            cell.lock().unwrap().take().expect("op runs once")
+            take.lock().unwrap().take().expect("op runs once")
         });
         let jobs = &self.k.jobs;
-        if (queue || latest)
-            && let Some(active) = jobs
-                .board()
-                .runs
-                .into_iter()
-                .find(|r| r.key == key && r.phase.active())
-        {
-            if latest {
-                let _ = jobs.cancel(active.id);
+        if repeat == crate::Repeat::Join {
+            return Ok(jobs.start(task)?.id);
+        }
+        // Deciding, and starting a follow-up, under one lock: two runs of a
+        // key never overlap.
+        let mut queued = self.k.queued.lock().unwrap();
+        let waiting = queued
+            .get(&key)
+            .and_then(|(_, c)| c.downcast_ref::<Arc<Mutex<Option<O>>>>())
+            .cloned();
+        let active = (jobs.board().runs.into_iter()).find(|r| r.key == key && r.phase.active());
+        let Some(active) = active else {
+            // The run it waited for just ended: this one starts in its place.
+            if let Some(old) = waiting.and_then(|w| w.lock().unwrap().take()) {
+                queued.remove(&key);
+                let mut op = cell.lock().unwrap();
+                *op = Some(old.merge(op.take().expect("not started")));
             }
-            // One follow-up per key, always the newest request.
-            if self
-                .k
-                .queued
-                .lock()
-                .unwrap()
-                .insert(key.clone(), task)
-                .is_some()
-            {
-                return Ok(active.id);
-            }
-            let k = self.k.clone();
-            let handle = jobs.handle(active.id);
-            // Tracked, so `idle()` also waits for the follow-up.
-            self.k.tasks.spawn(async move {
-                if let Some(h) = handle {
-                    // Shutdown cancels the active job later: don't hold it up.
-                    tokio::select! {
-                        _ = h.wait() => {}
-                        _ = k.stop.cancelled() => return,
-                    }
-                }
-                let next = k.queued.lock().unwrap().remove(&key);
-                if let Some(task) = next.filter(|_| !k.closed()) {
-                    let _ = k.jobs.start(task);
-                }
+            return Ok(jobs.start(task)?.id);
+        };
+        if repeat == crate::Repeat::Latest {
+            let _ = jobs.cancel(active.id);
+        }
+        // One follow-up per key: a newer request merges into it.
+        if let Some(waiting) = waiting {
+            let newer = cell.lock().unwrap().take().expect("not started");
+            let mut waiting = waiting.lock().unwrap();
+            *waiting = Some(match waiting.take() {
+                Some(old) => old.merge(newer),
+                None => newer,
             });
             return Ok(active.id);
         }
-        Ok(jobs.start(task)?.id)
+        if queued.insert(key.clone(), (task, Box::new(cell))).is_some() {
+            return Ok(active.id);
+        }
+        drop(queued);
+        let k = self.k.clone();
+        let handle = jobs.handle(active.id);
+        // Tracked, so `idle()` also waits for the follow-up.
+        self.k.tasks.spawn(async move {
+            if let Some(h) = handle {
+                // Shutdown cancels the active job later: don't hold it up.
+                tokio::select! {
+                    _ = h.wait() => {}
+                    _ = k.stop.cancelled() => return,
+                }
+            }
+            let mut queued = k.queued.lock().unwrap();
+            if let Some((task, _)) = queued.remove(&key).filter(|_| !k.closed()) {
+                let _ = k.jobs.start(task);
+            }
+        });
+        Ok(active.id)
     }
     /// Read what an op's result depends on (e.g. a subscription's link) when
     /// it starts; [`Input::check`] inside the final write then refuses to save
@@ -1006,7 +1066,7 @@ impl Cx {
     pub async fn or_cancel<T>(&self, fut: impl std::future::Future<Output = T>) -> Result<T> {
         tokio::select! {
             biased;
-            _ = self.cancelled() => Err(Error::new("cancelled", "Cancelled")),
+            _ = self.cancelled() => Err(Error::cancel("Cancelled")),
             v = fut => Ok(v),
         }
     }
@@ -1037,7 +1097,9 @@ impl Cx {
     pub fn http(&self) -> &reqwest::Client {
         &self.k.http
     }
+    /// A toast with the plugin's name, also written to the log.
     pub fn notify(&self, text: &str) {
+        self.k.log(self.plugin, log::Level::Info, text);
         self.k.notify(self.plugin_name(), text)
     }
     /// A toast with a button that runs `op()`, e.g. "Undo" or "Turn back on":
@@ -1053,8 +1115,15 @@ impl Cx {
             plugin: self.plugin,
             run: Arc::new(move |cx| cx.run(op())),
         };
-        self.k
-            .push_notice(self.plugin_name(), text, false, None, Some(action));
+        self.k.log(self.plugin, log::Level::Info, text);
+        self.k.push_notice(
+            self.plugin,
+            self.plugin_name(),
+            text,
+            false,
+            None,
+            Some(action),
+        );
     }
 }
 
@@ -1069,53 +1138,51 @@ impl Drop for LiveMark {
     }
 }
 
-/// Bring saved data up to the plugins' schemas: lenient table step (new
-/// columns), migrations in version order, then the strict check. A plugin that
-/// never saved anything starts on its newest schema: its migrations are
-/// recorded as done without running.
-fn migrate(store: &Store, reg: &mut Registry) -> Result<()> {
-    use crate::state::MigrationRow;
-    let done = |id: String| MigrationRow {
-        id,
-        at: crate::now() as i64,
-    };
-    reg.migrations.sort_by_key(|(p, v, _)| (*p, *v));
-    let fresh: Vec<bool> = store.transaction(|tx| {
-        (0..reg.plugins.len())
-            .map(|p| Ok(!installed(tx, reg.plugins[p].id)?))
-            .collect()
-    })?;
-    for (_, _, p) in &reg.persist {
-        (p.register)(store, false)?;
-    }
-    for (p, version, step) in &reg.migrations {
-        let plugin = &reg.plugins[*p];
-        let id = format!("{}|{version}", plugin.id);
-        store
-            .transaction(|tx| {
-                if tx.get::<MigrationRow>(id.as_str())?.is_none() {
-                    if !fresh[*p] {
-                        step(tx.sql())?;
+/// The kernel's own scripts (crates/kernel/migrations).
+const SCRIPTS: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
+
+/// Run the scripts of the kernel and of `plugins` that have not run in this
+/// database yet, in name order, each in its own transaction. `kernel_migrations`
+/// records `<plugin>/<file>` of every script that ran.
+pub(crate) fn migrate(store: &Store, plugins: &[&'static Plugin]) -> Result<()> {
+    let owners = std::iter::once(("kernel", "homeport", SCRIPTS))
+        .chain(plugins.iter().map(|p| (p.id, p.name, p.migrations)));
+    let mut applied = Vec::new();
+    for (owner, name, scripts) in owners {
+        for (file, sql) in scripts {
+            let id = format!("{owner}/{file}");
+            let fresh = store
+                .transaction(|tx| {
+                    if ran(tx, &id)? {
+                        return Ok(false);
                     }
-                    tx.put(&done(id.clone()))?;
-                }
-                Ok(())
-            })
-            .map_err(|e| Error::msg(format!("{}: migration {version} failed: {e}", plugin.name)))?;
-    }
-    store.transaction(|tx| {
-        for p in &reg.plugins {
-            let id = format!("{}|installed", p.id);
-            if tx.get::<MigrationRow>(id.as_str())?.is_none() {
-                tx.put(&done(id))?;
+                    tx.sql().execute_batch(sql)?;
+                    tx.put(&crate::state::MigrationRow {
+                        id: id.clone(),
+                        at: crate::now() as i64,
+                    })?;
+                    Ok(true)
+                })
+                .map_err(|e| Error::msg(format!("{name}: migration {file} failed: {e}")))?;
+            if fresh && !applied.contains(&name) {
+                applied.push(name);
             }
         }
-        Ok(())
-    })?;
-    for (_, _, p) in &reg.persist {
-        (p.register)(store, true)?;
+    }
+    if !applied.is_empty() {
+        log::info!("Database tables updated for {}", applied.join(", "));
     }
     Ok(())
+}
+
+/// The script ran here (before the kernel's first one there is no journal).
+fn ran(tx: &crate::store::Tx<'_>, id: &str) -> Result<bool> {
+    let journal: bool = tx.sql().query_row(
+        "SELECT count(*) > 0 FROM sqlite_schema WHERE type = 'table' AND name = 'kernel_migrations'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(journal && tx.get::<crate::state::MigrationRow>(id)?.is_some())
 }
 
 /// Read every persisted state. A setting that no longer reads (an older or
@@ -1134,7 +1201,7 @@ fn load_cells(
                 (Ok(value), _) => value,
                 (Err(e), Some(default)) if !strict && e.code == "setting" => {
                     set_aside(tx, name)?;
-                    let owner = plugin.map_or("rproxy", |i| reg.plugins[i].name);
+                    let owner = plugin.map_or("homeport", |i| reg.plugins[i].name);
                     let warning = format!("{owner}: the saved setting {name} could not be read, so its default is used.");
                     warnings.push(("Settings", warning));
                     default()
@@ -1162,13 +1229,6 @@ fn set_aside(tx: &crate::store::Tx<'_>, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// The plugin ran here before (it gets a `<plugin>|installed` migration row).
-fn installed(tx: &crate::store::Tx<'_>, plugin: &str) -> Result<bool> {
-    Ok(tx
-        .get::<crate::state::MigrationRow>(format!("{plugin}|installed").as_str())?
-        .is_some())
-}
-
 /// What an op read when it started (see [`Cx::input`]).
 #[derive(Clone)]
 pub struct Input<K> {
@@ -1189,7 +1249,28 @@ impl<K: PartialEq> Input<K> {
         if self.current(w) {
             Ok(())
         } else {
-            Err(Error::new("cancelled", "Changed while this was running."))
+            Err(Error::cancel("Changed while this was running."))
+        }
+    }
+}
+impl<K: Clone + PartialEq + Send + Sync + 'static> Input<K> {
+    /// The check alone, without the value's type: an op carries it into the
+    /// write of the plugin that handles it.
+    pub fn guard(&self) -> Guard {
+        let (read, value) = (self.read.clone(), self.value.clone());
+        Guard(Arc::new(move |snap| value.is_some() && read(snap) == value))
+    }
+}
+/// [`Input::check`] without the value's type ([`Input::guard`]).
+#[derive(Clone)]
+pub struct Guard(Arc<dyn Fn(&Snapshot) -> bool + Send + Sync>);
+impl Guard {
+    /// Inside `cx.write`: a silent cancellation when the input changed or is gone.
+    pub fn check(&self, w: &Write<'_>) -> Result<()> {
+        if (self.0)(w.base()) {
+            Ok(())
+        } else {
+            Err(Error::cancel("Changed while this was running."))
         }
     }
 }
@@ -1219,32 +1300,28 @@ pub(crate) fn panic_text(panic: &(dyn Any + Send)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Platform, categories};
+    use crate::Platform;
     static ELSEWHERE: Plugin = Plugin {
         id: "elsewhere",
         name: "Elsewhere",
-        description: "",
-        category: categories::NETWORK,
-        requires: &[],
-        required: false,
-        default_enabled: true,
         platforms: if cfg!(windows) {
             &[Platform::Macos]
         } else {
             &[Platform::Windows]
         },
-        setup: |_| Ok(()),
+        ..Plugin::DEFAULT
     };
     static NEEDS_IT: Plugin = Plugin {
         id: "needs-it",
         name: "Needs it",
-        requires: &["elsewhere"],
+        requires: &[&ELSEWHERE],
         platforms: Platform::ALL,
         ..ELSEWHERE
     };
     #[test]
     fn plugins_for_other_systems_are_skipped_with_a_reason() {
-        let (on, why) = resolve(&[&ELSEWHERE, &NEEDS_IT], &HashMap::new());
+        let saved = HashMap::from([("elsewhere".into(), true), ("needs-it".into(), true)]);
+        let (on, why) = resolve(&[&ELSEWHERE, &NEEDS_IT], &saved);
         assert!(on.is_empty());
         let only = if cfg!(windows) {
             "macOS only"

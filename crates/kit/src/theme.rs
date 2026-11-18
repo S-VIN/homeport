@@ -55,6 +55,9 @@ pub fn fit_pointer(ctx: &egui::Context) {
 }
 /// Width of the label column in property lists (server details, About).
 pub const LABEL_WIDTH: f32 = 96.0;
+/// Opacity of what does not apply now (an excluded server's cells, a
+/// disabled main button).
+pub const DIMMED: f32 = 0.45;
 /// Corner radius of cards, popovers and toasts.
 pub const RADIUS: u8 = 8;
 /// Corner radius of controls (buttons, inputs, selects).

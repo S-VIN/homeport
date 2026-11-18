@@ -6,10 +6,10 @@
 //! Geo rules (`geosite:category-ru`, `geoip:ru`) use rule sets from the
 //! MetaCubeX geo database. The core downloads them, keeps them in its home
 //! folder and refreshes them daily; the page can refresh them on demand.
+use homeport_kernel::core::Labels;
+use homeport_kernel::mihomo::{RuleBehavior, RuleProvider};
+use homeport_kernel::{kit, mihomo::ipnet::IpNet, prelude::*, ui::Column, ui::ListEditor};
 use plugin_servers as servers;
-use rproxy_kernel::core::Labels;
-use rproxy_kernel::mihomo::{RuleBehavior, RuleProvider};
-use rproxy_kernel::{kit, mihomo::ipnet::IpNet, prelude::*, ui::Column, ui::ListEditor};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr},
@@ -68,7 +68,7 @@ pub struct UpdateGeo;
 impl Op for UpdateGeo {
     type Reply = ();
     fn job(&self) -> Option<JobSpec> {
-        Some(JobSpec::new("Update geo data").page("routing"))
+        Some(JobSpec::new("Update geo data").page(&PLUGIN))
     }
 }
 struct RefreshGeo;
@@ -117,8 +117,9 @@ pub static PLUGIN: Plugin = Plugin {
     id: "routing",
     name: "Routing",
     description: "Send domains and networks through the proxy, directly, or block them. The first match wins.",
-    requires: &["servers"],
+    requires: &[&plugin_servers::PLUGIN],
     required: true,
+    migrations: homeport_kernel::migrations!(),
     setup,
     ..Plugin::DEFAULT
 };
@@ -364,6 +365,18 @@ async fn above_catch_all(cx: Cx, mut op: Add<Rule>, next: Next<Add<Rule>>) -> Re
 fn setup(p: &mut Setup) -> Result<()> {
     p.wrap(above_catch_all);
     p.handle(set_route);
+    p.on(|_: Cx, e: Added<Rule>| async move {
+        info!("Rule added: {} → {}", e.item.pattern, e.item.action);
+        Ok(())
+    });
+    p.on(|_: Cx, e: Saved<Rule>| async move {
+        info!("Rule changed: {} → {}", e.item.pattern, e.item.action);
+        Ok(())
+    });
+    p.on(|_: Cx, e: Removed<Rule>| async move {
+        info!("Rule removed: {}", e.item.pattern);
+        Ok(())
+    });
     p.list(&RULES).validate(|_, rule, _, others| {
         let (pattern, network) = rule_pattern(&rule.pattern)?;
         let clash = others.iter().any(|r| {
@@ -412,6 +425,7 @@ fn setup(p: &mut Setup) -> Result<()> {
         if !failed.is_empty() {
             bail!("Could not download {}.", failed.join(", "));
         }
+        info!("Geo lists updated: {}", sets.len());
         cx.summary(kit::plural(
             sets.len(),
             "geo list updated",
@@ -427,17 +441,19 @@ fn setup(p: &mut Setup) -> Result<()> {
     );
     // New geo rules download in the background; show their state soon after
     // the last of several quick edits.
-    p.on_change([RULES.name], |cx: Cx| async move {
-        if !geo_providers(&cx.snapshot()).is_empty() {
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            read_geo(&cx).await?;
-        }
-        Ok(())
-    })
+    p.watch(
+        |s| s.get(&RULES),
+        |cx: Cx, _| async move {
+            if !geo_providers(&cx.snapshot()).is_empty() {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                read_geo(&cx).await?;
+            }
+            Ok(())
+        },
+    )
     .latest();
     p.page_fn(
         PageSpec {
-            id: "routing",
             title: "Routing",
             icon: Icon::Routing,
             order: 30,
@@ -597,7 +613,7 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
     let n = cx.get(&RULES).len();
     let counter = kit::count(n, "rule", "rules");
     let has_geo = !geo_providers(cx.snapshot()).is_empty();
-    kit::page_header(ui, "Routing", &counter, |ui| {
+    cx.page_header(ui, &counter, |ui, cx| {
         if has_geo {
             cx.job_button(
                 ui,
@@ -621,6 +637,10 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
             },
             move |ui, r, width| rule_fields(ui, &inbounds, r, width),
         )
+        // The type leads, as in the add form.
+        .leading("Type", 76., |ui, _, r: &Rule| {
+            kit::badge(ui, kind(&r.pattern), kit::Tone::Neutral);
+        })
         .column(
             Column::edit("Pattern", "Domain, IP or network", |r: &mut Rule| {
                 &mut r.pattern
@@ -629,9 +649,6 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
                 pattern_label(&labels, &r.pattern).unwrap_or_else(|| r.pattern.clone())
             }),
         )
-        .column(Column::custom("Type", 80., |ui, _, r: &Rule| {
-            kit::badge(ui, kind(&r.pattern), kit::Tone::Neutral);
-        }))
         .column(Column::choice(
             "Route",
             120.,
@@ -642,7 +659,7 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
         .empty(
             Icon::Routing,
             "No routing rules",
-            "Everything goes through the proxy.",
+            "All traffic goes to the connected server until you add a rule.",
         )
         .show(ui, cx);
 }

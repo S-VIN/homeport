@@ -215,8 +215,11 @@ fn apply_theme(ctx: &egui::Context, k: &Kernel, s: &mut SessionState) {
 
 fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
     if cx.s.page == PLUGINS_PAGE {
+        // Only the plugins with a switch: required ones are part of the app.
         let enabled = cx.k.reg.plugins.iter().filter(|p| !p.required).count();
-        kit::page_header(ui, "Plugins", &format!("{enabled} active"), |_| {});
+        let optional = cx.k.catalog.iter().filter(|p| !p.required).count();
+        let counter = format!("{enabled} of {optional} on");
+        kit::page_header(ui, "Plugins", &counter, |_| {});
 
         // Pinned under the header: it never scrolls away or pushes the content.
         if cx.k.restart_pending()
@@ -237,11 +240,11 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
         kit::page_scroll(ui, "settings", |ui| settings(ui, cx));
         return;
     }
-    let Some(entry) = cx.k.reg.pages.iter().find(|p| p.spec.id == cx.s.page) else {
-        cx.s.page = cx.k.reg.pages.first().map_or(SETTINGS_PAGE, |p| p.spec.id);
+    let Some(entry) = cx.k.reg.pages.iter().find(|p| p.id == cx.s.page) else {
+        cx.s.page = cx.k.reg.pages.first().map_or(SETTINGS_PAGE, |p| p.id);
         return;
     };
-    let (id, plugin, make) = (entry.spec.id, entry.plugin, entry.make.clone());
+    let (id, plugin, make) = (entry.id, entry.plugin, entry.make.clone());
     let mut page = cx.s.pages.remove(id).unwrap_or_else(|| make());
     ui.push_id(id, |ui| cx.scoped(Some(plugin), |cx| page.ui(ui, cx)));
     cx.s.pages.insert(id, page);

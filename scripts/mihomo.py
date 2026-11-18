@@ -47,7 +47,7 @@ def update_binaries():
         path = binary_path(record['os'], record['architecture'])
         if path.relative_to(ROOT).as_posix() != record['path']:
             raise ValueError('Manifest path does not match platform')
-        request = Request(record['url'], headers={'User-Agent': 'rproxy'})
+        request = Request(record['url'], headers={'User-Agent': 'homeport'})
         with urlopen(request, timeout=120) as response:
             archive = response.read()
         if hashlib.sha256(archive).hexdigest() != record['archive_sha256']:

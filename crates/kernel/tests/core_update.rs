@@ -1,5 +1,5 @@
-//! Live update of the mihomo core from GitHub (network): `cargo test -p rproxy-kernel --test core_update -- --ignored`.
-use rproxy_kernel::{Host, Kernel};
+//! Live update of the mihomo core from GitHub (network): `cargo test -p homeport-kernel --test core_update -- --ignored`.
+use homeport_kernel::{Host, Kernel};
 use std::time::Duration;
 
 async fn finished(k: &Kernel) {

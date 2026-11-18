@@ -5,6 +5,7 @@
 use super::UiCx;
 use crate::{
     Id, Record, State,
+    columns::Columns,
     kit::{self, Emphasis, Icon, Tone, theme},
     list::{Add, Edit, Move, Remove, Save},
 };
@@ -126,7 +127,7 @@ impl<'s, T: 's> Column<'s, T> {
 
 type Fields<'s, T> = Box<dyn FnMut(&mut Ui, &mut T, f32) -> bool + 's>;
 type Subtitle<'s, T> = Box<dyn Fn(&[T], usize) -> Option<(String, Tone)> + 's>;
-type Leading<'s, T> = (f32, Box<dyn Fn(&mut Ui, &mut UiCx, &T) + 's>);
+type Leading<'s, T> = (&'s str, f32, Box<dyn Fn(&mut Ui, &mut UiCx, &T) + 's>);
 
 pub struct ListEditor<'s, T: Record> {
     state: &'static State<Vec<T>>,
@@ -137,6 +138,7 @@ pub struct ListEditor<'s, T: Record> {
     subtitle: Option<Subtitle<'s, T>>,
     leading: Option<Leading<'s, T>>,
     headers: bool,
+    added: Option<&'static Columns<T>>,
 }
 
 impl<'s, T: Record> ListEditor<'s, T> {
@@ -150,10 +152,17 @@ impl<'s, T: Record> ListEditor<'s, T> {
             subtitle: None,
             leading: None,
             headers: true,
+            added: None,
         }
     }
     pub fn column(mut self, c: Column<'s, T>) -> Self {
         self.columns.push(c);
+        self
+    }
+    /// Let other plugins add columns ([`Setup::column`](crate::Setup::column)):
+    /// they follow the list's own ones.
+    pub fn columns_from(mut self, list: &'static Columns<T>) -> Self {
+        self.added = Some(list);
         self
     }
     /// Add bar above the list. `fields` draws inputs for the draft into the given
@@ -186,13 +195,28 @@ impl<'s, T: Record> ListEditor<'s, T> {
         self.subtitle = Some(Box::new(f));
         self
     }
-    /// A fixed-width marker before the first column (e.g. a color dot).
-    pub fn leading(mut self, width: f32, f: impl Fn(&mut Ui, &mut UiCx, &T) + 's) -> Self {
-        self.leading = Some((width, Box::new(f)));
+    /// A fixed-width marker before the first column (a color dot, a type
+    /// badge); `title` heads it like a column's ("" for none).
+    pub fn leading(
+        mut self,
+        title: &'s str,
+        width: f32,
+        f: impl Fn(&mut Ui, &mut UiCx, &T) + 's,
+    ) -> Self {
+        self.leading = Some((title, width, Box::new(f)));
         self
     }
 
     pub fn show(mut self, ui: &mut Ui, cx: &mut UiCx) {
+        for c in self.added.map_or(Vec::new(), |list| cx.added(ui, list)) {
+            let cell = c.cell.clone();
+            let column = Column::custom(
+                c.column.title,
+                crate::columns::COLUMN_WIDTH,
+                move |ui, cx, item| cx.scoped(Some(c.plugin), |cx| cell(ui, cx, item)),
+            );
+            self.columns.push(column.right());
+        }
         let list = egui::Id::unique(("list", self.state.name));
         let editing_id = list.with("editing");
         let mut editing: Option<Id> = ui.data(|d| d.get_temp(editing_id)).flatten();
@@ -204,7 +228,7 @@ impl<'s, T: Record> ListEditor<'s, T> {
         kit::list_card(ui, |ui| {
             // Rows sit inside `kit::row`'s inset; header and rows share one layout.
             let width = ui.available_width() - 2. * (theme::INSET - theme::SPACE_S);
-            let layout = self.layout(width, self.arrows_in_row(ui));
+            let layout = self.layout(width);
             if self.headers && !rows.is_empty() && self.columns.iter().any(|c| !c.title.is_empty())
             {
                 self.header(ui, &layout);
@@ -264,12 +288,11 @@ impl<'s, T: Record> ListEditor<'s, T> {
         ui.data_mut(|d| d.insert_temp(draft_id, draft));
     }
 
-    /// Column widths for rows `width` wide. Narrow rows put the fixed-width
-    /// columns on a second line, so the main column keeps at least `MIN_FILL`:
-    /// plugins don't plan for screen sizes.
-    /// Column widths for a row of `width`; `arrows`: with the order arrows.
-    fn layout(&self, width: f32, arrows: bool) -> Layout {
-        const MIN_FILL: f32 = 96.;
+    /// Column widths for rows `width` wide.
+    /// Narrow rows put the fixed-width columns on a second line, so the main
+    /// column keeps at least `MIN_FILL`: plugins don't plan for screen sizes.
+    fn layout(&self, width: f32) -> Layout {
+        const MIN_FILL: f32 = 160.;
         let gap = theme::HORIZONTAL_GAP;
         let fills = self
             .columns
@@ -284,7 +307,7 @@ impl<'s, T: Record> ListEditor<'s, T> {
             .map(|w| w + gap)
             .sum();
         let leading = self.leading_width();
-        let avail = width - leading - self.actions_width(arrows) - gap;
+        let avail = width - leading - self.actions_width() - gap;
         if fixed > 0. && avail - fixed < MIN_FILL * fills {
             // The second line starts under the main column and has no actions.
             Layout {
@@ -303,17 +326,12 @@ impl<'s, T: Record> ListEditor<'s, T> {
     fn leading_width(&self) -> f32 {
         self.leading
             .as_ref()
-            .map_or(0., |(w, _)| w + theme::HORIZONTAL_GAP)
+            .map_or(0., |(_, w, _)| w + theme::HORIZONTAL_GAP)
     }
     /// Row actions sit edge to edge: order arrows, edit, delete.
-    fn actions_width(&self, arrows: bool) -> f32 {
-        let arrows = self.ordered && arrows;
-        (if arrows { 2. } else { 0. } + if self.editable() { 1. } else { 0. } + 1.) * theme::CONTROL
-    }
-    /// On a phone the order arrows sit on the editor's line (the row's room
-    /// goes to the text); a list without an editor keeps them in every row.
-    fn arrows_in_row(&self, ui: &Ui) -> bool {
-        self.ordered && (!kit::phone(ui) || !self.editable())
+    fn actions_width(&self) -> f32 {
+        (if self.ordered { 2. } else { 0. } + if self.editable() { 1. } else { 0. } + 1.)
+            * theme::CONTROL
     }
     fn editable(&self) -> bool {
         self.columns
@@ -323,8 +341,13 @@ impl<'s, T: Record> ListEditor<'s, T> {
 
     fn header(&self, ui: &mut Ui, layout: &Layout) {
         kit::list_header(ui, |ui| {
-            // Like a row's marker and the gap after it (`add_space` adds no gap).
-            ui.add_space(self.leading_width());
+            match &self.leading {
+                Some((title, width, _)) if !title.is_empty() => {
+                    kit::cell(ui, *width, |ui| kit::caption(ui, *title));
+                }
+                // Like a row's marker and the gap after it (`add_space` adds no gap).
+                _ => ui.add_space(self.leading_width()),
+            }
             for c in self.columns.iter().filter(|c| layout.on(c, Line::Main)) {
                 let width = layout.width(c);
                 if c.right {
@@ -386,7 +409,7 @@ impl<'s, T: Record> ListEditor<'s, T> {
                     kit::row_line(ui, height, |ui| {
                         self.marker(ui, cx, row, two_lines);
                         self.cells(ui, cx, row, &mut draft, &mut save, layout, Line::Main);
-                        if self.arrows_in_row(ui)
+                        if self.ordered
                             && let Some(up) = kit::order(ui, row.index, row.len, emphasis)
                         {
                             cx.submit(key, Move::new(self.state, id, up));
@@ -398,7 +421,10 @@ impl<'s, T: Record> ListEditor<'s, T> {
                             } else {
                                 (Icon::Edit, "Edit")
                             };
-                            if kit::icon_button_ex(ui, icon, label, true, emphasis, false).clicked()
+                            if kit::IconButton::new(icon, label)
+                                .emphasis(emphasis)
+                                .show(ui)
+                                .clicked()
                             {
                                 if !row.editing {
                                     *editing = Some(id);
@@ -419,9 +445,7 @@ impl<'s, T: Record> ListEditor<'s, T> {
                         }
                     });
                     if row.editing && kit::phone(ui) {
-                        // A phone row is too narrow for a field: each gets a full
-                        // line, the first one also the order arrows.
-                        let mut arrows = self.ordered;
+                        // A phone row is too narrow for a field: each gets a full line.
                         for c in &self.columns {
                             if let Kind::Edit {
                                 lens, placeholder, ..
@@ -429,10 +453,7 @@ impl<'s, T: Record> ListEditor<'s, T> {
                             {
                                 kit::row_line(ui, theme::CONTROL, |ui| {
                                     ui.add_space(self.leading_width());
-                                    let order = 2. * theme::CONTROL + theme::HORIZONTAL_GAP;
-                                    let width = ui.available_width()
-                                        - theme::SPACE_S
-                                        - if arrows { order } else { 0. };
+                                    let width = ui.available_width() - theme::SPACE_S;
                                     let text = lens(&mut draft);
                                     edit_field(
                                         ui,
@@ -443,12 +464,6 @@ impl<'s, T: Record> ListEditor<'s, T> {
                                         width,
                                         &mut save,
                                     );
-                                    if std::mem::take(&mut arrows)
-                                        && let Some(up) =
-                                            kit::order(ui, row.index, row.len, Emphasis::Normal)
-                                    {
-                                        cx.submit(key, Move::new(self.state, id, up));
-                                    }
                                 });
                             }
                         }
@@ -457,8 +472,15 @@ impl<'s, T: Record> ListEditor<'s, T> {
                     if layout.stacked {
                         // Tucked under the first line; the gap below separates rows.
                         ui.add_space(-4.);
+                        // At the row's right edge, where the main line's actions end.
+                        let below: f32 = self
+                            .columns
+                            .iter()
+                            .filter(|c| layout.on(c, Line::Below))
+                            .map(|c| layout.width(c) + theme::HORIZONTAL_GAP)
+                            .sum();
                         kit::row_line(ui, theme::CONTROL, |ui| {
-                            ui.add_space(self.leading_width());
+                            ui.add_space((ui.available_width() - below).max(self.leading_width()));
                             self.cells(ui, cx, row, &mut draft, &mut save, layout, Line::Below);
                         });
                         ui.add_space(8.);
@@ -536,7 +558,7 @@ impl<'s, T: Record> ListEditor<'s, T> {
         }
     }
     fn marker(&self, ui: &mut Ui, cx: &mut UiCx, row: &RowView<'_, T>, two_lines: bool) {
-        let Some((width, f)) = &self.leading else {
+        let Some((_, width, f)) = &self.leading else {
             return;
         };
         if two_lines {
@@ -661,7 +683,7 @@ fn edit_field<T>(
     width: f32,
     save: &mut bool,
 ) {
-    let r = kit::input(ui, title, text, placeholder, width, false)
+    let r = kit::input(ui, title, text, placeholder, width)
         .on_hover_text("Enter or leave the field to save · Esc discards unsaved text");
     if ui
         .data_mut(|d| d.remove_temp::<bool>(row.list.with(("focus", row.id))))

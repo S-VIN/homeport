@@ -5,6 +5,8 @@ pub(super) struct Tab {
     id: &'static str,
     title: &'static str,
     icon: Icon,
+    /// The plugin category: the sidebar separates groups.
+    group: &'static str,
 }
 
 pub(super) fn tabs(cx: &UiCx) -> Vec<Tab> {
@@ -12,14 +14,16 @@ pub(super) fn tabs(cx: &UiCx) -> Vec<Tab> {
         .pages
         .iter()
         .map(|e| Tab {
-            id: e.spec.id,
+            id: e.id,
             title: e.spec.title,
             icon: e.spec.icon,
+            group: cx.k.reg.plugins[e.plugin].category.id,
         })
         .chain(std::iter::once(Tab {
             id: PLUGINS_PAGE,
             title: "Plugins",
             icon: Icon::Plugin,
+            group: "",
         }))
         .collect()
 }
@@ -37,11 +41,13 @@ pub(super) fn navigation(root: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette, r
         id: SETTINGS_PAGE,
         title: "Settings",
         icon: Icon::Settings,
+        group: "",
     };
     let more = Tab {
         id: "more",
         title: "More",
         icon: Icon::More,
+        group: "",
     };
     let gap = 2.;
     let full = ui.available_width();
@@ -105,11 +111,17 @@ pub(super) fn navigation(root: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette, r
                 .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
                 .show(|ui| {
                     ui.set_min_width(170.);
-                    for t in &overflow {
-                        if side_tab(ui, p, t, cx.s.page == t.id, 170.).clicked() {
-                            cx.s.page = t.id;
-                        }
-                    }
+                    // Many pages on a short screen: the list scrolls above the tab.
+                    let room = (r.rect.top() - ui.ctx().content_rect().top() - 24.).max(80.);
+                    egui::ScrollArea::vertical()
+                        .max_height(room)
+                        .show(ui, |ui| {
+                            for t in &overflow {
+                                if side_tab(ui, p, t, cx.s.page == t.id, 170.).clicked() {
+                                    cx.s.page = t.id;
+                                }
+                            }
+                        });
                 });
         } else if r.clicked() {
             cx.s.page = t.id;
@@ -186,13 +198,24 @@ pub(super) fn side_tab(
     active: bool,
     width: f32,
 ) -> egui::Response {
+    side_row(ui, p, t.id, t.title, t.icon, active, width)
+}
+fn side_row(
+    ui: &mut egui::Ui,
+    p: &kit::Palette,
+    id: &str,
+    title: &str,
+    icon: Icon,
+    active: bool,
+    width: f32,
+) -> egui::Response {
     let (_, rect) = ui.allocate_space(vec2(width, 32.));
     let response = ui.interact(
         rect,
-        ui.scope_id().with(("navigation", t.id)),
+        ui.scope_id().with(("navigation", id)),
         egui::Sense::click(),
     );
-    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, active, t.title));
+    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, active, title));
     let hovered = response.hovered();
     if active || hovered {
         ui.painter().rect_filled(
@@ -212,7 +235,7 @@ pub(super) fn side_tab(
     kit::icons::paint_sized(
         ui.painter(),
         rect.left_center() + vec2(18., 0.),
-        t.icon,
+        icon,
         17.,
         ink,
     );
@@ -222,7 +245,7 @@ pub(super) fn side_tab(
         egui::FontId::proportional(theme::BODY)
     };
     let text = ui.painter().layout_no_wrap(
-        t.title.to_owned(),
+        title.to_owned(),
         font,
         if active { p.accent } else { p.foreground },
     );
@@ -246,33 +269,54 @@ pub(super) fn sidebar(root: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette, rect
     let ui = &mut ui;
     ui.spacing_mut().item_spacing.y = 2.;
     let width = inner.width();
+    let mut group = None;
     for t in tabs(cx) {
+        if group.is_some_and(|g| g != t.group) {
+            ui.add_space(theme::SPACE_XS);
+            kit::separator(ui);
+            ui.add_space(theme::SPACE_XS + 1.);
+        }
+        group = Some(t.group);
         if side_tab(ui, p, &t, cx.s.page == t.id, width).clicked() {
             cx.s.page = t.id;
         }
     }
     // Bottom block: save state, Activity, Settings.
-    let bottom = 32. + 2. + 26. + 2. + 24.;
+    let bottom = 24. + 2. + 32. + 2. + 32.;
     ui.add_space((ui.available_height() - bottom).max(theme::SPACE_L));
+    // Room kept for the save state, so the rows below don't move.
     ui.allocate_ui_with_layout(
         vec2(width, 24.),
         Layout::left_to_right(Align::Center),
         |ui| {
+            ui.set_min_size(vec2(width, 24.));
             ui.add_space(10.);
             save_state(ui, cx, p);
         },
     );
-    let r = ui.horizontal(|ui| {
-        ui.add_space(2.);
-        activity_button(ui, cx, p)
-    });
+    let a = Activity::of(cx);
+    let r = side_row(
+        ui,
+        p,
+        "activity",
+        &a.text,
+        Icon::Tasks,
+        cx.s.activity_open,
+        width,
+    )
+    .on_hover_text(&a.tip);
+    a.mark(ui, p, r.rect.left_center() + vec2(25., -6.));
+    if r.clicked() {
+        a.toggle(cx);
+    }
     let settings = Tab {
         id: SETTINGS_PAGE,
         title: "Settings",
         icon: Icon::Settings,
+        group: "",
     };
     if side_tab(ui, p, &settings, cx.s.page == SETTINGS_PAGE, width).clicked() {
         cx.s.page = SETTINGS_PAGE;
     }
-    r.inner.rect
+    r.rect
 }

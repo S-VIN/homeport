@@ -5,8 +5,8 @@
 use super::{wireguard, xray};
 use crate::{LINK, MAX_BYTES, Parse};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use homeport_kernel::prelude::*;
 use plugin_servers::Proxy;
-use rproxy_kernel::prelude::*;
 use serde_json::Value;
 use std::io::Read;
 
@@ -25,18 +25,18 @@ fn is_key(body: &str) -> bool {
 pub(crate) fn register(p: &mut Setup) {
     p.handle(|_: Cx, op: Parse| async move { parse(&op.body) })
         .claim(|_, op| is_key(&op.body).then_some(Claim::content(80)));
-    p.hook(&LINK, |_, raw| {
-        is_key(raw).then(|| parse(raw).map(drop).map_err(|e| e.message))
-    });
+    p.hook(&LINK, |_, raw| is_key(raw).then(|| parse(raw).map(drop)));
 }
 
-/// Every connection of every key (one key per line).
+/// Every connection of every key (one key per line); a key that cannot be
+/// read is skipped (see [`super::usable`]).
 pub fn parse(body: &str) -> Result<Vec<Proxy>> {
-    let mut out = Vec::new();
-    for key in body.split_whitespace() {
-        out.extend(connections(&decode(key)?)?);
-    }
-    Ok(out)
+    super::usable((body.split_whitespace().enumerate()).map(|(i, key)| {
+        (
+            format!("Key {}", i + 1),
+            decode(key).and_then(|p| connections(&p)),
+        )
+    }))
 }
 
 /// The JSON profile inside a key.
@@ -100,14 +100,14 @@ fn connections(profile: &Value) -> Result<Vec<Proxy>> {
                         .map_err(|_| invalid("Invalid Xray profile in the Amnezia key."))?,
                     None => last,
                 };
-                xray::profiles(&doc)?
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, mut v)| {
+                let mut proxies = Vec::new();
+                for (_, servers) in xray::profiles(&doc)? {
+                    for (i, mut v) in servers?.into_iter().enumerate() {
                         v["name"] = name.into();
-                        Proxy::from_value(v, i + 1)
-                    })
-                    .collect::<Result<_>>()?
+                        proxies.push(Proxy::from_value(v, i + 1)?);
+                    }
+                }
+                proxies
             };
             found.push((kind, proxies));
         }

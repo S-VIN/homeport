@@ -1,6 +1,6 @@
 //! Kernel mechanics with small test plugins: state, list ops, op chains,
 //! claims, cascades, ownership, events and queued jobs.
-use rproxy_kernel::{Host, prelude::*};
+use homeport_kernel::{Host, prelude::*};
 use std::sync::{
     Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -53,6 +53,11 @@ static A: Plugin = Plugin {
     name: "A",
     category: categories::SERVERS,
     required: true,
+    migrations: &[(
+        "001-tables.sql",
+        "CREATE TABLE test_parents (id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL) STRICT;
+         CREATE TABLE test_parents_archive (id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL) STRICT;",
+    )],
     setup: |p| {
         p.list(&PARENTS).validate(|_, item, _, others| {
             item.name = item.name.trim().to_owned();
@@ -84,7 +89,11 @@ static B: Plugin = Plugin {
     id: "b",
     name: "B",
     category: categories::SERVERS,
-    requires: &["a"],
+    requires: &[&A],
+    migrations: &[(
+        "001-children.sql",
+        "CREATE TABLE test_children (id TEXT NOT NULL PRIMARY KEY, parent TEXT NOT NULL) STRICT;",
+    )],
     setup: |p| {
         p.collection(&CHILDREN);
         p.cascade(&PARENTS, &CHILDREN, |c| c.parent);
@@ -119,7 +128,7 @@ static B: Plugin = Plugin {
 #[tokio::test(flavor = "multi_thread")]
 async fn kernel_mechanics() {
     let dir = tempfile::tempdir().unwrap();
-    let host = Host::start(vec![&A, &B], dir.path()).await.unwrap();
+    let host = Host::start_enabled(vec![&A, &B], dir.path()).await.unwrap();
     let k = host.kernel();
     let a = k.cx_for("a");
 
@@ -221,5 +230,35 @@ async fn kernel_mechanics() {
     assert_eq!(names, ["two"]);
     assert_eq!(k.snapshot().get(&ARCHIVE)[0].name, "old");
     assert_eq!(k.snapshot().get(&CHILDREN).len(), 1);
+    host.shutdown().await;
+}
+
+/// A failed SQLite commit leaves the state as it was: the write fails as a
+/// whole, nothing half-saved shows up.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_commit_keeps_the_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = Host::start_enabled(vec![&A, &B], dir.path()).await.unwrap();
+    let a = host.kernel().cx_for("a");
+    let db = homeport_kernel::store::rusqlite::Connection::open(
+        dir.path().join("homeport-plugins.sqlite3"),
+    )
+    .unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER refuse BEFORE INSERT ON test_parents_archive
+         BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+    )
+    .unwrap();
+    let item = Parent {
+        id: Id::random(),
+        name: "kept".into(),
+    };
+    let error = a.call(Add::new(&ARCHIVE, item.clone())).await.unwrap_err();
+    assert!(error.message.contains("disk full"), "{}", error.message);
+    assert!(host.kernel().snapshot().get(&ARCHIVE).is_empty());
+
+    db.execute_batch("DROP TRIGGER refuse").unwrap();
+    a.call(Add::new(&ARCHIVE, item)).await.unwrap();
+    assert_eq!(host.kernel().snapshot().get(&ARCHIVE).len(), 1);
     host.shutdown().await;
 }

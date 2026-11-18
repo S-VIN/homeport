@@ -1,4 +1,4 @@
-//! Close-on-exit job: Windows terminates the bundled core even if rproxy crashes.
+//! Close-on-exit job: Windows terminates the bundled core even if homeport crashes.
 use std::{ffi::c_void, io};
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE},

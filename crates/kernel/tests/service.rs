@@ -1,7 +1,7 @@
 //! `p.service`: a run follows its spec, and the old run is fully stopped (its
 //! guards dropped, `on_stop` finished) before the next one starts and before
 //! shutdown returns.
-use rproxy_kernel::{Host, prelude::*};
+use homeport_kernel::{Host, prelude::*};
 use std::{sync::Mutex, time::Duration};
 
 static PORT: State<u16> = State::new("svc.port");
@@ -55,7 +55,7 @@ async fn until(what: &str, ok: impl Fn(&[String]) -> bool) {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_service_restarts_only_after_the_old_run_stopped() {
     let dir = tempfile::tempdir().unwrap();
-    let host = Host::start(vec![&SVC], dir.path()).await.unwrap();
+    let host = Host::start_enabled(vec![&SVC], dir.path()).await.unwrap();
     let cx = host.kernel().cx_for("svc");
     cx.call(Set {
         state: &PORT,

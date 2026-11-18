@@ -1,7 +1,7 @@
 use super::*;
 
 /// Page header: title and a muted counter on the left, actions on the right.
-/// The counter hides when the actions need its room.
+/// A counter without room next to the title goes on the line below.
 pub fn page_header(ui: &mut Ui, title: &str, counter: &str, actions: impl FnOnce(&mut Ui)) {
     let p = theme::palette(ui);
     let mut below = false;
@@ -17,31 +17,26 @@ pub fn page_header(ui: &mut Ui, title: &str, counter: &str, actions: impl FnOnce
             let title =
                 ui.add(egui::Label::new(bold(title, theme::TITLE).color(p.foreground)).truncate());
             let room = width - title.rect.width() - actions_width - 3. * theme::HORIZONTAL_GAP;
-            // Long counter, then its first part ("83 servers"); otherwise the
-            // counter goes on a line of its own below.
-            let first = counter.split(" · ").next().unwrap_or(counter);
-            let fits = |text: &str| {
-                ui.painter()
-                    .layout_no_wrap(text.to_owned(), FontId::proportional(theme::SMALL), p.muted)
+            // A counter that does not fit goes whole on a line of its own below.
+            below = !counter.is_empty()
+                && ui
+                    .painter()
+                    .layout_no_wrap(
+                        counter.to_owned(),
+                        FontId::proportional(theme::SMALL),
+                        p.muted,
+                    )
                     .size()
                     .x
-                    <= room
-            };
-            below = !counter.is_empty() && !fits(first);
-            if let Some(text) = [counter, first]
-                .into_iter()
-                .find(|t| !t.is_empty() && fits(t))
-            {
+                    > room;
+            if !counter.is_empty() && !below {
                 ui.add_space(2.);
-                let r = ui.label(RichText::new(text).size(theme::SMALL).color(p.muted));
-                if text != counter {
-                    r.on_hover_text(counter);
-                }
+                ui.label(RichText::new(counter).size(theme::SMALL).color(p.muted));
             }
             // Not `min_rect`: the row's minimum size already spans the width.
+            // The cursor already stands a gap past the last widget.
             let left = ui.cursor().left();
-            let free =
-                (ui.max_rect().right() - left - actions_width - theme::HORIZONTAL_GAP).max(0.);
+            let free = (ui.max_rect().right() - left - actions_width).max(0.);
             ui.add_space(free);
             let w = ui
                 .horizontal(|ui| {
@@ -58,9 +53,7 @@ pub fn page_header(ui: &mut Ui, title: &str, counter: &str, actions: impl FnOnce
         },
     );
     if below {
-        let first = counter.split(" · ").next().unwrap_or(counter);
-        ui.add(egui::Label::new(RichText::new(first).size(theme::SMALL).color(p.muted)).truncate())
-            .on_hover_text(counter);
+        ui.add(egui::Label::new(RichText::new(counter).size(theme::SMALL).color(p.muted)).wrap());
     }
     ui.add_space(theme::SPACE_S);
 }
@@ -75,10 +68,16 @@ pub fn add_bar(
     enabled: bool,
     fields: impl FnOnce(&mut Ui, f32) -> bool,
 ) -> bool {
+    // A phone stacks the fields: a full-width button goes under them.
+    let phone = phone(ui);
     let mut add = false;
-    ui.horizontal(|ui| {
-        let button = 64.;
-        let width = ui.available_width() - button - theme::HORIZONTAL_GAP;
+    let bar = |ui: &mut Ui| {
+        let button = if phone { ui.available_width() } else { 64. };
+        let width = if phone {
+            ui.available_width()
+        } else {
+            ui.available_width() - button - theme::HORIZONTAL_GAP
+        };
         // The field being typed in: Enter gives up focus, the next entry wants it.
         let typing = ui.scope_id().with("add-bar-focus");
         let enter = fields(ui, width);
@@ -95,7 +94,15 @@ pub fn add_bar(
         if enter && let Some(f) = ui.data(|d| d.get_temp::<egui::Id>(typing)) {
             ui.memory_mut(|m| m.request_focus(f));
         }
-    });
+    };
+    if phone {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = theme::SPACE_S;
+            bar(ui)
+        });
+    } else {
+        ui.horizontal(bar);
+    }
     ui.add_space(theme::SPACE_M);
     add
 }
@@ -153,23 +160,29 @@ pub fn settings_card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
 }
 /// Vertical scroll for a page body; keeps card borders off the clip edge.
 pub fn page_scroll<R>(ui: &mut Ui, id: impl egui::AsIdSalt, add: impl FnOnce(&mut Ui) -> R) -> R {
-    egui::ScrollArea::vertical()
-        .id_salt(id)
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            egui::Frame::NONE
-                // The bar floats over the edge: pages with and without a
-                // scroll end at the same right edge.
-                .inner_margin(egui::Margin {
-                    left: 0,
-                    right: 1,
-                    top: 0,
-                    bottom: 1,
-                })
-                .show(ui, add)
-                .inner
-        })
-        .inner
+    // The bar runs in the page's right margin: content keeps the same right
+    // edge with and without a scroll, and the bar never covers a card's border.
+    let gutter = theme::SPACE_M;
+    let mut rect = ui.available_rect_before_wrap();
+    rect.max.x += gutter;
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+        egui::ScrollArea::vertical()
+            .id_salt(id)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin {
+                        left: 0,
+                        right: gutter as i8,
+                        top: 0,
+                        bottom: 1,
+                    })
+                    .show(ui, add)
+                    .inner
+            })
+            .inner
+    })
+    .inner
 }
 /// Card for a list: rows from [`row`] fill it edge to edge.
 pub fn list_card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
@@ -374,16 +387,15 @@ pub fn cell_right<R>(ui: &mut Ui, width: f32, add: impl FnOnce(&mut Ui) -> R) ->
 /// Move up / move down buttons. `Some(true)` = up.
 pub fn order(ui: &mut Ui, index: usize, len: usize, emphasis: Emphasis) -> Option<bool> {
     ui.spacing_mut().item_spacing.x = 0.;
-    let up = icon_button_ex(ui, Icon::Up, "Move up", index > 0, emphasis, false).clicked();
-    let down = icon_button_ex(
-        ui,
-        Icon::Down,
-        "Move down",
-        index + 1 < len,
-        emphasis,
-        false,
-    )
-    .clicked();
+    let button = |icon, label, enabled| {
+        IconButton::new(icon, label)
+            .enabled(enabled)
+            .emphasis(emphasis)
+    };
+    let up = button(Icon::Up, "Move up", index > 0).show(ui).clicked();
+    let down = button(Icon::Down, "Move down", index + 1 < len)
+        .show(ui)
+        .clicked();
     ui.spacing_mut().item_spacing.x = theme::HORIZONTAL_GAP;
     if up {
         Some(true)
@@ -397,31 +409,19 @@ pub fn order(ui: &mut Ui, index: usize, len: usize, emphasis: Emphasis) -> Optio
 /// Delete button of a row: one click deletes, the caller offers Undo in a
 /// toast ([`crate`] users: `UiCx::undo`). It turns red only under the pointer.
 pub fn remove(ui: &mut Ui, emphasis: Emphasis) -> bool {
-    icon_button_ex(ui, Icon::Delete, "Delete", true, emphasis, true).clicked()
+    IconButton::new(Icon::Delete, "Delete")
+        .emphasis(emphasis)
+        .danger()
+        .show(ui)
+        .clicked()
 }
 
 /// Save (✓) and Cancel (✕) of an inline edit, side by side. Returns
 /// `Some(true)` on save, `Some(false)` on cancel.
 pub fn edit_actions(ui: &mut Ui, can_save: bool) -> Option<bool> {
     ui.spacing_mut().item_spacing.x = 0.;
-    let save = icon_button_ex(
-        ui,
-        Icon::Check,
-        "Save · Enter",
-        can_save,
-        Emphasis::Normal,
-        false,
-    )
-    .clicked();
-    let cancel = icon_button_ex(
-        ui,
-        Icon::Close,
-        "Cancel · Esc",
-        true,
-        Emphasis::Normal,
-        false,
-    )
-    .clicked();
+    let save = icon_button(ui, Icon::Check, "Save · Enter", can_save).clicked();
+    let cancel = icon_button(ui, Icon::Close, "Cancel · Esc", true).clicked();
     ui.spacing_mut().item_spacing.x = theme::HORIZONTAL_GAP;
     if save {
         Some(true)
@@ -434,7 +434,7 @@ pub fn edit_actions(ui: &mut Ui, can_save: bool) -> Option<bool> {
 
 /// A truncated one-line label with exactly one tooltip: `tooltip` when given,
 /// otherwise the full text when it is cut off.
-/// `text` shortened in the middle to fit the row ("/home/…/rproxy"): for
+/// `text` shortened in the middle to fit the row ("/home/…/homeport"): for
 /// paths and addresses whose ends matter. The full text is the tooltip.
 pub fn middle(ui: &mut Ui, text: &str, color: Color32) -> Response {
     let font = FontId::proportional(theme::BODY);

@@ -1,4 +1,4 @@
-//! Internal mode of the same rproxy executable. It owns the core through a
+//! Internal mode of the same homeport executable. It owns the core through a
 //! lifetime lease held by the application: when the lease closes — also after
 //! a crash — the core is stopped and reaped.
 //!

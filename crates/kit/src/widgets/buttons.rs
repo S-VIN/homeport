@@ -164,26 +164,15 @@ impl<'a> Button<'a> {
                 self.tone.map_or(p.foreground, |t| p.tone(t)),
             ),
         };
-        let (fill, ink) = if self.enabled {
-            (fill, ink)
-        } else {
-            (
-                if self.kind == Kind::Ghost {
-                    fill
-                } else {
-                    p.subtle
-                },
-                p.faint,
-            )
+        // Disabled keeps the style's shape, dimmed: a primary stays the main action.
+        let (fill, stroke, ink) = match self.kind {
+            _ if self.enabled => (fill, stroke, ink),
+            Kind::Ghost => (fill, Stroke::NONE, p.faint),
+            Kind::Secondary => (p.surface, Stroke::new(1_f32, p.control_border), p.faint),
+            Kind::Primary | Kind::Danger => (fill.gamma_multiply(theme::DIMMED), Stroke::NONE, ink),
         };
         let painter = ui.painter();
-        painter.rect(
-            rect,
-            RADIUS_CONTROL,
-            fill,
-            if self.enabled { stroke } else { Stroke::NONE },
-            egui::StrokeKind::Inside,
-        );
+        painter.rect(rect, RADIUS_CONTROL, fill, stroke, egui::StrokeKind::Inside);
         let mut x = rect.center().x - content / 2.;
         if let Some(icon) = self.icon {
             crate::icons::paint_sized(painter, pos2(x + 8., rect.center().y), icon, 16., ink);
@@ -378,11 +367,16 @@ pub fn segmented<T: Copy + PartialEq>(ui: &mut Ui, value: &mut T, options: &[(T,
                         Sense::click(),
                     );
                     if active {
+                        // Raised: lighter than the track (a dark surface would sink in).
+                        let (fill, stroke) = match p.dark {
+                            true => (p.control_border, Stroke::NONE),
+                            false => (p.surface, Stroke::new(1_f32, p.border)),
+                        };
                         ui.painter().rect(
                             rect,
                             RADIUS_CONTROL - 1,
-                            p.surface,
-                            Stroke::new(1_f32, p.border),
+                            fill,
+                            stroke,
                             egui::StrokeKind::Inside,
                         );
                     } else if r.hovered() {
@@ -406,12 +400,11 @@ pub fn segmented<T: Copy + PartialEq>(ui: &mut Ui, value: &mut T, options: &[(T,
 
 /// The button of a toolbar tool: icon, label and a count badge; pressed while
 /// its panel is open. Phones show the icon only (the label becomes the tooltip).
-pub fn tool_button(ui: &mut Ui, icon: Icon, label: &str, count: usize, open: bool) -> Response {
+pub fn tool_button(ui: &mut Ui, icon: Icon, label: &str, count: usize) -> Response {
     let text = if phone(ui) { "" } else { label };
     let r = Button::secondary(text)
         .icon(icon)
         .count((count > 0).then_some(count))
-        .selected(open)
         .show(ui);
     r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
     if text.is_empty() {

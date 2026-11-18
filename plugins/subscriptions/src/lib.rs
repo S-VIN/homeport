@@ -11,12 +11,12 @@
 //! * a plugin with its own download algorithm wraps [`Fetch`] or claims [`RefreshSource`]
 //!   for the sources it owns;
 //! * [`LINK`] accepts direct links (`vless://…`) when a source is added.
-use plugin_servers::{self as servers, Proxy, ReplaceFromSource};
-use rproxy_kernel::{
-    kit::{self, Tone},
+use homeport_kernel::{
+    kit::{self, Tone, theme},
     prelude::*,
     ui::{Column, ListEditor},
 };
+use plugin_servers::{self as servers, Proxy, ReplaceFromSource};
 use std::io::Read;
 
 pub mod formats;
@@ -26,8 +26,9 @@ pub static PLUGIN: Plugin = Plugin {
     name: "Subscriptions",
     description: "Load servers from subscription URLs and links, refreshed on a schedule.",
     category: categories::SERVERS,
-    requires: &["servers"],
+    requires: &[&plugin_servers::PLUGIN],
     required: true,
+    migrations: homeport_kernel::migrations!(),
     setup,
     ..Plugin::DEFAULT
 };
@@ -131,7 +132,7 @@ pub struct RefreshAll;
 impl Op for RefreshAll {
     type Reply = ();
     fn job(&self) -> Option<JobSpec> {
-        Some(JobSpec::new("Refresh subscriptions").page("subscriptions"))
+        Some(JobSpec::new("Refresh subscriptions").page(&PLUGIN))
     }
 }
 /// Load one source and replace its servers.
@@ -142,8 +143,8 @@ impl Op for RefreshSource {
     type Reply = ();
     fn job(&self) -> Option<JobSpec> {
         Some(
-            JobSpec::keyed(self.id.to_string(), "Load subscription")
-                .page("subscriptions")
+            JobSpec::keyed(self.id.to_string(), "Load servers")
+                .page(&PLUGIN)
                 .latest(),
         )
     }
@@ -217,8 +218,7 @@ impl Op for Parse {
 }
 
 /// Accept a direct link as a source: `Some(Ok)` = valid, `Some(Err)` = known but invalid.
-pub static LINK: Hook<str, Option<std::result::Result<(), String>>> =
-    Hook::new("subscriptions.link");
+pub static LINK: Hook<str, Option<Result<()>>> = Hook::new("subscriptions.link");
 /// Blocks below the subscription list.
 pub static SECTIONS: Slot<()> = Slot::new(
     "subscriptions.sections",
@@ -235,7 +235,7 @@ fn validate(snap: &Snapshot, s: &mut Source, others: &[Source]) -> Result<()> {
     const HINT: &str = "Enter an HTTP(S) subscription URL or a supported link.";
     match snap.first(&LINK, raw) {
         Some(Ok(())) => s.url = raw.to_owned(),
-        Some(Err(e)) => bail!("{e}"),
+        Some(Err(e)) => return Err(e),
         // A pasted config is not a URL: formats answer for it above.
         None => {
             let url = url::Url::parse(raw).map_err(|_| Error::msg(HINT))?;
@@ -276,11 +276,15 @@ pub async fn http_get(client: &reqwest::Client, url: &str, device_id: &str) -> R
         .get(url)
         .header("x-hwid", device_id)
         .header("x-device-os", std::env::consts::OS)
-        .header("x-device-model", "rproxy")
+        .header("x-device-model", "homeport")
         // Providers pick the document format by client; this one gets plain share links.
         .header(
             reqwest::header::USER_AGENT,
-            concat!("rproxy/", env!("CARGO_PKG_VERSION"), " (v2rayN compatible)"),
+            concat!(
+                "homeport/",
+                env!("CARGO_PKG_VERSION"),
+                " (v2rayN compatible)"
+            ),
         )
         .timeout(std::time::Duration::from_secs(30))
         .send()
@@ -307,7 +311,7 @@ pub async fn http_get(client: &reqwest::Client, url: &str, device_id: &str) -> R
     {
         return Err(Error::new(
             "device-id",
-            "The provider did not accept this installation's device ID. Contact your subscription provider to allow rproxy.",
+            "The provider did not accept this installation's device ID. Contact your subscription provider to allow homeport.",
         ));
     }
     if !res.status().is_success() {
@@ -453,6 +457,33 @@ async fn refresh_all(cx: Cx, _: RefreshAll) -> Result<()> {
     )
 }
 
+/// One log line when a refresh changed something: the servers, or whether it fails.
+fn report(cx: &Cx, id: Id, result: &Result<(Info, servers::Replaced)>) {
+    let sources = cx.get(&SOURCES);
+    let (Some(name), Some(source)) = (label(&sources, id), sources.iter().find(|s| s.id == id))
+    else {
+        return;
+    };
+    match result {
+        Err(e) if source.error.as_ref() != Some(&e.message) => {
+            warn!("{name} could not refresh: {e}")
+        }
+        Ok((_, r)) if !r.added.is_empty() || !r.removed.is_empty() || source.error.is_some() => {
+            let change = match (r.added.len(), r.removed.len()) {
+                (0, 0) => String::new(),
+                (added, 0) => format!(" ({added} new)"),
+                (0, removed) => format!(" ({removed} removed)"),
+                (added, removed) => format!(" ({added} new, {removed} removed)"),
+            };
+            info!(
+                "{name}: {}{change}",
+                kit::plural(r.total, "server", "servers")
+            );
+        }
+        _ => {}
+    }
+}
+
 async fn refresh_source(cx: Cx, op: RefreshSource) -> Result<()> {
     // What this load depends on: the source's link. An edit or a removal
     // meanwhile makes the result stale, and it is dropped instead of saved.
@@ -480,18 +511,19 @@ async fn refresh_source(cx: Cx, op: RefreshSource) -> Result<()> {
             .await?
         };
         cx.checkpoint()?;
-        let still = input.clone();
         let replace = ReplaceFromSource {
             source: op.id,
             proxies,
-            still_current: Some(Box::new(move |w| still.current(w))),
+            guard: Some(input.guard()),
         };
-        cx.call(replace).await.map(|_| info)
+        cx.call(replace).await.map(|replaced| (info, replaced))
     }
     .await;
     if result.as_ref().is_err_and(|e| e.cancelled()) {
         return result.map(drop);
     }
+    report(&cx, op.id, &result);
+    let result = result.map(|(info, _)| info);
     let outcome = result.as_ref().cloned().map_err(|e| e.message.clone());
     cx.write(move |w| {
         input.check(w)?;
@@ -552,34 +584,52 @@ fn setup(p: &mut Setup) -> Result<()> {
     });
     p.every(
         "refresh",
+        // Nothing to refresh without subscriptions.
         |s| {
-            Some(std::time::Duration::from_secs(
-                s.get(&SETTINGS).refresh_secs.into(),
-            ))
+            (!s.get(&SOURCES).is_empty())
+                .then(|| std::time::Duration::from_secs(s.get(&SETTINGS).refresh_secs.into()))
         },
         || RefreshAll,
     );
-    p.hook(&servers::SOURCE_LABEL, |snap, id| {
-        label(&snap.get(&SOURCES), *id)
-    });
-    p.hook(&servers::SOURCE_RANK, |snap, id| {
-        snap.get(&SOURCES).iter().position(|s| s.id == *id)
-    });
-    p.hook(&servers::SOURCE_HUE, |snap, id| {
+    p.hook(&servers::SOURCE, |snap, id| {
         let sources = snap.get(&SOURCES);
-        let s = sources.iter().find(|s| s.id == *id)?;
-        Some(s.hue.map_or_else(|| servers::hue_of(s.id), usize::from))
+        let rank = sources.iter().position(|s| s.id == *id)?;
+        let s = &sources[rank];
+        Some(servers::SourceInfo {
+            kind: "Subscription",
+            label: label(&sources, s.id)?,
+            hue: s.hue.map_or_else(|| servers::hue_of(s.id), usize::from),
+            rank,
+        })
     });
 
     p.page_fn(
         PageSpec {
-            id: "subscriptions",
             title: "Subscriptions",
             icon: Icon::Subscriptions,
             order: 20,
         },
         page,
     );
+    p.fill(&servers::EMPTY, "add", 0, |ui, cx, _| {
+        let sources = cx.get(&SOURCES);
+        if let Some(e) = sources.iter().find_map(|s| s.error.as_deref()) {
+            let short = e.lines().next().unwrap_or(e).trim_end_matches('.');
+            kit::tone_text(ui, format!("Subscription failed: {short}"), Tone::Warning);
+            ui.add_space(theme::SPACE_M);
+        } else if sources.is_empty() {
+            kit::hint(ui, "Add a subscription to get servers.");
+            ui.add_space(theme::SPACE_M);
+        }
+        let open = if sources.is_empty() {
+            kit::Button::primary("Add subscription").icon(Icon::Add)
+        } else {
+            kit::Button::secondary("Open Subscriptions")
+        };
+        if open.show(ui).clicked() {
+            cx.navigate(&PLUGIN);
+        }
+    });
     p.fill(&SETTINGS_SECTIONS, "refresh", 0, |ui, cx, _| {
         cx.setting(
             ui,
@@ -673,7 +723,7 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
             kit::plural(servers.len(), "server", "servers")
         )
     };
-    kit::page_header(ui, "Subscriptions", &counter, |ui| {
+    cx.page_header(ui, &counter, |ui, cx| {
         cx.job_button(
             ui,
             Icon::Refresh,
@@ -695,13 +745,13 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
                     &mut s.url,
                     "Subscription URL or server link",
                     width,
-                    false,
                 );
                 kit::submitted(ui, &r) && !s.url.trim().is_empty()
             },
         )
-        .leading(8., |ui, cx, s: &Source| {
-            kit::tag_dot(ui, servers::source_hue(cx.snapshot(), s.id));
+        .leading("", 8., |ui, cx, s: &Source| {
+            kit::tag_dot(ui, servers::source(cx.snapshot(), s.id).hue)
+                .on_hover_text("Tag color of its servers");
         })
         .column(
             Column::edit("Subscription", "Subscription URL", |s: &mut Source| {

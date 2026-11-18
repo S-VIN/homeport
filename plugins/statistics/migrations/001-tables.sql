@@ -1,0 +1,2 @@
+CREATE TABLE statistics_days (id TEXT NOT NULL PRIMARY KEY, day TEXT NOT NULL, up INT NOT NULL, down INT NOT NULL) STRICT;
+CREATE TABLE statistics_servers (id TEXT NOT NULL PRIMARY KEY, server TEXT NOT NULL, month TEXT NOT NULL, month_up INT NOT NULL, month_down INT NOT NULL, total_up INT NOT NULL, total_down INT NOT NULL) STRICT;

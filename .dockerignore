@@ -1,4 +1,4 @@
-# Only what `cargo build --bin rproxy` and scripts/build.py, scripts/mihomo.py need.
+# Only what `cargo build --bin homeport`, scripts/build.py, mihomo.py and presets/server.sql need.
 .git
 .agents
 .claude

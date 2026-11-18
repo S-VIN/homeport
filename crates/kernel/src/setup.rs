@@ -66,7 +66,7 @@ impl Policy {
     }
 }
 
-/// Returned by [`Setup::on`] and [`Setup::on_change`] to choose how repeated
+/// Returned by [`Setup::on`] and [`Setup::watch`] to choose how repeated
 /// events are handled.
 pub struct ObserverSpec<'a> {
     observer: &'a mut Observer,
@@ -131,6 +131,8 @@ impl<S: Clone + Send + Sync + 'static> ServiceSetup<'_, S> {
 }
 pub(crate) struct PageEntry {
     pub plugin: usize,
+    /// The plugin id.
+    pub id: &'static str,
     pub spec: PageSpec,
     pub make: Arc<dyn Fn() -> Box<dyn Page> + Send + Sync>,
 }
@@ -151,6 +153,8 @@ pub(crate) struct Registry {
     /// The plugin answering each exclusive hook.
     pub deciders: HashMap<&'static str, Option<usize>>,
     pub slots: HashMap<&'static str, Box<dyn Any + Send + Sync>>,
+    /// Columns added to lists, by list id ([`crate::columns`]).
+    pub columns: HashMap<&'static str, Box<dyn Any + Send + Sync>>,
     pub slot_edits: Vec<SlotEdit>,
     /// `(slot id, plugin)` of every contribution: where a plugin shows its UI.
     pub fills: Vec<(&'static str, usize)>,
@@ -161,12 +165,6 @@ pub(crate) struct Registry {
     pub schedules: Vec<Schedule>,
     pub services: Vec<Service>,
     pub cascades: Vec<Cascade>,
-    /// `(plugin, version, step)`; each runs once, in version order.
-    pub migrations: Vec<(
-        usize,
-        u32,
-        Box<dyn Fn(&crate::store::rusqlite::Connection) -> Result<()> + Send + Sync>,
-    )>,
     /// `(title, text)` of problems met while starting (shown once the app runs).
     pub warnings: Vec<(&'static str, String)>,
     pub seq: usize,
@@ -254,7 +252,20 @@ impl Registry {
         for edit in std::mem::take(&mut self.slot_edits) {
             edit(self);
         }
-        self.pages.sort_by_key(|p| p.spec.order);
+        for (i, page) in self.pages.iter().enumerate() {
+            assert!(
+                self.pages[..i].iter().all(|p| p.id != page.id),
+                "{} registers two pages: a plugin has at most one",
+                page.id
+            );
+        }
+        // Grouped like Settings → Plugins (categories in plugin order), then by `order`.
+        let plugins = &self.plugins;
+        let group = |p: &PageEntry| {
+            let category = plugins[p.plugin].category.id;
+            plugins.iter().position(|pl| pl.category.id == category)
+        };
+        self.pages.sort_by_key(|p| (group(p), p.spec.order));
     }
 }
 
@@ -265,7 +276,7 @@ pub struct Setup<'a> {
 }
 
 impl<'a> Setup<'a> {
-    fn me(&self) -> usize {
+    pub(crate) fn me(&self) -> usize {
         self.plugin.expect("kernel registrations use internal APIs")
     }
     pub fn plugin_id(&self) -> &'static str {
@@ -376,26 +387,6 @@ impl<'a> Setup<'a> {
             Box::new(move || Arc::new(crate::state::Live::new(init())) as Value),
         ));
     }
-    /// A schema step that runs once, before state loads, in its own
-    /// transaction: `p.migrate(1, |sql| …)`, then 2, 3… for later changes.
-    /// Not needed for new nullable columns or `#[column(default = "…")]`.
-    pub fn migrate(
-        &mut self,
-        version: u32,
-        f: impl Fn(&crate::store::rusqlite::Connection) -> Result<()> + Send + Sync + 'static,
-    ) {
-        let me = self.me();
-        assert!(
-            !self
-                .reg
-                .migrations
-                .iter()
-                .any(|(p, v, _)| *p == me && *v == version),
-            "migration {version} of {} is registered twice",
-            self.plugin_id()
-        );
-        self.reg.migrations.push((me, version, Box::new(f)));
-    }
     /// Delete child rows whose parent row disappeared, in the same transaction.
     pub fn cascade<P: Record, C: Record>(
         &mut self,
@@ -491,32 +482,49 @@ impl<'a> Setup<'a> {
             observer: list.last_mut().expect("just pushed"),
         }
     }
-    /// Observe commits that touched any of the given states, e.g. `[RULES.name]`.
-    pub fn on_change<F, Fut>(
+    /// Run `f` with the new key after a commit that changed `key(snapshot)`,
+    /// e.g. `p.watch(|s| s.get(&RULES), reload)`. The key at start is the baseline.
+    pub fn watch<K, F, Fut>(
         &mut self,
-        states: impl IntoIterator<Item = &'static str>,
+        key: impl Fn(&Snapshot) -> K + Send + Sync + 'static,
         f: F,
     ) -> ObserverSpec<'_>
     where
-        F: Fn(Cx) -> Fut + Send + Sync + 'static,
+        K: Clone + PartialEq + Send + Sync + 'static,
+        F: Fn(Cx, K) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
-        let states: Vec<&'static str> = states.into_iter().collect();
         let plugin = self.plugin.unwrap_or(usize::MAX);
+        let last = Arc::new(std::sync::Mutex::new(None::<K>));
+        let key = Arc::new(key);
+        let (k, l) = (key.clone(), last.clone());
+        self.reg
+            .observers
+            .entry(TypeId::of::<crate::Started>())
+            .or_default()
+            .push(Observer {
+                plugin,
+                f: Arc::new(move |cx, _| {
+                    l.lock().unwrap().get_or_insert_with(|| k(&cx.snapshot()));
+                    None
+                }),
+                policy: Policy::Parallel,
+            });
+        let f = Arc::new(f);
         let list = self
             .reg
             .observers
             .entry(TypeId::of::<crate::Changed>())
             .or_default();
-        // Commits that touch none of `states` start nothing (and cancel nothing).
         list.push(Observer {
             plugin,
-            f: Arc::new(move |cx, e| {
-                let e = e.downcast_ref::<crate::Changed>()?;
-                e.states
-                    .iter()
-                    .any(|s| states.contains(s))
-                    .then(|| Box::pin(f(cx)) as BoxFut<()>)
+            f: Arc::new(move |cx, _| {
+                let now = key(&cx.snapshot());
+                let mut last = last.lock().unwrap();
+                // Unknown baseline (a commit before `Started`): take it, run nothing.
+                let changed = last.as_ref().is_some_and(|l| *l != now);
+                *last = Some(now.clone());
+                changed.then(|| Box::pin(f(cx, now)) as BoxFut<()>)
             }),
             policy: Policy::Parallel,
         });
@@ -546,14 +554,21 @@ impl<'a> Setup<'a> {
             self.reg.warnings.push(("Plugins", warning));
             return;
         }
-        self.reg
+        let fns = self
+            .reg
             .hooks
             .entry(hook.id)
-            .or_insert_with(|| Box::new(HookFns::<I, O>(Vec::new())))
-            .downcast_mut::<HookFns<I, O>>()
-            .expect("hook types")
-            .0
-            .push(Arc::new(f));
+            .or_insert_with(|| Box::new(HookFns::<I, O>(Vec::new())));
+        let Some(fns) = fns.downcast_mut::<HookFns<I, O>>() else {
+            let warning = format!(
+                "{} answers `{}` with other types than its owner; the answer is ignored.",
+                self.plugin.map_or("Kernel", |p| self.reg.plugins[p].name),
+                hook.id,
+            );
+            self.reg.warnings.push(("Plugins", warning));
+            return;
+        };
+        fns.0.push(Arc::new(f));
     }
     /// Contribute a typed fragment of the mihomo configuration, recomputed after every commit.
     pub fn core(&mut self, f: impl Fn(&Snapshot) -> Fragment + Send + Sync + 'static) {
@@ -633,6 +648,16 @@ impl<'a> Setup<'a> {
         }
     }
 
+    /// Run a long-lived task (a follower, a poller) for the plugin's whole
+    /// life: a [`Self::service`] whose spec never changes.
+    pub fn task<F, Fut>(&mut self, name: &str, run: F) -> ServiceSetup<'_, ()>
+    where
+        F: Fn(Cx) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.service(name, |_| Some(()), move |cx, ()| run(cx))
+    }
+
     // ---- UI ---------------------------------------------------------------
     /// Add a contribution to a zone. `order` sorts contributions (lower first).
     pub fn fill<P: 'static>(
@@ -694,25 +719,27 @@ impl<'a> Setup<'a> {
             reg.contributions_mut(slot).retain(|c| c.id != contribution);
         }));
     }
-    /// A page in the bottom navigation with its own per-session state.
+    /// The plugin's page, with its own per-session state.
     pub fn page<T: Page + Default + 'static>(&mut self, spec: PageSpec) {
-        let plugin = self.me();
+        let (plugin, id) = (self.me(), self.plugin_id());
         self.reg.pages.push(PageEntry {
             plugin,
+            id,
             spec,
             make: Arc::new(|| Box::new(T::default())),
         });
     }
-    /// A stateless page.
+    /// The plugin's page, stateless.
     pub fn page_fn(
         &mut self,
         spec: PageSpec,
         f: impl Fn(&mut egui::Ui, &mut UiCx) + Send + Sync + 'static,
     ) {
-        let plugin = self.me();
+        let (plugin, id) = (self.me(), self.plugin_id());
         let f = Arc::new(f);
         self.reg.pages.push(PageEntry {
             plugin,
+            id,
             spec,
             make: Arc::new(move || {
                 let f = f.clone();

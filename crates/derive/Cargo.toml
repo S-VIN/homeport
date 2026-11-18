@@ -1,9 +1,9 @@
 [package]
-name = "rproxy-derive"
+name = "homeport-derive"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Derive relational table mappings for rproxy"
+description = "Derive relational table mappings for homeport"
 
 [lib]
 proc-macro = true

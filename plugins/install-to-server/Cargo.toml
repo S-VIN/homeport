@@ -5,8 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-rproxy-kernel = { path = "../../crates/kernel" }
-plugin-routing = { path = "../routing" }
+homeport-kernel = { path = "../../crates/kernel" }
 serde = { workspace = true }
 tokio = { workspace = true }
 russh = { version = "0.65.1", default-features = false, features = ["ring", "rsa"] }

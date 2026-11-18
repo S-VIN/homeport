@@ -1555,6 +1555,7 @@ dependencies = [
  "raw-window-handle",
  "smithay-clipboard",
  "web-time",
+ "webbrowser",
  "windows-sys 0.61.2",
  "winit",
 ]
@@ -1571,6 +1572,18 @@ dependencies = [
  "log",
  "profiling",
  "winit",
+]
+
+[[package]]
+name = "egui_plot"
+version = "0.38.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c34f8fe086d7e69ce558dcc85f7c7be593092525d01cb30caa560044bc2bbaa"
+dependencies = [
+ "ahash",
+ "egui",
+ "emath",
+ "nohash-hasher",
 ]
 
 [[package]]
@@ -2351,6 +2364,127 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
 dependencies = [
  "digest 0.11.3",
+]
+
+[[package]]
+name = "homeport"
+version = "0.2.0"
+dependencies = [
+ "axum",
+ "base64 0.23.1",
+ "eframe",
+ "egui",
+ "futures-util",
+ "homeport-kernel",
+ "homeport-remote",
+ "image",
+ "ksni",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "plugin-autostart",
+ "plugin-chain-exit",
+ "plugin-connections",
+ "plugin-dns",
+ "plugin-health-checks",
+ "plugin-install-to-server",
+ "plugin-local-proxy",
+ "plugin-logs",
+ "plugin-name-filters",
+ "plugin-routing",
+ "plugin-servers",
+ "plugin-statistics",
+ "plugin-subscriptions",
+ "plugin-vless-inbound",
+ "reqwest",
+ "rfd",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tray-icon",
+ "url",
+ "uuid",
+ "windows-sys 0.61.2",
+ "winit",
+ "zbus",
+]
+
+[[package]]
+name = "homeport-derive"
+version = "0.1.0"
+dependencies = [
+ "quote",
+ "syn 3.0.10",
+]
+
+[[package]]
+name = "homeport-kernel"
+version = "0.2.0"
+dependencies = [
+ "egui",
+ "flate2",
+ "futures-util",
+ "getrandom 0.4.3",
+ "homeport-derive",
+ "homeport-kit",
+ "homeport-mihomo",
+ "log",
+ "reqwest",
+ "rusqlite",
+ "same-file",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "uuid",
+ "zip",
+]
+
+[[package]]
+name = "homeport-kit"
+version = "0.2.0"
+dependencies = [
+ "egui",
+ "epaint",
+ "qrcode",
+]
+
+[[package]]
+name = "homeport-mihomo"
+version = "0.2.0"
+dependencies = [
+ "ipnet",
+ "libc",
+ "log",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "homeport-remote"
+version = "0.2.0"
+dependencies = [
+ "axum",
+ "eframe",
+ "egui",
+ "homeport-kernel",
+ "js-sys",
+ "miniz_oxide 0.9.1",
+ "postcard",
+ "serde",
+ "tempfile",
+ "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+ "web-sys",
 ]
 
 [[package]]
@@ -3894,7 +4028,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 name = "plugin-autostart"
 version = "0.2.0"
 dependencies = [
- "rproxy-kernel",
+ "homeport-kernel",
  "winreg",
  "zbus",
 ]
@@ -3904,9 +4038,9 @@ name = "plugin-chain-exit"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "homeport-kernel",
  "plugin-servers",
  "reqwest",
- "rproxy-kernel",
  "serde",
  "serde_json",
  "x25519-dalek",
@@ -3916,19 +4050,27 @@ dependencies = [
 name = "plugin-connections"
 version = "0.1.0"
 dependencies = [
+ "homeport-kernel",
  "plugin-servers",
- "rproxy-kernel",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "plugin-dns"
+version = "0.1.0"
+dependencies = [
+ "homeport-kernel",
+ "serde",
+ "url",
 ]
 
 [[package]]
 name = "plugin-health-checks"
 version = "0.2.0"
 dependencies = [
+ "homeport-kernel",
  "plugin-servers",
- "reqwest",
- "rproxy-kernel",
  "serde",
  "tokio",
  "url",
@@ -3938,8 +4080,7 @@ dependencies = [
 name = "plugin-install-to-server"
 version = "0.1.0"
 dependencies = [
- "plugin-routing",
- "rproxy-kernel",
+ "homeport-kernel",
  "russh",
  "serde",
  "tempfile",
@@ -3950,8 +4091,8 @@ dependencies = [
 name = "plugin-local-proxy"
 version = "0.2.0"
 dependencies = [
+ "homeport-kernel",
  "reqwest",
- "rproxy-kernel",
  "serde",
  "serde_json",
  "tempfile",
@@ -3963,8 +4104,8 @@ dependencies = [
 name = "plugin-logs"
 version = "0.1.0"
 dependencies = [
+ "homeport-kernel",
  "reqwest",
- "rproxy-kernel",
  "serde_json",
  "tokio",
 ]
@@ -3973,8 +4114,8 @@ dependencies = [
 name = "plugin-name-filters"
 version = "0.2.0"
 dependencies = [
+ "homeport-kernel",
  "plugin-servers",
- "rproxy-kernel",
  "serde",
 ]
 
@@ -3982,8 +4123,8 @@ dependencies = [
 name = "plugin-routing"
 version = "0.2.0"
 dependencies = [
+ "homeport-kernel",
  "plugin-servers",
- "rproxy-kernel",
  "serde",
  "tokio",
 ]
@@ -3992,12 +4133,27 @@ dependencies = [
 name = "plugin-servers"
 version = "0.2.0"
 dependencies = [
+ "homeport-kernel",
  "percent-encoding",
- "rproxy-kernel",
+ "reqwest",
  "serde",
  "serde_json",
+ "tokio",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "plugin-statistics"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "egui_plot",
+ "homeport-kernel",
+ "plugin-servers",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -4006,9 +4162,9 @@ version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "flate2",
+ "homeport-kernel",
  "plugin-servers",
  "reqwest",
- "rproxy-kernel",
  "serde",
  "serde-saphyr",
  "serde_json",
@@ -4023,13 +4179,13 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "futures-util",
+ "homeport-kernel",
  "http-body-util",
  "hyper",
  "hyper-util",
  "plugin-routing",
  "plugin-servers",
  "rcgen",
- "rproxy-kernel",
  "rustls-acme",
  "serde",
  "serde_json",
@@ -4450,123 +4606,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "rproxy"
-version = "0.2.0"
-dependencies = [
- "axum",
- "base64 0.23.1",
- "eframe",
- "egui",
- "futures-util",
- "image",
- "ksni",
- "objc2 0.6.5",
- "objc2-app-kit 0.3.2",
- "plugin-autostart",
- "plugin-chain-exit",
- "plugin-connections",
- "plugin-health-checks",
- "plugin-install-to-server",
- "plugin-local-proxy",
- "plugin-logs",
- "plugin-name-filters",
- "plugin-routing",
- "plugin-servers",
- "plugin-subscriptions",
- "plugin-vless-inbound",
- "reqwest",
- "rfd",
- "rproxy-kernel",
- "rproxy-remote",
- "serde_json",
- "tempfile",
- "tokio",
- "tray-icon",
- "url",
- "uuid",
- "windows-sys 0.61.2",
- "winit",
- "zbus",
-]
-
-[[package]]
-name = "rproxy-derive"
-version = "0.1.0"
-dependencies = [
- "quote",
- "syn 3.0.10",
-]
-
-[[package]]
-name = "rproxy-kernel"
-version = "0.2.0"
-dependencies = [
- "egui",
- "flate2",
- "futures-util",
- "getrandom 0.4.3",
- "reqwest",
- "rproxy-derive",
- "rproxy-kit",
- "rproxy-mihomo",
- "rusqlite",
- "same-file",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "tokio-util",
- "uuid",
- "zip",
-]
-
-[[package]]
-name = "rproxy-kit"
-version = "0.2.0"
-dependencies = [
- "egui",
- "epaint",
- "qrcode",
-]
-
-[[package]]
-name = "rproxy-mihomo"
-version = "0.2.0"
-dependencies = [
- "ipnet",
- "libc",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "uuid",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "rproxy-remote"
-version = "0.2.0"
-dependencies = [
- "axum",
- "eframe",
- "egui",
- "js-sys",
- "miniz_oxide 0.9.1",
- "postcard",
- "rproxy-kernel",
- "serde",
- "tempfile",
- "tokio",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-bindgen-test",
- "web-sys",
 ]
 
 [[package]]
@@ -6298,6 +6337,22 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webbrowser"
+version = "1.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe8d20d0214027baf11b8b0cc307c1da7657d8f4db9aa956f7de27a6fb1acbd5"
+dependencies = [
+ "jni",
+ "log",
+ "ndk-context",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "url",
+ "web-sys",
 ]
 
 [[package]]

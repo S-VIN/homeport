@@ -1,27 +1,28 @@
 [package]
-name = "rproxy-kernel"
+name = "homeport-kernel"
 version = "0.2.0"
 edition = "2024"
 publish = false
-description = "rproxy kernel: plugins, state, ops, events, UI zones and the mihomo core"
+description = "homeport kernel: plugins, state, ops, events, UI zones and the mihomo core"
 
 [dependencies]
-rproxy-derive = { path = "../derive" }
-rproxy-kit = { path = "../kit" }
-rproxy-mihomo = { path = "../mihomo" }
+homeport-derive = { path = "../derive" }
+homeport-kit = { path = "../kit" }
+homeport-mihomo = { path = "../mihomo" }
 egui = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { version = "0.7.20", features = ["rt"] }
 futures-util = { workspace = true }
-rusqlite = { version = "0.42", features = ["bundled", "fallible_uint", "backup"] }
+rusqlite = { version = "0.42", features = ["bundled", "fallible_uint", "backup", "functions"] }
 uuid = { workspace = true }
 getrandom = "0.4"
 same-file = "1.0.6"
 tempfile = { workspace = true }
 reqwest = { workspace = true }
 sha2 = "0.11.1"
+log = "0.4.35"
 
 [target.'cfg(not(windows))'.dependencies]
 flate2 = { workspace = true }

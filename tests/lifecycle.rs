@@ -35,10 +35,10 @@ fn alive(pid: u32) -> bool {
     })
 }
 fn app(dir: &Path) -> App {
-    App(Command::new(env!("CARGO_BIN_EXE_rproxy"))
+    App(Command::new(env!("CARGO_BIN_EXE_homeport"))
         .arg("web")
-        .env("RPROXY_LISTEN", "127.0.0.1:0")
-        .env("RPROXY_DATA_DIR", dir)
+        .env("HOMEPORT_LISTEN", "127.0.0.1:0")
+        .env("HOMEPORT_DATA_DIR", dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -92,7 +92,7 @@ fn closing_the_lease_stops_the_tunnel_supervisor_and_reaps_its_core() {
     fs::write(&core, "#!/bin/sh\necho $$ > \"$2/pid\"\nexec sleep 60\n").unwrap();
     fs::set_permissions(&core, fs::Permissions::from_mode(0o700)).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let mut supervisor = App(Command::new(env!("CARGO_BIN_EXE_rproxy"))
+    let mut supervisor = App(Command::new(env!("CARGO_BIN_EXE_homeport"))
         .args(["--core-supervisor", "--lease"])
         .arg(listener.local_addr().unwrap().port().to_string())
         .args([&ticket, &core])

@@ -1,7 +1,7 @@
 //! Geo rules, connections, configuration exchange and the tunnel with the real bundled mihomo.
+use homeport_kernel::{Host, Id, Kernel, list::Add};
 use plugin_local_proxy::{PROXY, SaveProxy};
 use plugin_routing::{GEO, Route, Rule};
-use rproxy_kernel::{Host, Id, Kernel, list::Add};
 use std::{sync::Arc, time::Duration};
 
 async fn until(k: &Kernel, what: &str, secs: u64, ok: impl Fn(&Kernel) -> bool) {
@@ -16,7 +16,7 @@ async fn until(k: &Kernel, what: &str, secs: u64, ok: impl Fn(&Kernel) -> bool) 
 }
 
 async fn start(dir: &std::path::Path) -> Arc<Host> {
-    let host = Host::start(rproxy::catalog(), dir).await.unwrap();
+    let host = Host::start_enabled(homeport::catalog(), dir).await.unwrap();
     let k = host.kernel();
     let mut inbound = (*k.snapshot().get(&PROXY)).clone();
     inbound.port = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -42,7 +42,7 @@ async fn geo_rules_download_and_unknown_lists_do_not_break_the_core() {
     for pattern in [
         "geosite:category-ru",
         "geoip:ru",
-        "geosite:no-such-list-rproxy",
+        "geosite:no-such-list-homeport",
     ] {
         routing
             .call(Add::new(
@@ -66,7 +66,7 @@ async fn geo_rules_download_and_unknown_lists_do_not_break_the_core() {
     assert!(
         !k.snapshot()
             .live(&GEO)
-            .get("geosite-no-such-list-rproxy")
+            .get("geosite-no-such-list-homeport")
             .is_some_and(|s| s.rules > 0)
     );
     k.cx_for("routing")
@@ -81,7 +81,7 @@ async fn geo_rules_download_and_unknown_lists_do_not_break_the_core() {
 }
 
 fn via(port: u16) -> reqwest::Client {
-    rproxy_kernel::mihomo::http()
+    homeport_kernel::mihomo::http()
         .no_proxy()
         .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).unwrap())
         .timeout(Duration::from_secs(15))
@@ -96,9 +96,9 @@ async fn warp_is_set_up_and_carries_traffic_as_the_exit() {
     let dir = tempfile::tempdir().unwrap();
     let host = start(dir.path()).await;
     let k = host.kernel();
-    // The entry: this machine's own upstream proxy (RPROXY_TEST_UPSTREAM=host:port, SOCKS5 with UDP),
+    // The entry: this machine's own upstream proxy (HOMEPORT_TEST_UPSTREAM=host:port, SOCKS5 with UDP),
     // or none when the network reaches Cloudflare directly.
-    if let Ok(upstream) = std::env::var("RPROXY_TEST_UPSTREAM") {
+    if let Ok(upstream) = std::env::var("HOMEPORT_TEST_UPSTREAM") {
         let (host_, port) = upstream.rsplit_once(':').unwrap();
         let doc = format!(
             "proxies:\n  - {{name: Upstream, type: socks5, server: {host_}, port: {port}, udp: true}}"
@@ -116,7 +116,7 @@ async fn warp_is_set_up_and_carries_traffic_as_the_exit() {
             .call(plugin_servers::ReplaceFromSource {
                 source: id,
                 proxies,
-                still_current: None,
+                guard: None,
             })
             .await
             .unwrap();
@@ -127,7 +127,7 @@ async fn warp_is_set_up_and_carries_traffic_as_the_exit() {
             .unwrap();
     } else {
         k.cx_for("chain-exit")
-            .call(rproxy_kernel::Update {
+            .call(homeport_kernel::Update {
                 state: &exit::SETTINGS,
                 change: Box::new(|s| s.entry = exit::Entry::Direct),
             })
@@ -190,7 +190,7 @@ async fn connections_show_live_traffic_and_can_be_closed() {
     let dir = tempfile::tempdir().unwrap();
     let host = start(dir.path()).await;
     // An open window: connections are sampled every second.
-    let _window = host.session(&rproxy_kernel::egui::Context::default());
+    let _window = host.session(&homeport_kernel::egui::Context::default());
     let k = host.kernel();
     k.cx_for("routing")
         .call(Add::new(
@@ -264,7 +264,7 @@ async fn configuration_round_trip_preserves_settings_without_automatic_backups()
     let bytes = host.export_configuration().unwrap();
     let config = host.prepare_import("saved.sqlite3".into(), &bytes).unwrap();
     k.cx_for("routing")
-        .call(rproxy_kernel::list::Remove::new(
+        .call(homeport_kernel::list::Remove::new(
             &plugin_routing::RULES,
             rule.id,
         ))
@@ -297,7 +297,7 @@ async fn failed_tunnel_authorization_keeps_the_saved_setting_and_proxy() {
     // Library hosts do not configure a supervisor, so they cannot open OS dialogs.
     let error = k
         .cx_for("local-proxy")
-        .call(rproxy_kernel::Update {
+        .call(homeport_kernel::Update {
             state: &plugin_local_proxy::PROXY,
             change: Box::new(|d| d.tun = true),
         })
@@ -315,7 +315,7 @@ async fn failed_tunnel_authorization_keeps_the_saved_setting_and_proxy() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_server_installation_that_cannot_start_explains_why_and_saves_nothing() {
-    use plugin_install_to_server::{DEPLOYMENTS, Install, STATUS, Status, deploy::Options};
+    use plugin_install_to_server::{DEPLOYMENTS, Install, PROGRESS, Status, deploy::Options};
     let dir = tempfile::tempdir().unwrap();
     let host = start(dir.path()).await;
     let k = host.kernel();
@@ -336,7 +336,47 @@ async fn a_server_installation_that_cannot_start_explains_why_and_saves_nothing(
         error.message.contains("does not answer over SSH"),
         "{error}"
     );
-    assert_eq!(*k.snapshot().live(&STATUS), Status::Failed(error.message));
+    assert_eq!(*k.snapshot().live(&PROGRESS), Status::Failed(error.message));
     assert!(k.snapshot().get(&DEPLOYMENTS).is_empty());
+    host.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn uninstalling_from_an_unreachable_server_keeps_its_record() {
+    use plugin_install_to_server::{DEPLOYMENTS, Deployment, REMOVAL, Status, Uninstall};
+    let dir = tempfile::tempdir().unwrap();
+    let host = start(dir.path()).await;
+    let k = host.kernel();
+    let cx = k.cx_for("install-to-server");
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let record = Deployment {
+        id: Id::random(),
+        host: "127.0.0.1".into(),
+        ssh_port: closed.local_addr().unwrap().port(),
+        ssh_login: "root".into(),
+        directory: "/root/homeport".into(),
+        panel: "https://panel.example.com:8443".into(),
+        login: "admin".into(),
+        password: "panel".into(),
+        ready: true,
+    };
+    drop(closed);
+    cx.call(Add::new(&DEPLOYMENTS, record.clone()))
+        .await
+        .unwrap();
+    let uninstall = |password: &str| Uninstall {
+        id: record.id,
+        login: "root".into(),
+        password: password.into(),
+    };
+    let error = cx.call(uninstall("")).await.unwrap_err();
+    assert_eq!(error.message, "Enter the SSH login and password.");
+    let error = cx.call(uninstall("secret")).await.unwrap_err();
+    assert!(
+        error.message.contains("does not answer over SSH"),
+        "{error}"
+    );
+    assert_eq!(*k.snapshot().live(&REMOVAL), Status::Failed(error.message));
+    assert_eq!(*k.snapshot().get(&DEPLOYMENTS), vec![record]);
     host.shutdown().await;
 }

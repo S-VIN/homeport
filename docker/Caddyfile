@@ -6,7 +6,7 @@
 	email "{$ACME_EMAIL}"
 }
 
-https://{$RPROXY_PANEL_DOMAIN}:{$HTTPS_PORT}, https://{$RPROXY_AUTH_DOMAIN}:{$HTTPS_PORT} {
+https://{$HOMEPORT_PANEL_DOMAIN}:{$HTTPS_PORT}, https://{$HOMEPORT_AUTH_DOMAIN}:{$HTTPS_PORT} {
 	# HTTP-01 leaves TCP 443 available for VLESS/REALITY.
 	tls {
 		issuer acme {
@@ -19,7 +19,7 @@ https://{$RPROXY_PANEL_DOMAIN}:{$HTTPS_PORT}, https://{$RPROXY_AUTH_DOMAIN}:{$HT
 		X-Frame-Options DENY
 	}
 
-	@auth host {$RPROXY_AUTH_DOMAIN}
+	@auth host {$HOMEPORT_AUTH_DOMAIN}
 	handle @auth {
 		reverse_proxy 127.0.0.1:{$TINYAUTH_PORT}
 	}
@@ -27,7 +27,7 @@ https://{$RPROXY_PANEL_DOMAIN}:{$HTTPS_PORT}, https://{$RPROXY_AUTH_DOMAIN}:{$HT
 		forward_auth 127.0.0.1:{$TINYAUTH_PORT} {
 			uri /api/auth/caddy
 		}
-		reverse_proxy 127.0.0.1:{$RPROXY_UI_PORT} {
+		reverse_proxy 127.0.0.1:{$HOMEPORT_UI_PORT} {
 			stream_timeout {$WS_MAX_DURATION}
 		}
 	}

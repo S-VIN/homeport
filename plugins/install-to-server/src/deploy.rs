@@ -1,7 +1,9 @@
-//! One installation: connect over SSH, upload the Compose stack with a fresh
-//! server profile, run `install.sh` as root and follow its progress.
-use crate::{DEPLOYMENTS, Deployment, STATUS, Status};
-use rproxy_kernel::{configuration::Profile, prelude::*};
+//! One installation: connect over SSH, upload the Compose stack, run
+//! `install.sh` as root and follow its progress. The image's server preset
+//! (presets/server.sql) configures the new homeport. Uninstalling runs
+//! `uninstall.sh` the same way.
+use crate::{DEPLOYMENTS, Deployment, LOG, PROGRESS, REMOVAL, Status};
+use homeport_kernel::prelude::*;
 use std::{net::IpAddr, path::PathBuf, time::Duration};
 
 /// What the user chooses. Everything but the SSH access has a working default.
@@ -18,6 +20,7 @@ pub struct Options {
     /// Empty: `<server address>.sslip.io`, which needs no DNS setup.
     pub domain: String,
     pub https_port: u16,
+    /// `~/…` is in the home folder of the SSH login.
     pub directory: String,
     pub image: String,
     /// Optional Let's Encrypt contact.
@@ -35,8 +38,8 @@ impl Default for Options {
             disable_ipv6: true,
             domain: String::new(),
             https_port: 8443,
-            directory: "/srv/rproxy".into(),
-            image: "ghcr.io/s-vin/rproxy:latest".into(),
+            directory: "~/homeport".into(),
+            image: "ghcr.io/s-vin/homeport:latest".into(),
             email: String::new(),
         }
     }
@@ -66,13 +69,16 @@ impl Options {
             "Enter a domain like example.com, or leave it empty."
         } else if ports.contains(&0) || (1..3).any(|i| ports[..i].contains(&ports[i])) {
             "The SSH and panel ports must differ; port 80 is used for certificates."
-        } else if !self.directory.starts_with('/')
+        } else if !(self.directory.starts_with('/') || self.directory.starts_with("~/"))
             || self.directory.split('/').any(|part| part == "..")
-            || !word(self.directory.trim_matches('/'), "/_-.")
+            || !word(
+                self.directory.trim_start_matches('~').trim_matches('/'),
+                "/_-.",
+            )
         {
-            "The folder must be an absolute path of letters, digits, /, _, - and ."
+            "The folder must start with ~/ or / and contain letters, digits, /, _, - and ."
         } else if !word(&self.image, "/._:@-") {
-            "Enter a container image like ghcr.io/owner/rproxy:latest."
+            "Enter a container image like ghcr.io/owner/homeport:latest."
         } else {
             return None;
         })
@@ -197,13 +203,22 @@ impl Server {
                 russh::ChannelMsg::Data { data } | russh::ChannelMsg::ExtendedData { data, .. } => {
                     text.push_str(&String::from_utf8_lossy(&data));
                     while let Some(end) = text[seen..].find('\n') {
-                        line(&text[seen..seen + end]);
+                        // A progress line redrawn with \r: its last state.
+                        line(
+                            text[seen..seen + end]
+                                .rsplit('\r')
+                                .next()
+                                .unwrap_or_default(),
+                        );
                         seen += end + 1;
                     }
                 }
                 russh::ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
                 _ => {}
             }
+        }
+        if seen < text.len() {
+            line(text[seen..].rsplit('\r').next().unwrap_or_default());
         }
         Ok(Output { code, text })
     }
@@ -221,24 +236,76 @@ impl Server {
         }
         Ok(out.text)
     }
+    /// `~/…` in the home folder of the SSH login (not root's when using sudo).
+    async fn resolve(&self, directory: &str) -> Result<String> {
+        match directory.strip_prefix('~') {
+            Some(rest) => Ok(format!("{}{rest}", self.home().await?)),
+            None => Ok(directory.to_owned()),
+        }
+    }
+    /// The home folder of the SSH login: what the installer keeps on the
+    /// server goes there.
+    async fn home(&self) -> Result<String> {
+        let home = self.sh("printf '%s' \"$HOME\"").await?;
+        let home = home.trim().trim_end_matches('/');
+        if !home.starts_with('/') || home.contains(['\'', '\n']) {
+            bail!("The server did not tell the home folder of the SSH login.");
+        }
+        Ok(home.to_owned())
+    }
     async fn upload(&self, path: &str, bytes: &[u8]) -> Result<()> {
         let command = format!("umask 077; cat > {}", quote(path));
         self.send(&command, bytes).await.map(drop)
     }
+    /// A new temporary folder for the uploaded files.
+    async fn stage(&self) -> Result<String> {
+        let stage = self.sh("umask 077; mktemp -d /tmp/homeport-install.XXXXXX");
+        Ok(stage.await?.trim().to_owned())
+    }
+    /// Run the uploaded `script` as root; `line` sees its output. Without an
+    /// exit code (Stop, timeout, lost connection) the outcome on the server
+    /// is unknown, and that is an error.
+    async fn run_as_root(&self, cx: &Cx, script: &str, line: impl FnMut(&str)) -> Result<Output> {
+        let (command, password) = match &self.sudo {
+            Some(password) => (format!("sudo -S -p '' sh {script}"), password.as_bytes()),
+            None => (format!("sh {script}"), &b""[..]),
+        };
+        let run = self.run(&command, password, line);
+        match tokio::time::timeout(Duration::from_secs(1800), cx.or_cancel(run)).await {
+            Ok(Ok(Ok(out @ Output { code: Some(_), .. }))) => Ok(out),
+            Ok(Err(cancelled)) => Err(cancelled),
+            _ => bail!("The connection to the server was lost before the work was done."),
+        }
+    }
 }
 
-/// The new server's own configuration: an exit, so traffic of the clients
-/// it will serve leaves from it directly. Nothing of this device's
-/// configuration goes there.
-fn profile() -> Result<Vec<u8>> {
-    let direct = plugin_routing::Rule {
-        id: Id::random(),
-        pattern: "*".into(),
-        action: plugin_routing::Route::Direct,
-    };
-    Profile::new()?
-        .list(&plugin_routing::RULES, &[direct])?
-        .finish()
+/// A run's progress: the job's steps, the page's status and the log.
+struct Progress<'a> {
+    cx: &'a Cx,
+    o: &'a Options,
+    status: &'static State<Status>,
+    done: std::sync::atomic::AtomicU64,
+}
+impl Progress<'_> {
+    fn step(&self, text: &str) {
+        let done = (self.done).fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        self.cx.progress(done.min(STEPS - 1), Some(STEPS));
+        self.cx
+            .set_live(self.status, Status::Working(format!("{text}…")));
+        log(self.cx, self.o, &format!("▸ {text}"));
+        info!("{}: {text}", self.o.host.trim());
+    }
+    /// A line of a script: `::step::` is progress, `::error::` the reason
+    /// it failed, the rest goes to the log.
+    fn line(&self, line: &str, reason: &mut Option<String>) {
+        if let Some(text) = line.strip_prefix("::step::") {
+            self.step(text);
+        } else if let Some(text) = line.strip_prefix("::error::") {
+            *reason = Some(text.to_owned());
+        } else if !line.trim().is_empty() {
+            log(self.cx, self.o, line);
+        }
+    }
 }
 
 /// `<address>.sslip.io` resolves to the address itself: a certificate
@@ -256,74 +323,112 @@ fn domain(o: &Options, ip: IpAddr) -> Result<String> {
 }
 
 const STEPS: u64 = 8;
+/// Lines kept in the installation log.
+const LOG_LINES: usize = 400;
+
+/// Add a line to the installation log, with the passwords hidden.
+pub fn log(cx: &Cx, o: &Options, line: &str) {
+    let mut line = line.trim_end().to_owned();
+    for secret in [&o.password, &o.panel_password] {
+        if !secret.is_empty() {
+            line = line.replace(secret.as_str(), "•••");
+        }
+    }
+    cx.update_live(&LOG, |l| {
+        l.push(line);
+        let extra = l.len().saturating_sub(LOG_LINES);
+        l.drain(..extra);
+    });
+}
+
+/// Sign in to the server, with the first steps in the log.
+async fn connect(cx: &Cx, o: &Options, progress: &Progress<'_>) -> Result<Server> {
+    cx.set_live(&LOG, Vec::new());
+    progress.step(&format!("Connecting to {}:{}", o.host.trim(), o.ssh_port));
+    let server = Server::connect(o, cx.data_dir().join("known_hosts")).await?;
+    let sudo = if server.sudo.is_some() {
+        ", using sudo"
+    } else {
+        ""
+    };
+    log(cx, o, &format!("Signed in as {}{sudo}", o.login.trim()));
+    Ok(server)
+}
 
 pub async fn install(cx: &Cx, o: &Options) -> Result<()> {
-    let steps = std::sync::atomic::AtomicU64::new(0);
-    let step = |text: &str| {
-        let done = steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        cx.progress(done.min(STEPS - 1), Some(STEPS));
-        cx.set_live(&STATUS, Status::Working(format!("{text}…")));
-    };
     if let Some(problem) = o.problem() {
+        cx.set_live(&LOG, Vec::new());
         bail!("{problem}");
     }
-    step("Connecting");
-    let server = Server::connect(o, cx.data_dir().join("known_hosts")).await?;
+    let progress = Progress {
+        cx,
+        o,
+        status: &PROGRESS,
+        done: 0.into(),
+    };
+    let server = connect(cx, o, &progress).await?;
     if o.disable_ipv6 && server.ip.is_ipv6() {
         bail!("This connection uses IPv6. Enter the server's IPv4 address, or leave IPv6 on.");
     }
+    let directory = server.resolve(&o.directory).await?;
     let domain = domain(o, server.ip)?;
     let (panel, auth) = (format!("panel.{domain}"), format!("auth.{domain}"));
-    let profile = profile()?;
+    // Installing again to the same place updates that installation: same
+    // record, and the same panel password unless a new one is given.
+    let host = o.host.trim().to_owned();
+    let earlier = (cx.get(&DEPLOYMENTS).iter())
+        .find(|d| d.host == host && d.directory == directory)
+        .cloned();
     let mut record = Deployment {
-        id: Id::random(),
-        host: o.host.trim().into(),
-        directory: o.directory.clone(),
+        id: earlier.as_ref().map_or_else(Id::random, |d| d.id),
+        host,
+        ssh_port: o.ssh_port,
+        ssh_login: o.login.trim().to_owned(),
+        directory: directory.clone(),
         panel: format!("https://{panel}:{}", o.https_port),
         login: o.panel_login.clone(),
-        password: match o.panel_password.as_str() {
-            "" => format!("{}{}", Id::random(), Id::random()),
-            chosen => chosen.into(),
+        password: match (o.panel_password.as_str(), &earlier) {
+            ("", Some(d)) => d.password.clone(),
+            ("", None) => format!("{}{}", Id::random(), Id::random()),
+            (chosen, _) => chosen.into(),
         },
         ready: false,
     };
     let env: String = [
-        ("RPROXY_PANEL_DOMAIN", panel.as_str()),
-        ("RPROXY_AUTH_DOMAIN", auth.as_str()),
-        ("DATA_DIR", &format!("{}/data", o.directory)),
+        ("HOMEPORT_PANEL_DOMAIN", panel.as_str()),
+        ("HOMEPORT_AUTH_DOMAIN", auth.as_str()),
+        ("DATA_DIR", &format!("{directory}/data")),
         ("TINYAUTH_USERNAME", &record.login),
         ("TINYAUTH_PASSWORD", &record.password),
         ("HTTPS_PORT", &o.https_port.to_string()),
-        ("RPROXY_IMAGE", &o.image),
+        ("HOMEPORT_IMAGE", &o.image),
         ("ACME_EMAIL", &o.email),
     ]
     .iter()
     .map(|(key, value)| format!("{key}='{value}'\n"))
     .collect();
 
-    step("Uploading");
-    let stage = server
-        .sh("umask 077; mktemp -d /tmp/rproxy-install.XXXXXX")
-        .await?;
-    let stage = stage.trim();
+    progress.step(&format!("Uploading the installation to {directory}"));
+    let stage = server.stage().await?;
+    let stage = stage.as_str();
     let script = format!(
-        "DEST={} STAGE={} PANEL={} AUTH={} HTTPS_PORT={} DISABLE_IPV6={}\n{}",
-        quote(&o.directory),
+        "DEST={} STAGE={} HOME_DIR={} PANEL={} AUTH={} HTTPS_PORT={} DISABLE_IPV6={}\n{}",
+        quote(&directory),
         quote(stage),
+        quote(&server.home().await?),
         quote(&record.panel),
         quote(&format!("https://{auth}:{}", o.https_port)),
         o.https_port,
         u8::from(o.disable_ipv6),
         include_str!("install.sh"),
     );
-    let files: [(&str, &[u8]); 5] = [
+    let files: [(&str, &[u8]); 4] = [
         (
             "compose.yaml",
             include_bytes!("../../../docker/compose.yaml"),
         ),
         ("Caddyfile", include_bytes!("../../../docker/Caddyfile")),
         (".env", env.as_bytes()),
-        ("profile.sqlite3", &profile),
         ("install.sh", script.as_bytes()),
     ];
     let result = async {
@@ -333,47 +438,96 @@ pub async fn install(cx: &Cx, o: &Options) -> Result<()> {
         cx.checkpoint()?;
         // Saved before the server changes: its password is never lost.
         save(cx, record.clone()).await?;
-        let mut reason = None;
-        let (command, password) = match &server.sudo {
-            Some(password) => (
-                format!("sudo -S -p '' sh {stage}/install.sh"),
-                password.as_bytes(),
-            ),
-            None => (format!("sh {stage}/install.sh"), &b""[..]),
-        };
-        let run = server.run(&command, password, |line| {
-            if let Some(text) = line.strip_prefix("::step::") {
-                step(text);
-            } else if let Some(text) = line.strip_prefix("::error::") {
-                reason = Some(text.to_owned());
-            }
+        let (mut reason, mut created) = (None, false);
+        let script = format!("{stage}/install.sh");
+        // An unknown outcome on the server keeps the record as it is.
+        let outcome = server.run_as_root(cx, &script, |line| match line {
+            "::created::" => created = true,
+            line => progress.line(line, &mut reason),
         });
-        let run = tokio::time::timeout(Duration::from_secs(1800), cx.or_cancel(run));
-        match run.await {
-            Ok(Ok(Ok(Output { code: Some(0), .. }))) => {
+        match outcome.await? {
+            Output { code: Some(0), .. } => {
+                info!(
+                    "{}: installed; the panel is at {}",
+                    record.host, record.panel
+                );
+                log(
+                    cx,
+                    o,
+                    &format!("✔ Installed. The panel is at {}", record.panel),
+                );
                 record.ready = true;
                 save(cx, record.clone()).await
             }
-            // The script removed what it had installed.
-            Ok(Ok(Ok(Output {
-                code: Some(_),
-                text,
-            }))) => {
-                let id = record.id;
-                cx.write(move |w| {
-                    w.update(&DEPLOYMENTS, |all| all.retain(|d| d.id != id));
-                    Ok(())
-                })
-                .await?;
-                Err(err(reason.unwrap_or_else(|| last_lines(&text, &o.password))))
+            // The script stopped with a reason; what it set up stays for the next run.
+            Output { text, .. } => {
+                if !created {
+                    // Nothing of this installation is on the server: as before it.
+                    let (id, earlier) = (record.id, earlier.clone());
+                    cx.write(move |w| {
+                        w.update(&DEPLOYMENTS, |all| {
+                            all.retain(|d| d.id != id);
+                            all.extend(earlier);
+                        });
+                        Ok(())
+                    })
+                    .await?;
+                }
+                Err(err(reason.unwrap_or_else(|| {
+                    last_lines("The installation", &text, &o.password)
+                })))
             }
-            // No exit code: the outcome on the server is unknown; the record stays.
-            Ok(Err(cancelled)) => Err(cancelled),
-            _ => bail!("The connection to the server was lost during the installation."),
         }
     }
     .await;
     let _ = server.sh(&format!("rm -rf -- {}", quote(stage))).await;
+    result
+}
+
+/// Remove homeport and what its installer added from the server of
+/// `record`, then every record of that server.
+pub async fn uninstall(cx: &Cx, o: &Options, record: &Deployment) -> Result<()> {
+    if o.login.trim().is_empty() || o.password.is_empty() {
+        cx.set_live(&LOG, Vec::new());
+        bail!("Enter the SSH login and password.");
+    }
+    let progress = Progress {
+        cx,
+        o,
+        status: &REMOVAL,
+        done: 0.into(),
+    };
+    let server = connect(cx, o, &progress).await?;
+    let stage = server.stage().await?;
+    let script = format!(
+        "DEST={} STAGE={} HOME_DIR={}\n{}",
+        quote(&record.directory),
+        quote(&stage),
+        quote(&server.home().await?),
+        include_str!("uninstall.sh"),
+    );
+    let result = async {
+        let path = format!("{stage}/uninstall.sh");
+        server.upload(&path, script.as_bytes()).await?;
+        cx.checkpoint()?;
+        let mut reason = None;
+        let run = server.run_as_root(cx, &path, |line| progress.line(line, &mut reason));
+        let out = run.await?;
+        if out.code != Some(0) {
+            let why = reason.unwrap_or_else(|| last_lines("Uninstalling", &out.text, &o.password));
+            bail!("{why}");
+        }
+        info!("{}: uninstalled", record.host);
+        log(cx, o, &format!("✔ Uninstalled from {}", record.host));
+        let host = record.host.clone();
+        cx.write(move |w| {
+            w.update(&DEPLOYMENTS, |all| all.retain(|d| d.host != host));
+            Ok(())
+        })
+        .await
+    }
+    .await;
+    let _ = server.sh(&format!("rm -rf -- {}", quote(&stage))).await;
     result
 }
 
@@ -391,14 +545,14 @@ async fn save(cx: &Cx, record: Deployment) -> Result<()> {
 }
 
 /// The end of the server's output for a failure the script did not explain.
-fn last_lines(text: &str, secret: &str) -> String {
+fn last_lines(what: &str, text: &str, secret: &str) -> String {
     let lines: Vec<&str> = text
         .lines()
         .filter(|l| !l.trim().is_empty() && !l.starts_with("::"))
         .collect();
     let tail = lines[lines.len().saturating_sub(8)..].join("\n");
     format!(
-        "The installation failed on the server:\n{}",
+        "{what} failed on the server:\n{}",
         tail.replace(secret, "•••")
     )
 }
@@ -421,7 +575,16 @@ mod tests {
             change(&mut o);
             o.problem().is_some()
         };
-        for directory in ["/", "/srv/../etc", "/srv/a;id", "relative", "/srv/a b"] {
+        for directory in [
+            "/",
+            "~",
+            "~/",
+            "/srv/../etc",
+            "/srv/a;id",
+            "relative",
+            "~user/x",
+            "/srv/a b",
+        ] {
             let mut o = options();
             o.directory = directory.into();
             assert!(o.problem().is_some(), "{directory}");
@@ -431,11 +594,12 @@ mod tests {
         assert!(rejected(|o| o.domain = "example.com;id".into()));
         assert!(rejected(|o| o.panel_password = "a'b".into()));
         assert!(rejected(
-            |o| o.panel_password = "a\nRPROXY_IMAGE=evil".into()
+            |o| o.panel_password = "a\nHOMEPORT_IMAGE=evil".into()
         ));
         assert!(rejected(|o| o.panel_login = "a b".into()));
         assert!(rejected(|o| o.image = "image; rm".into()));
         assert!(!rejected(|o| o.panel_password = "p@$$ w0rd \"!".into()));
+        assert!(!rejected(|o| o.directory = "/opt/homeport".into()));
     }
     #[test]
     fn the_automatic_domain_needs_a_public_ipv4_address() {
@@ -456,23 +620,10 @@ mod tests {
         );
     }
     #[test]
-    fn the_profile_is_a_new_server_with_a_direct_route() {
-        use rproxy_kernel::store::Store;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("profile");
-        std::fs::write(&path, profile().unwrap()).unwrap();
-        let db = Store::open(path).unwrap();
-        let rules = db
-            .transaction(|tx| tx.all::<plugin_routing::Rule>())
-            .unwrap();
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].action, plugin_routing::Route::Direct);
-    }
-    #[test]
     fn a_failure_shows_the_end_of_the_output_without_the_password() {
         let text = "::step::Checking\nok\n\nE: password broke apt\n";
         assert_eq!(
-            last_lines(text, "password"),
+            last_lines("The installation", text, "password"),
             "The installation failed on the server:\nok\nE: ••• broke apt"
         );
     }

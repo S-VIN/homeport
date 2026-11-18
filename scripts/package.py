@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Package the release build for this OS and architecture into dist/.
 
-Packages are named rproxy-<version>-<os>-<arch>…; on CI their names also go to
+Packages are named homeport-<version>-<os>-<arch>…; on CI their names also go to
 GITHUB_OUTPUT as package-1, package-2 for upload. Templates live in scripts/packaging/.
 """
 import argparse
@@ -21,7 +21,7 @@ from mihomo import verify as verify_mihomo
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / 'dist'
 TEMPLATES = ROOT / 'scripts/packaging'
-APP_ID = 'io.github.rproxy.Rproxy'
+APP_ID = 'io.github.homeport.Homeport'
 VERSION = tomllib.loads((ROOT / 'Cargo.toml').read_text())['package']['version']
 # linuxdeploy is pinned to a release; its digests come from that release's assets.
 LINUXDEPLOY = 'https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-{}.AppImage'
@@ -48,14 +48,16 @@ def fresh(path):
 
 
 def bundle(path, system, arch, resources=None):
-    """rproxy and its mihomo core side by side; the core's license under resources/licenses."""
-    exe = 'rproxy.exe' if system == 'win32' else 'rproxy'
+    """homeport and its mihomo core side by side; the core's license under resources/licenses.
+    The client preset (presets/client.sql) lies beside them (macOS: in Resources)."""
+    exe = 'homeport.exe' if system == 'win32' else 'homeport'
     target = ROOT / os.environ.get('CARGO_TARGET_DIR', 'target') / os.environ.get('CARGO_BUILD_TARGET', '')
     copy(target / 'release' / exe, path / exe)
     core = verify_mihomo(system, arch)
     copy(core, path / core.name)
     (path / core.name).chmod(0o755)
     copy(ROOT / 'assets/mihomo/LICENSE', (resources or path) / 'licenses/mihomo/LICENSE')
+    copy(ROOT / 'presets/client.sql', (resources if system == 'darwin' else path) / 'preset.sql')
 
 
 def windows(arch, name):
@@ -73,9 +75,9 @@ def windows(arch, name):
 def macos(arch, name):
     """An ad-hoc signed app in a DMG with an Applications link."""
     image = fresh(DIST / f'macos-{arch}')
-    app = image / 'rproxy.app'
+    app = image / 'homeport.app'
     bundle(app / 'Contents/MacOS', 'darwin', arch, resources=app / 'Contents/Resources')
-    info = dict(CFBundleExecutable='rproxy', CFBundleName='rproxy', CFBundleIdentifier=APP_ID,
+    info = dict(CFBundleExecutable='homeport', CFBundleName='homeport', CFBundleIdentifier=APP_ID,
                 CFBundleVersion=VERSION, CFBundleShortVersionString=VERSION,
                 CFBundlePackageType='APPL', NSHighResolutionCapable=True,
                 LSMinimumSystemVersion='11.0', LSApplicationCategoryType='public.app-category.utilities')
@@ -89,7 +91,7 @@ def macos(arch, name):
     # hdiutil sometimes fails with "Resource busy" on CI runners; a retry succeeds.
     for attempt in range(3):
         try:
-            run('hdiutil', 'create', '-volname', 'rproxy', '-srcfolder', image, '-ov', '-format', 'UDZO', dmg)
+            run('hdiutil', 'create', '-volname', 'homeport', '-srcfolder', image, '-ov', '-format', 'UDZO', dmg)
             break
         except subprocess.CalledProcessError:
             if attempt == 2:
@@ -105,23 +107,23 @@ def linux(arch, name):
     share = appdir / 'usr/share'
     icon = share / f'icons/hicolor/512x512/apps/{APP_ID}.png'
     copy(TEMPLATES / f'{APP_ID}.desktop', share / f'applications/{APP_ID}.desktop')
-    copy(ROOT / 'assets/logos/rproxy-blue-512.png', icon)
-    copy(ROOT / 'assets/logos/rproxy-blue.svg', share / f'icons/hicolor/scalable/apps/{APP_ID}.svg')
+    copy(ROOT / 'assets/logos/homeport-blue-512.png', icon)
+    copy(ROOT / 'assets/logos/homeport-blue.svg', share / f'icons/hicolor/scalable/apps/{APP_ID}.svg')
 
     # Flatpak first: linuxdeploy later adds libraries to the AppDir that the runtime already has.
     flatpak = DIST / f'{name}.flatpak'
     manifest = {
         'app-id': APP_ID, 'runtime': 'org.freedesktop.Platform', 'runtime-version': '26.08',
-        'sdk': 'org.freedesktop.Sdk', 'command': 'rproxy',
+        'sdk': 'org.freedesktop.Sdk', 'command': 'homeport',
         # Fewer malloc arenas: the default one per thread wastes memory in a tray app.
-        'finish-args': ['--env=MALLOC_ARENA_MAX=2', '--filesystem=xdg-run/rproxy:create', '--share=network', '--share=ipc',
+        'finish-args': ['--env=MALLOC_ARENA_MAX=2', '--filesystem=xdg-run/homeport:create', '--share=network', '--share=ipc',
                         '--socket=wayland', '--socket=fallback-x11', '--device=dri', '--talk-name=org.kde.StatusNotifierWatcher',
                         # TUN: the administrator prompt (pkexec) and the tunnel core run on the host.
                         '--talk-name=org.freedesktop.Flatpak',
                         # Start at login: read the entry the Background portal writes.
                         '--filesystem=xdg-config/autostart:ro'],
         # Cargo already stripped debuginfo; this also avoids a host eu-strip (elfutils).
-        'modules': [{'name': 'rproxy', 'buildsystem': 'simple', 'build-options': {'no-debuginfo': True},
+        'modules': [{'name': 'homeport', 'buildsystem': 'simple', 'build-options': {'no-debuginfo': True},
                      'build-commands': ['cp -a usr/. /app/'],
                      'sources': [{'type': 'dir', 'path': str(appdir)}]}],
     }
@@ -155,7 +157,7 @@ def main():
     args = parser.parse_args()
     DIST.mkdir(exist_ok=True)
     system = {'win32': 'windows', 'darwin': 'macos', 'linux': 'linux'}[args.os]
-    packages = {'win32': windows, 'darwin': macos, 'linux': linux}[args.os](args.arch, f'rproxy-{VERSION}-{system}-{args.arch}')
+    packages = {'win32': windows, 'darwin': macos, 'linux': linux}[args.os](args.arch, f'homeport-{VERSION}-{system}-{args.arch}')
     for package in packages:
         print(f'Packaged {package.relative_to(ROOT)}')
     if 'GITHUB_OUTPUT' in os.environ:

@@ -20,7 +20,7 @@ pub fn property(ui: &mut Ui, label: &str, value: &str) {
         );
         ui.data_mut(|d| d.insert_temp(id, r.response.rect.expand2(vec2(30., 2.))));
         if long && (hovered || ui.ctx().memory(|m| m.has_focus(id))) {
-            let c = icon_button_ex(ui, Icon::Copy, "Copy", true, Emphasis::Normal, false);
+            let c = icon_button(ui, Icon::Copy, "Copy", true);
             if c.clicked() {
                 ui.ctx().copy_text(value.to_owned());
             }
@@ -47,6 +47,26 @@ pub fn property_with(ui: &mut Ui, label: &str, value: impl FnOnce(&mut Ui)) {
         },
     );
 }
+/// A status line: a colored icon before wrapping text ("Listener · Running").
+pub fn property_status(ui: &mut Ui, label: &str, icon: Icon, color: Color32, text: &str) {
+    let p = theme::palette(ui);
+    property_with(ui, label, |ui| {
+        ui.spacing_mut().item_spacing.x = STATUS_GAP;
+        super::icon(ui, icon, STATUS_ICON, color);
+        ui.add(egui::Label::new(RichText::new(text).color(p.foreground)).wrap());
+    });
+}
+/// An action under a [`property_status`], where its text starts.
+pub fn property_action<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let mut out = None;
+    property_with(ui, "", |ui| {
+        ui.add_space(STATUS_ICON + STATUS_GAP);
+        out = Some(add(ui));
+    });
+    out.expect("property_with runs its content")
+}
+const STATUS_ICON: f32 = 14.;
+const STATUS_GAP: f32 = 6.;
 /// Label → value lines.
 pub fn properties(ui: &mut Ui, id: impl egui::AsIdSalt, rows: &[(String, String)]) {
     ui.push_id(id, |ui| {
@@ -130,13 +150,9 @@ fn stats_row(
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = gap;
         for (label, value, color) in items {
+            // Plain text: the stats sit in a card already, a tile would nest another.
             let (rect, _) = ui.allocate_exact_size(vec2(width, 40.), Sense::hover());
-            ui.painter().rect_filled(
-                rect,
-                RADIUS_CONTROL,
-                if p.dark { p.subtle } else { p.background },
-            );
-            let inner = rect.shrink2(vec2(8., 5.));
+            let inner = rect.shrink2(vec2(0., 5.));
             let mut child = ui.new_child(
                 egui::UiBuilder::new()
                     .max_rect(inner)

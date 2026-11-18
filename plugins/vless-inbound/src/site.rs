@@ -222,23 +222,116 @@ fn respond(req: &Request<Incoming>, domain: &str, secure: bool) -> Response<Full
     }
 }
 
+/// A small page of programmer jokes; new ones can be added in the browser
+/// (kept only until the page is reloaded).
 fn home(domain: &str) -> String {
     let name = domain.split('.').next().unwrap_or(domain);
-    format!(
-        r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{name}</title>
-<style>body{{margin:0;font:16px/1.6 Georgia,serif;color:#222;background:#fafaf7}}main{{max-width:38rem;margin:4rem auto;padding:0 1.25rem}}h1{{font-weight:normal;font-size:1.8rem}}a{{color:#225}}footer{{margin-top:3rem;color:#888;font-size:.85rem}}</style>
-</head><body><main>
-<h1>{name}</h1>
-<p>Notes on photography, small trips and the occasional recipe. Most of the old posts are being moved here from another host, so for now the archive is short.</p>
-<p>New entries appear every few weeks.</p>
-<footer>&copy; {domain}</footer>
-</main></body></html>
-"#
-    )
+    let jokes: String = JOKES.iter().map(|j| format!("<li>{j}</li>\n")).collect();
+    HOME.replace("{name}", name)
+        .replace("{domain}", domain)
+        .replace("{jokes}", &jokes)
 }
+
+const JOKES: [&str; 10] = [
+    "There are 10 kinds of people: those who understand binary and those who don't.",
+    "A SQL query walks into a bar, goes up to two tables and asks: &ldquo;Can I join you?&rdquo;",
+    "Why do programmers prefer dark mode? Because light attracts bugs.",
+    "How many programmers does it take to change a light bulb? None, that's a hardware problem.",
+    "&ldquo;Go to the store and buy a loaf of bread. If they have eggs, buy a dozen.&rdquo; The programmer came back with twelve loaves.",
+    "To understand recursion, you must first understand recursion.",
+    "There are two hard things in computer science: cache invalidation, naming things and off-by-one errors.",
+    "I would tell you a UDP joke, but you might not get it.",
+    "A programmer puts two glasses on the nightstand before going to sleep: a full one in case of thirst, and an empty one in case of no thirst.",
+    "&ldquo;It works on my machine.&rdquo; &ldquo;Then we'll ship your machine.&rdquo;",
+];
+
+const HOME: &str = r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{name} &middot; programmer jokes</title>
+<style>
+body{margin:0;font:16px/1.6 Georgia,serif;color:#222;background:#fafaf7}
+main{max-width:40rem;margin:3rem auto;padding:0 1.25rem}
+h1{font-weight:normal;font-size:1.8rem;margin-bottom:.25rem}
+.lead{color:#666;margin-top:0}
+ol{padding-left:1.4rem}
+li{margin:.6rem 0;padding:.4rem .6rem;border-radius:6px;transition:background .4s}
+li.picked{background:#fff3c4}
+li.new{color:#225}
+form{margin-top:2rem;display:flex;flex-direction:column;gap:.5rem}
+textarea{font:inherit;padding:.5rem;border:1px solid #ccc;border-radius:6px;min-height:4.5rem;resize:vertical}
+.buttons{display:flex;gap:.5rem;flex-wrap:wrap}
+button{font:inherit;font-size:.95rem;padding:.4rem .9rem;border:1px solid #225;border-radius:6px;background:#225;color:#fff;cursor:pointer}
+button.plain{background:none;color:#225}
+button:disabled{opacity:.5;cursor:default}
+footer{margin-top:3rem;color:#888;font-size:.85rem}
+</style>
+</head><body><main>
+<h1>Programmer jokes</h1>
+<p class="lead">A small collection from code reviews, stand-ups and late deploys. <span id="count"></span></p>
+<div class="buttons"><button type="button" class="plain" id="random">Random joke</button></div>
+<ol id="jokes">
+{jokes}</ol>
+<form id="add">
+<label for="joke">Know a good one? Add it to the list:</label>
+<textarea id="joke" maxlength="500" placeholder="Why did the programmer quit their job?"></textarea>
+<div class="buttons"><button type="submit" id="submit" disabled>Add joke</button></div>
+</form>
+<footer>&copy; {domain}</footer>
+</main>
+<script>
+(function () {
+  var list = document.getElementById('jokes');
+  var form = document.getElementById('add');
+  var input = document.getElementById('joke');
+  var submit = document.getElementById('submit');
+  var count = document.getElementById('count');
+  function update() {
+    var n = list.children.length;
+    count.textContent = n + (n === 1 ? ' joke so far.' : ' jokes so far.');
+  }
+  function pick(item) {
+    Array.prototype.forEach.call(list.children, function (li) { li.classList.remove('picked'); });
+    item.classList.add('picked');
+    item.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+  input.addEventListener('input', function () {
+    submit.disabled = input.value.trim() === '';
+  });
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var text = input.value.trim();
+    if (!text) return;
+    var li = document.createElement('li');
+    li.className = 'new';
+    li.textContent = text;
+    list.appendChild(li);
+    input.value = '';
+    submit.disabled = true;
+    update();
+    pick(li);
+  });
+  document.getElementById('random').addEventListener('click', function () {
+    var items = list.children;
+    if (items.length) pick(items[Math.floor(Math.random() * items.length)]);
+  });
+  update();
+})();
+</script>
+</body></html>
+"#;
 
 fn not_found() -> String {
     "<!doctype html><html><head><title>404 Not Found</title></head><body><h1>Not Found</h1><p>The requested URL was not found on this server.</p></body></html>\n".into()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_home_page_lists_ten_jokes_and_can_add_more() {
+        let page = super::home("node.example.com");
+        assert_eq!(page.matches("<li>").count(), 10);
+        assert!(page.contains("<title>node &middot; programmer jokes</title>"));
+        assert!(page.contains("&copy; node.example.com") && page.contains("id=\"add\""));
+        assert!(!page.contains("{name}") && !page.contains("{jokes}"));
+    }
 }

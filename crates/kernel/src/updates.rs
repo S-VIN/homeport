@@ -46,7 +46,7 @@ fn asset(version: &str) -> Option<String> {
     Some(format!("mihomo-{os}-{arch}-v{version}.{ext}"))
 }
 
-pub use rproxy_mihomo::{newer, version_of};
+pub use homeport_mihomo::{newer, version_of};
 
 impl Kernel {
     pub fn core_updates(&self) -> CoreUpdates {
@@ -59,7 +59,7 @@ impl Kernel {
     }
     /// The installed update's executable, if it is used instead of the bundled core.
     pub fn installed_core(&self) -> Option<std::path::PathBuf> {
-        rproxy_mihomo::installed_update(&self.core.home)
+        homeport_mihomo::installed_update(&self.core.home)
     }
     /// Stop the core, change its file, and start it again — also when the change failed.
     async fn swap_core(&self, change: impl FnOnce() -> std::io::Result<()>) -> Result<()> {
@@ -75,7 +75,7 @@ impl Kernel {
         self.core_api()
             .direct_or_routed("GitHub", |c| {
                 c.get(url)
-                    .header(reqwest::header::USER_AGENT, "rproxy")
+                    .header(reqwest::header::USER_AGENT, "homeport")
                     .timeout(timeout)
                     .send()
             })
@@ -118,13 +118,14 @@ impl Kernel {
         let task = Task::new("kernel/core-update", move |job| {
             let k = k.clone();
             async move {
-                let r = k.latest_release().await?;
+                let r = logged("check", k.latest_release()).await?;
                 let current = k.core_status().version.unwrap_or_default();
-                job.summary(if newer(&r.version, &current) {
-                    format!("mihomo {} is available", r.version)
+                if newer(&r.version, &current) {
+                    log::info!("mihomo {} is available", r.version);
+                    job.summary(format!("mihomo {} is available", r.version));
                 } else {
-                    "The core is up to date".into()
-                });
+                    job.summary("The core is up to date");
+                }
                 let mut u = k.updates.lock().unwrap();
                 (u.latest, u.checked) = (Some(r), Some(crate::now()));
                 drop(u);
@@ -141,7 +142,7 @@ impl Kernel {
         let k = self.clone();
         let task = Task::new("kernel/core-update", move |job| {
             let k = k.clone();
-            async move {
+            logged("update", async move {
                 let r = match k.core_updates().latest {
                     Some(r) => r,
                     None => k.latest_release().await?,
@@ -176,16 +177,17 @@ impl Kernel {
                 // Replaced while stopped: Windows locks running executables.
                 // The version file follows the binary, so a failed rename keeps a matching pair.
                 let home = k.core.home.clone();
-                let target = rproxy_mihomo::installed(&home);
+                let target = homeport_mihomo::installed(&home);
                 k.swap_core(|| {
                     std::fs::rename(target.with_extension("download"), &target)?;
-                    std::fs::write(rproxy_mihomo::installed_version_file(&home), &r.version)
+                    std::fs::write(homeport_mihomo::installed_version_file(&home), &r.version)
                 })
                 .await
                 .map_err(|e| Error::msg(format!("Cannot install the core: {}", e.message)))?;
+                log::info!("Core updated to mihomo {}", r.version);
                 job.summary(format!("Updated to mihomo {}", r.version));
                 Ok(())
-            }
+            })
         })
         .label("Update core");
         self.jobs.start(task).map(drop)
@@ -201,8 +203,8 @@ impl Kernel {
                 k.swap_core(|| {
                     // Also an older update that no longer runs.
                     for file in [
-                        rproxy_mihomo::installed(&home),
-                        rproxy_mihomo::installed_version_file(&home),
+                        homeport_mihomo::installed(&home),
+                        homeport_mihomo::installed_version_file(&home),
                     ] {
                         if file.is_file() {
                             std::fs::remove_file(file)?;
@@ -211,6 +213,7 @@ impl Kernel {
                     Ok(())
                 })
                 .await?;
+                log::info!("Switched to the bundled core");
                 job.summary("Using the bundled core");
                 Ok(())
             }
@@ -254,7 +257,7 @@ fn unpack(archive: &[u8]) -> Result<Vec<u8>> {
 /// Write `<home>/bin/mihomo.download` and check that it runs and reports `version`.
 fn stage(home: &Path, binary: &[u8], version: &str) -> Result<()> {
     let io = |e: std::io::Error| Error::msg(format!("Cannot install the core: {e}"));
-    let path = rproxy_mihomo::installed(home).with_extension("download");
+    let path = homeport_mihomo::installed(home).with_extension("download");
     std::fs::create_dir_all(path.parent().expect("bin folder")).map_err(io)?;
     std::fs::write(&path, binary).map_err(io)?;
     #[cfg(unix)]
@@ -279,6 +282,17 @@ fn stage(home: &Path, binary: &[u8], version: &str) -> Result<()> {
         crate::bail!("The downloaded core did not start on this system.");
     }
     Ok(())
+}
+
+/// `work`, with its failure written to the log (core updates show no toast).
+async fn logged<T>(what: &str, work: impl Future<Output = Result<T>>) -> Result<T> {
+    let r = work.await;
+    if let Err(e) = &r
+        && !e.cancelled()
+    {
+        log::warn!("Core {what} failed: {e}");
+    }
+    r
 }
 
 #[cfg(test)]

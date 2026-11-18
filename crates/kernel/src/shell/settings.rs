@@ -30,9 +30,9 @@ pub(super) fn settings(ui: &mut egui::Ui, cx: &mut UiCx) {
             kit::settings_row(
                 ui,
                 "Application",
-                "Closing the window keeps rproxy running in the background",
+                "Closing the window keeps homeport running in the background",
                 |ui| {
-                    if kit::Button::secondary("Quit rproxy").show(ui).clicked() {
+                    if kit::Button::secondary("Quit homeport").show(ui).clicked() {
                         cx.s.exit_requested = true;
                     }
                 },
@@ -60,20 +60,21 @@ pub(super) fn settings(ui: &mut egui::Ui, cx: &mut UiCx) {
     kit::section(ui, "About", None);
     let status = cx.core_status();
     let p = theme::palette(ui);
-    kit::card(ui, |ui| {
-        ui.spacing_mut().item_spacing.y = 0.;
-        kit::property(
-            ui,
-            "Version",
-            &format!("rproxy {}", env!("CARGO_PKG_VERSION")),
-        );
+    // Rows like every other section: the name left, the value and its
+    // actions at the right edge.
+    kit::settings_card(ui, |ui| {
+        kit::settings_row(ui, "Version", "", |ui| {
+            ui.label(format!("homeport {}", env!("CARGO_PKG_VERSION")));
+        });
         core_row(ui, cx, &status);
         let dir = cx.k.data_dir.display().to_string();
-        kit::property_with(ui, "Data folder", |ui| {
-            let w = ui.available_width() - theme::CONTROL - theme::HORIZONTAL_GAP;
-            ui.allocate_ui_with_layout(vec2(w, 20.), Layout::left_to_right(Align::Center), |ui| {
-                kit::middle(ui, &dir, p.foreground);
-            });
+        kit::settings_row(ui, "Data folder", "", |ui| {
+            ui.allocate_ui_with_layout(
+                // Fixed: the row measures its control, so it must not follow the room left.
+                vec2(240., 20.),
+                Layout::left_to_right(Align::Center),
+                |ui| kit::middle(ui, &dir, p.foreground),
+            );
             if kit::icon_button(ui, Icon::Copy, "Copy path", true).clicked() {
                 ui.ctx().copy_text(dir.clone());
                 cx.notify("Path copied");
@@ -99,7 +100,7 @@ pub(super) fn configuration(ui: &mut egui::Ui, cx: &mut UiCx) {
             .icon(Icon::Down)
             .enabled(!cx.s.file_busy)
             .show(ui)
-            .on_hover_text("Includes subscription links and credentials.")
+            .on_hover_text("Includes links and credentials.")
             .clicked()
         {
             cx.s.file_action = Some(FileAction::Export);
@@ -162,54 +163,56 @@ pub(super) fn core_row(ui: &mut egui::Ui, cx: &mut UiCx, status: &crate::core::C
         .as_ref()
         .filter(|r| crate::updates::newer(&r.version, &current))
         .cloned();
-    // The version on the left, its actions at the right end of the same row.
-    kit::property_with(ui, "Core", |ui| {
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let result = if let Some(run) = &running {
-                let text = match run.total {
-                    Some(total) if total > 0 => format!("{}%", run.done * 100 / total),
-                    _ => "Working…".to_owned(),
-                };
-                kit::spinner(ui);
-                kit::caption(ui, text);
-                Ok(())
-            } else if let Some(r) = &available {
-                if kit::Button::secondary(&format!("Update to {}", r.version))
-                    .show(ui)
-                    .clicked()
-                {
-                    k.install_core_update()
-                } else {
-                    Ok(())
-                }
-            } else {
-                let mut result = Ok(());
-                if kit::Button::secondary("Check for update")
-                    .show(ui)
-                    .clicked()
-                {
-                    result = k.check_core_update();
-                }
-                if installed
-                    && kit::Button::ghost("Use bundled")
-                        .show(ui)
-                        .on_hover_text("Remove the update and run the core shipped with rproxy")
-                        .clicked()
-                {
-                    result = k.remove_core_update();
-                }
-                result
+    // The version and its actions; under the name, when it was last checked.
+    let checked = match (updates.checked, &available, &running) {
+        (Some(at), None, None) => Some(format!("Up to date · checked {}", kit::age(at))),
+        _ => None,
+    };
+    let left = |ui: &mut egui::Ui| {
+        ui.label(RichText::new("Core").color(kit::colors(ui).foreground));
+        if let Some(checked) = checked {
+            kit::hint(ui, checked);
+        }
+    };
+    kit::settings_item(ui, "Core", left, |ui| {
+        ui.label(&label);
+        let result = if let Some(run) = &running {
+            let text = match run.total {
+                Some(total) if total > 0 => format!("{}%", run.done * 100 / total),
+                _ => "Working…".to_owned(),
             };
-            if let Err(e) = result {
-                k.notify_error("Core update", &e.message);
+            kit::spinner(ui);
+            kit::caption(ui, text);
+            Ok(())
+        } else if let Some(r) = &available {
+            if kit::Button::secondary(&format!("Update to {}", r.version))
+                .show(ui)
+                .clicked()
+            {
+                k.install_core_update()
+            } else {
+                Ok(())
             }
-            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                let ink = kit::colors(ui).foreground;
-                kit::truncated(ui, RichText::new(&label).color(ink), None);
-            });
-        });
+        } else {
+            let mut result = Ok(());
+            if installed
+                && kit::Button::ghost("Use bundled")
+                    .show(ui)
+                    .on_hover_text("Remove the update and run the core shipped with homeport")
+                    .clicked()
+            {
+                result = k.remove_core_update();
+            }
+            if kit::Button::secondary("Check for update")
+                .show(ui)
+                .clicked()
+            {
+                result = k.check_core_update();
+            }
+            result
+        };
+        if let Err(e) = result {
+            k.notify_error("Core update", &e.message);
+        }
     });
-    if let (Some(at), None, None) = (updates.checked, &available, &running) {
-        kit::property(ui, "", &format!("Up to date · checked {}", kit::age(at)));
-    }
 }

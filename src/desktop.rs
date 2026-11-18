@@ -179,7 +179,7 @@ impl Tray {
             link: Link::Idle,
         };
         let handle = match tray
-            .disable_dbus_name(rproxy_kernel::Platform::is_flatpak())
+            .disable_dbus_name(homeport_kernel::Platform::is_flatpak())
             .spawn()
             .await
         {
@@ -194,10 +194,10 @@ impl Tray {
 }
 impl ksni::Tray for Tray {
     fn id(&self) -> String {
-        "rproxy".into()
+        "homeport".into()
     }
     fn title(&self) -> String {
-        "rproxy".into()
+        "homeport".into()
     }
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
         let mut i = icon(self.link);
@@ -224,7 +224,7 @@ impl ksni::Tray for Tray {
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         vec![
             StandardItem {
-                label: "Open rproxy".into(),
+                label: "Open homeport".into(),
                 activate: Box::new(|t: &mut Self| t.control.send(WindowEvent::Open)),
                 ..Default::default()
             }

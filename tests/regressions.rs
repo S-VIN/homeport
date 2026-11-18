@@ -1,20 +1,22 @@
 //! Regressions for configuration exchange and subscription identity/concurrency.
-use plugin_subscriptions::{SOURCES, Source};
-use rproxy_kernel::{
+use homeport_kernel::{
     Host,
     list::{Add, Save},
 };
+use plugin_subscriptions::{SOURCES, Source};
 use std::{sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-fn catalog() -> Vec<&'static rproxy_kernel::Plugin> {
+fn catalog() -> Vec<&'static homeport_kernel::Plugin> {
     vec![&plugin_servers::PLUGIN, &plugin_subscriptions::PLUGIN]
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn invalid_imports_leave_the_running_profile_untouched() {
     let dir = tempfile::tempdir().unwrap();
-    let host = Host::start(rproxy::catalog(), dir.path()).await.unwrap();
+    let host = Host::start_enabled(homeport::catalog(), dir.path())
+        .await
+        .unwrap();
     let original = host.export_configuration().unwrap();
     let running = host.kernel();
     let plugins = running.plugins();
@@ -27,12 +29,12 @@ async fn invalid_imports_leave_the_running_profile_untouched() {
     for damage in [
         "ALTER TABLE kernel_plugins ADD COLUMN unexpected TEXT",
         "INSERT INTO kernel_settings (id,json) VALUES ('kernel.theme','not-json') ON CONFLICT(id) DO UPDATE SET json='not-json'",
-        "INSERT INTO kernel_plugins (id,enabled) VALUES ('health-checks',0) ON CONFLICT(id) DO UPDATE SET enabled=0; INSERT INTO kernel_settings (id,json) VALUES ('health-checks.auto','not-json') ON CONFLICT(id) DO UPDATE SET json='not-json'",
+        "INSERT INTO kernel_plugins (id,enabled) VALUES ('chain-exit',0) ON CONFLICT(id) DO UPDATE SET enabled=0; INSERT INTO kernel_settings (id,json) VALUES ('chain-exit.settings','not-json') ON CONFLICT(id) DO UPDATE SET json='not-json'",
         "CREATE TRIGGER unwanted AFTER INSERT ON kernel_plugins BEGIN DELETE FROM kernel_plugins; END",
     ] {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), &original).unwrap();
-        let db = rproxy_kernel::store::rusqlite::Connection::open(file.path()).unwrap();
+        let db = homeport_kernel::store::rusqlite::Connection::open(file.path()).unwrap();
         db.execute_batch(damage).unwrap();
         drop(db);
         let bytes = std::fs::read(file.path()).unwrap();
@@ -70,7 +72,7 @@ async fn invalid_imports_leave_the_running_profile_untouched() {
 #[tokio::test]
 async fn requests_send_hwid_and_report_provider_device_limits() {
     let dir = tempfile::tempdir().unwrap();
-    let host = Host::start(catalog(), dir.path()).await.unwrap();
+    let host = Host::start_enabled(catalog(), dir.path()).await.unwrap();
     let id = plugin_subscriptions::device_id(&dir.path().join("plugins/subscriptions")).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -81,7 +83,7 @@ async fn requests_send_hwid_and_report_provider_device_limits() {
             let n = socket.read(&mut bytes).await.unwrap();
             let request = String::from_utf8_lossy(&bytes[..n]).to_lowercase();
             assert!(request.contains(&format!("x-hwid: {id}")));
-            assert!(request.contains("x-device-model: rproxy"));
+            assert!(request.contains("x-device-model: homeport"));
             let extra = if limit {
                 "x-hwid-max-devices-reached: true\r\n"
             } else {
@@ -98,7 +100,7 @@ async fn requests_send_hwid_and_report_provider_device_limits() {
                 .unwrap();
         }
     });
-    let client = rproxy_kernel::mihomo::http().no_proxy().build().unwrap();
+    let client = homeport_kernel::mihomo::http().no_proxy().build().unwrap();
     let url = format!("http://{address}");
     assert_eq!(
         plugin_subscriptions::fetch_http(&host.kernel().cx_for("subscriptions"), &client, &url)
@@ -148,7 +150,7 @@ async fn changing_a_loading_subscription_never_commits_the_old_response() {
         }
     });
     let dir = tempfile::tempdir().unwrap();
-    let host = Host::start(catalog(), dir.path()).await.unwrap();
+    let host = Host::start_enabled(catalog(), dir.path()).await.unwrap();
     let k = host.kernel();
     let cx = k.cx_for("subscriptions");
     let source = Source::new(format!("http://{address}/old"));
@@ -183,14 +185,14 @@ async fn changing_a_loading_subscription_never_commits_the_old_response() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires private subscription URLs and explicit provider access"]
 async fn real_hwid_subscriptions_return_servers() {
-    let urls = std::env::var("RPROXY_TEST_SUBSCRIPTION_URLS").expect("URLs supplied locally");
-    let identity_dir = std::env::var("RPROXY_TEST_IDENTITY_DIR")
+    let urls = std::env::var("HOMEPORT_TEST_SUBSCRIPTION_URLS").expect("URLs supplied locally");
+    let identity_dir = std::env::var("HOMEPORT_TEST_IDENTITY_DIR")
         .expect("persistent installation identity directory");
     std::fs::create_dir_all(&identity_dir).unwrap();
     let id = plugin_subscriptions::device_id(std::path::Path::new(&identity_dir)).unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let host = Host::start(catalog(), dir.path()).await.unwrap();
-    let client = rproxy_kernel::mihomo::http().no_proxy().build().unwrap();
+    let host = Host::start_enabled(catalog(), dir.path()).await.unwrap();
+    let client = homeport_kernel::mihomo::http().no_proxy().build().unwrap();
     for (index, url) in urls.lines().enumerate() {
         let body = plugin_subscriptions::http_get(&client, url, &id)
             .await
@@ -200,7 +202,7 @@ async fn real_hwid_subscriptions_return_servers() {
             .kernel()
             .cx_for("subscriptions")
             .call(plugin_subscriptions::Parse {
-                source: rproxy_kernel::Id::random(),
+                source: homeport_kernel::Id::random(),
                 body,
             })
             .await
@@ -214,9 +216,9 @@ async fn real_hwid_subscriptions_return_servers() {
         host.kernel()
             .cx_for("servers")
             .call(plugin_servers::ReplaceFromSource {
-                source: rproxy_kernel::Id::random(),
+                source: homeport_kernel::Id::random(),
                 proxies,
-                still_current: None,
+                guard: None,
             })
             .await
             .unwrap();
@@ -231,24 +233,22 @@ async fn real_hwid_subscriptions_return_servers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn import_waits_for_old_writers_and_rejects_late_operations() {
-    use rproxy_kernel::{Platform, Plugin, State, categories};
+    use homeport_kernel::{Plugin, State};
     static VALUE: State<u32> = State::new("writer-test.value");
     static PLUGIN: Plugin = Plugin {
         id: "writer-test",
         name: "Writer test",
-        description: "",
-        category: categories::NETWORK,
-        requires: &[],
         required: true,
-        default_enabled: true,
-        platforms: Platform::ALL,
         setup: |p| {
             p.editable_setting(&VALUE);
             Ok(())
         },
+        ..Plugin::DEFAULT
     };
     let dir = tempfile::tempdir().unwrap();
-    let host = Host::start(vec![&PLUGIN], dir.path()).await.unwrap();
+    let host = Host::start_enabled(vec![&PLUGIN], dir.path())
+        .await
+        .unwrap();
     let candidate = host
         .prepare_import(
             "original.sqlite3".into(),
@@ -308,8 +308,8 @@ async fn import_waits_for_old_writers_and_rejects_late_operations() {
 async fn native_export_protects_working_files_and_replaces_only_the_selected_file() {
     let data = tempfile::tempdir().unwrap();
     let destination = tempfile::tempdir().unwrap();
-    let host = Host::start(catalog(), data.path()).await.unwrap();
-    let live = data.path().join("rproxy-plugins.sqlite3");
+    let host = Host::start_enabled(catalog(), data.path()).await.unwrap();
+    let live = data.path().join("homeport-plugins.sqlite3");
     assert!(host.export_configuration_to(&live).is_err());
     let alias = destination.path().join("alias.sqlite3");
     std::fs::hard_link(&live, &alias).unwrap();
@@ -362,24 +362,22 @@ fn hysteria_ipv6_and_old_subscription_settings_remain_compatible() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_wins_over_an_inflight_restart_and_prevents_future_launches() {
-    use rproxy_kernel::{Platform, Plugin, State, categories};
+    use homeport_kernel::{Plugin, State};
     static VALUE: State<u32> = State::new("shutdown-test.value");
     static PLUGIN: Plugin = Plugin {
         id: "shutdown-test",
         name: "Shutdown test",
-        description: "",
-        category: categories::NETWORK,
-        requires: &[],
         required: true,
-        default_enabled: true,
-        platforms: Platform::ALL,
         setup: |p| {
             p.editable_setting(&VALUE);
             Ok(())
         },
+        ..Plugin::DEFAULT
     };
     let dir = tempfile::tempdir().unwrap();
-    let host = Host::start(vec![&PLUGIN], dir.path()).await.unwrap();
+    let host = Host::start_enabled(vec![&PLUGIN], dir.path())
+        .await
+        .unwrap();
     let candidate = host
         .prepare_import(
             "before.sqlite3".into(),
@@ -426,15 +424,15 @@ async fn shutdown_wins_over_an_inflight_restart_and_prevents_future_launches() {
 /// A plugin outside subscriptions adds a format: its links are accepted when a
 /// source is added, and its documents are parsed when the source loads.
 mod demo_format {
+    use homeport_kernel::prelude::*;
     use plugin_servers::Proxy;
     use plugin_subscriptions::{LINK, Parse};
-    use rproxy_kernel::prelude::*;
 
     pub static PLUGIN: Plugin = Plugin {
         id: "format-demo",
         name: "Demo format",
         description: "demo://host:port links.",
-        requires: &["subscriptions"],
+        requires: &[&plugin_subscriptions::PLUGIN],
         setup,
         ..Plugin::DEFAULT
     };
@@ -444,7 +442,7 @@ mod demo_format {
                 raw.rsplit_once(':')
                     .filter(|(_, port)| port.parse::<u16>().is_ok())
                     .map(drop)
-                    .ok_or_else(|| "A demo link needs a port.".to_owned())
+                    .ok_or_else(|| Error::msg("A demo link needs a port."))
             })
         });
         p.handle(|_: Cx, op: Parse| async move {
@@ -469,7 +467,7 @@ async fn a_plugin_adds_a_subscription_format() {
     let dir = tempfile::tempdir().unwrap();
     let mut plugins = catalog();
     plugins.push(&demo_format::PLUGIN);
-    let host = Host::start(plugins, dir.path()).await.unwrap();
+    let host = Host::start_enabled(plugins, dir.path()).await.unwrap();
     let k = host.kernel();
     let cx = k.cx_for("subscriptions");
     assert!(

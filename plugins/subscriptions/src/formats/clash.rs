@@ -1,8 +1,8 @@
 //! Mihomo / Clash documents: YAML or JSON with a top-level `proxies:` list.
-//! Only outbound nodes are imported; listeners, rules and the controller stay rproxy's.
+//! Only outbound nodes are imported; listeners, rules and the controller stay homeport's.
 use crate::Parse;
+use homeport_kernel::prelude::*;
 use plugin_servers::Proxy;
-use rproxy_kernel::prelude::*;
 use serde_json::Value;
 
 /// Parse the `proxies` list of a Mihomo/Clash document.
@@ -13,12 +13,10 @@ pub fn parse(body: &str) -> Result<Vec<Proxy>> {
         .get("proxies")
         .and_then(Value::as_array)
         .ok_or_else(|| Error::msg("Expected a proxies list."))?;
-    nodes
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(i, v)| Proxy::from_value(v, i + 1))
-        .collect()
+    super::usable(nodes.iter().enumerate().map(|(i, v)| {
+        let name = (v["name"].as_str()).map_or_else(|| format!("Server {}", i + 1), str::to_owned);
+        (name, Proxy::from_value(v.clone(), i + 1).map(|p| vec![p]))
+    }))
 }
 
 pub(crate) fn register(p: &mut Setup) {

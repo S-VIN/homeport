@@ -29,13 +29,13 @@ impl NativeTray {
         #[cfg(target_os = "macos")]
         crate::macos::install_reopen(ctx);
         let menu = Menu::new();
-        let open = MenuItem::new("Open rproxy", true, None);
-        let quit = MenuItem::new("Quit rproxy", true, None);
+        let open = MenuItem::new("Open homeport", true, None);
+        let quit = MenuItem::new("Quit homeport", true, None);
         menu.append_items(&[&open, &quit])?;
         let icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_icon(image(Link::Idle))
-            .with_tooltip("rproxy · not connected")
+            .with_tooltip("homeport · not connected")
             .with_menu_on_left_click(false)
             .build()?;
         let quitting = Arc::new(AtomicBool::new(false));
@@ -77,9 +77,9 @@ impl NativeTray {
         if self.icon.set_icon(Some(image(link))).is_ok() {
             self.link = link;
             let text = match link {
-                Link::Idle => "rproxy · not connected",
-                Link::Selected => "rproxy · connected",
-                Link::Failed => "rproxy · connection error",
+                Link::Idle => "homeport · not connected",
+                Link::Selected => "homeport · connected",
+                Link::Failed => "homeport · connection error",
             };
             let _ = self.icon.set_tooltip(Some(text));
         }

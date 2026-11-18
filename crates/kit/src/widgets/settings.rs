@@ -70,8 +70,13 @@ pub fn settings_item(
     if narrow {
         let t = text(ui, ui.available_width(), text_height, Box::new(left));
         ui.add_space(theme::SPACE_S);
+        // Under the label the inputs share the full width; the natural width
+        // measured beside the label stays the one that decides the layout.
+        let stretch = (ui.available_width() / control_width).max(1.);
+        ui.data_mut(|d| d.insert_temp(stretch_id(), stretch));
         let c = place_control(ui, control_height);
-        remember(ui, (c.x, c.y, t));
+        ui.data_mut(|d| d.remove::<f32>(stretch_id()));
+        remember(ui, (control_width, c.y, t));
         ui.add_space(SETTINGS_PAD);
         return;
     }
@@ -92,6 +97,13 @@ pub fn settings_item(
     ui.add_space(SETTINGS_PAD);
 }
 const SETTINGS_PAD: f32 = 7.;
+fn stretch_id() -> egui::Id {
+    egui::Id::unique("kit-settings-stretch")
+}
+/// How much a settings row widens its inputs (1 beside the label).
+pub(crate) fn stretch(ui: &Ui) -> f32 {
+    ui.data(|d| d.get_temp(stretch_id())).unwrap_or(1.)
+}
 /// A caption line at the top of a settings card (e.g. a plugin group).
 pub fn settings_caption(ui: &mut Ui, text: &str, help: Option<&str>) {
     ui.add_space(SETTINGS_PAD);

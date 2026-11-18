@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-rproxy-kernel = { path = "../../crates/kernel" }
+homeport-kernel = { path = "../../crates/kernel" }
 
 # Flatpak: the Background portal (same zbus as the desktop shell).
 [target.'cfg(target_os = "linux")'.dependencies]

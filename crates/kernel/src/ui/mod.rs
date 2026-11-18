@@ -10,10 +10,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-/// Where a page appears in the bottom navigation.
+/// Where a plugin's page appears in the navigation. A plugin has at most one
+/// page; its id is the plugin id ([`UiCx::navigate`], [`JobSpec::page`](crate::JobSpec::page)).
 #[derive(Clone, Copy)]
 pub struct PageSpec {
-    pub id: &'static str,
     pub title: &'static str,
     pub icon: Icon,
     /// Lower comes first. Core pages use 10…60; Settings is always last.
@@ -82,6 +82,8 @@ pub(crate) struct SessionState {
     pub panels_open: bool,
     pub panel_anchor: Option<PanelAnchor>,
     pub activity_open: bool,
+    /// Failed tasks already seen in Activity (more mark its button).
+    pub seen_failures: usize,
     pub theme: Option<crate::kernel::Theme>,
     pub now: f64,
     pub wide: bool,
@@ -103,7 +105,7 @@ impl SessionState {
             file_busy: false,
             incoming: None,
             checking: None,
-            page: k.reg.pages.first().map_or("settings", |p| p.spec.id),
+            page: k.reg.pages.first().map_or("settings", |p| p.id),
             pages: HashMap::new(),
             tickets: Arc::default(),
             toasts: Vec::new(),
@@ -111,6 +113,7 @@ impl SessionState {
             panels_open: false,
             panel_anchor: None,
             activity_open: false,
+            seen_failures: 0,
             folded: Vec::new(),
             theme: None,
             now: 0.,
@@ -290,10 +293,13 @@ impl<'a> UiCx<'a> {
             Some((Ticket::Pending { .. }, _))
         )
     }
-    /// The state of the op submitted under `key`, with its typed reply
-    /// (`R` is the op's `Reply`). It stays until the next submit; an op that
-    /// was overtaken (a stale result) leaves it `Idle`.
-    pub fn request<R: Clone + 'static>(&self, key: impl Hash + std::fmt::Debug) -> Request<R> {
+    /// The state of the op `O` submitted under `key`, with its reply
+    /// (`cx.request::<CheckServer>(key)`). It stays until the next submit; an
+    /// op that was overtaken (a stale result) leaves it `Idle`.
+    pub fn request<O: crate::Op>(&self, key: impl Hash + std::fmt::Debug) -> Request<O::Reply>
+    where
+        O::Reply: Clone,
+    {
         let label = format!("{key:?}");
         match self.s.tickets.lock().unwrap().get(&self.ticket(key)) {
             None => Request::Idle,
@@ -304,12 +310,13 @@ impl<'a> UiCx<'a> {
                     result: Ok(reply), ..
                 },
                 _,
-            )) => match reply.downcast_ref::<R>() {
+            )) => match reply.downcast_ref::<O::Reply>() {
                 Some(r) => Request::Done(Ok(r.clone())),
-                // A bug in the page; it must not take the window down.
+                // The key was submitted with another op: a bug in the page,
+                // which must not take the window down.
                 None => Request::Done(Err(format!(
-                    "bug: request {label} does not reply with {}",
-                    std::any::type_name::<R>()
+                    "bug: request {label} is not a {}",
+                    std::any::type_name::<O>()
                 ))),
             },
         }
@@ -367,18 +374,36 @@ impl<'a> UiCx<'a> {
     pub fn notify(&mut self, text: &str) {
         self.k.notify(self.cx().plugin_name(), text)
     }
+    /// An error toast with the plugin's name, also written to the log.
     pub fn notify_error(&mut self, text: &str) {
-        self.k.notify_error(self.cx().plugin_name(), text)
+        let cx = self.cx();
+        self.k.notice(cx.plugin, cx.plugin_name(), text)
     }
-    /// Switch the session to another page.
-    pub fn navigate(&mut self, page: &'static str) {
+    /// The header of the calling plugin's page: the title from its
+    /// [`PageSpec`], a muted counter and actions on the right.
+    pub fn page_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        counter: &str,
+        actions: impl FnOnce(&mut egui::Ui, &mut UiCx),
+    ) {
+        let title = (self.k.reg.pages.iter())
+            .find(|e| Some(e.plugin) == self.plugin)
+            .map_or("", |e| e.spec.title);
+        crate::kit::page_header(ui, title, counter, |ui| actions(ui, self));
+    }
+    /// Switch the session to `plugin`'s page.
+    pub fn navigate(&mut self, plugin: &'static crate::Plugin) {
+        self.go(plugin.id);
+    }
+    pub(crate) fn go(&mut self, page: &'static str) {
         self.s.page = page;
         self.s.panels_open = false;
         self.s.activity_open = false;
     }
-    /// The page currently shown.
-    pub fn page(&self) -> &'static str {
-        self.s.page
+    /// Whether `plugin`'s page is shown.
+    pub fn on_page(&self, plugin: &crate::Plugin) -> bool {
+        self.s.page == plugin.id
     }
     /// Open or close the panels popover (narrow windows) with the calling
     /// plugin's panel (all panels when it has none), anchored to `chip`.
@@ -421,17 +446,18 @@ impl<'a> UiCx<'a> {
                 .pages
                 .iter()
                 .find(|e| mine(e.plugin))
-                .map(|e| e.spec.id);
+                .map(|e| e.id);
             // A chip opens its own panel (or page), never the others'.
             match page {
-                Some(page) if self.wide() || !panel => self.navigate(page),
+                Some(page) if self.wide() || !panel => self.go(page),
                 _ if panel => self.toggle_panels_from(&r),
                 _ => {}
             }
         }
         r
     }
-    pub fn wide(&self) -> bool {
+    /// Shell layout only: plugins leave screen sizes to kit.
+    pub(crate) fn wide(&self) -> bool {
         self.s.wide
     }
     pub fn core_status(&self) -> CoreStatus {

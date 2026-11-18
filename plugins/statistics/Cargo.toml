@@ -1,0 +1,16 @@
+[package]
+name = "plugin-statistics"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+homeport-kernel = { path = "../../crates/kernel" }
+plugin-servers = { path = "../servers" }
+serde = { workspace = true }
+tokio = { workspace = true }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+egui_plot = "0.38.0"
+
+[dev-dependencies]
+serde_json = { workspace = true }

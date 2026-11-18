@@ -47,43 +47,73 @@ pub(super) fn activity_button(
     cx: &mut UiCx,
     p: &kit::Palette,
 ) -> egui::Response {
-    let board = cx.k.board();
-    let active: Vec<_> = board
-        .runs
-        .iter()
-        .filter(|r| r.phase.active() && !r.quiet)
-        .collect();
-    let failed = board.runs.iter().any(|r| r.phase == Phase::Failed);
+    let a = Activity::of(cx);
     // On a phone an idle Activity is just its icon: the room goes to status chips.
-    let text = if active.is_empty() && kit::phone(ui) {
-        String::new()
-    } else if active.is_empty() {
-        "Tasks".to_owned()
+    let text = if a.running == 0 && kit::phone(ui) {
+        ""
     } else {
-        format!("{} running", active.len())
+        &a.text
     };
-    let tip = if active.is_empty() {
-        "Background tasks".to_owned()
-    } else {
-        active
-            .iter()
-            .map(|r| r.label.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let ink = if !active.is_empty() {
-        p.accent
-    } else if failed {
-        p.muted
-    } else {
-        p.faint
-    };
-    let r = kit::chip(ui, Some(Lead::Icon(Icon::Tasks, ink)), &text, &tip);
+    let ink = if a.running > 0 { p.accent } else { p.faint };
+    let r = kit::chip(ui, Some(Lead::Icon(Icon::Tasks, ink)), text, &a.tip);
+    a.mark(ui, p, r.rect.left_center() + vec2(15., -5.));
     if r.clicked() {
+        a.toggle(cx);
+    }
+    r
+}
+
+/// What the Activity button shows: running tasks, and failures not seen yet.
+pub(super) struct Activity {
+    pub text: String,
+    pub tip: String,
+    pub running: usize,
+    unseen: bool,
+}
+impl Activity {
+    pub fn of(cx: &mut UiCx) -> Self {
+        let board = cx.k.board();
+        let active: Vec<_> = board
+            .runs
+            .iter()
+            .filter(|r| r.phase.active() && !r.quiet)
+            .collect();
+        let failed = board
+            .runs
+            .iter()
+            .filter(|r| r.phase == Phase::Failed)
+            .count();
+        if cx.s.activity_open || failed < cx.s.seen_failures {
+            cx.s.seen_failures = failed;
+        }
+        Self {
+            text: match active.len() {
+                0 => "Tasks".to_owned(),
+                n => format!("{n} running"),
+            },
+            tip: if active.is_empty() {
+                "Background tasks".to_owned()
+            } else {
+                active
+                    .iter()
+                    .map(|r| r.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            },
+            running: active.len(),
+            unseen: failed > cx.s.seen_failures,
+        }
+    }
+    /// A dot on the icon while a failure waits to be seen.
+    pub fn mark(&self, ui: &egui::Ui, p: &kit::Palette, at: egui::Pos2) {
+        if self.unseen {
+            ui.painter().circle_filled(at, 3.5, p.danger);
+        }
+    }
+    pub fn toggle(&self, cx: &mut UiCx) {
         cx.s.activity_open = !cx.s.activity_open;
         cx.s.panels_open = false;
     }
-    r
 }
 
 pub(super) fn status_bar(ui: &mut egui::Ui, cx: &mut UiCx) {
@@ -244,11 +274,12 @@ pub(super) fn folded_chips(ui: &mut egui::Ui, cx: &mut UiCx) {
 
 /// Title row of a panel card: caption on the left, optional content on the right.
 pub fn panel_title(ui: &mut egui::Ui, title: &str, right: impl FnOnce(&mut egui::Ui)) {
+    // As tall as a button, so a card keeps its height with or without one.
     ui.allocate_ui_with_layout(
-        vec2(ui.available_width(), 22.),
+        vec2(ui.available_width(), theme::CONTROL),
         Layout::left_to_right(Align::Center),
         |ui| {
-            ui.set_min_size(vec2(ui.available_width(), 22.));
+            ui.set_min_size(vec2(ui.available_width(), theme::CONTROL));
             kit::caption(ui, title);
             ui.with_layout(Layout::right_to_left(Align::Center), right);
         },
@@ -256,11 +287,16 @@ pub fn panel_title(ui: &mut egui::Ui, title: &str, right: impl FnOnce(&mut egui:
     ui.add_space(2.);
 }
 
-/// Panel title with an "Open" button that opens `page` (hidden on that page).
-pub fn panel_title_page(ui: &mut egui::Ui, cx: &mut UiCx, title: &str, page: &'static str) {
+/// Panel title with an "Open" button that opens `plugin`'s page (hidden on that page).
+pub fn panel_title_page(
+    ui: &mut egui::Ui,
+    cx: &mut UiCx,
+    title: &str,
+    plugin: &'static crate::Plugin,
+) {
     let mut open = false;
     panel_title(ui, title, |ui| {
-        if cx.page() != page {
+        if !cx.on_page(plugin) {
             open = kit::Button::ghost("Open")
                 .tone(Tone::Accent)
                 .show(ui)
@@ -268,7 +304,7 @@ pub fn panel_title_page(ui: &mut egui::Ui, cx: &mut UiCx, title: &str, page: &'s
         }
     });
     if open {
-        cx.navigate(page);
+        cx.navigate(plugin);
     }
 }
 

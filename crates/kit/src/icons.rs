@@ -60,6 +60,12 @@ pub enum Icon {
     EyeOff,
     /// An empty circle (something off or not chosen).
     Circle,
+    /// A command prompt: work on a remote machine.
+    Terminal,
+    /// Bars: amounts over time.
+    Statistics,
+    /// A broom: take away everything an installation added.
+    Uninstall,
 }
 
 impl Icon {
@@ -111,6 +117,9 @@ impl Icon {
             Icon::Eye => ('\u{E220}', false),
             Icon::EyeOff => ('\u{E224}', false),
             Icon::Circle => ('\u{E18A}', false),
+            Icon::Terminal => ('\u{E47E}', false),
+            Icon::Statistics => ('\u{E150}', false),
+            Icon::Uninstall => ('\u{EC54}', false),
         })
     }
 }

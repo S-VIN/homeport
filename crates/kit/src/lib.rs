@@ -1,4 +1,4 @@
-//! rproxy UI kit: design tokens, palette, fonts, icons and domain-free egui widgets.
+//! homeport UI kit: design tokens, palette, fonts, icons and domain-free egui widgets.
 //!
 //! The kit knows nothing about proxies or plugins. The kernel builds its shell and
 //! plugin helpers (list editors, settings bound to state) on top of it.

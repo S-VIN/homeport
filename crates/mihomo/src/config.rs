@@ -202,11 +202,34 @@ pub struct Listener {
     pub optional: bool,
 }
 
+/// The core's own resolver. With the tunnel it also answers the apps
+/// (port 53 is captured only while a resolver is configured).
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Dns {
     pub enable: bool,
+    /// Server addresses as mihomo takes them: `https://…`, `tls://…`, an IP or `system`.
     pub nameservers: Vec<String>,
+    /// Answer apps with addresses from 198.18.0.0/16 and keep the real name
+    /// for the rules (mihomo `fake-ip`); otherwise real addresses.
+    pub fake_ip: bool,
+    /// Fixed answers: domain (`*` and `+.` wildcards) → IP address.
+    pub hosts: Vec<(String, String)>,
 }
+
+/// Names that must get real addresses in fake-IP mode: the local network,
+/// time servers, STUN and the Windows connectivity check.
+const FAKE_IP_FILTER: &[&str] = &[
+    "*.lan",
+    "*.local",
+    "*.localdomain",
+    "localhost",
+    "+.ntp.org",
+    "time.*.com",
+    "+.stun.*.*",
+    "+.stun.*.*.*",
+    "+.msftconnecttest.com",
+    "+.msftncsi.com",
+];
 
 /// What a rule set contains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -428,7 +451,7 @@ pub fn overlaps(a: IpAddr, b: IpAddr) -> bool {
 /// The kernel's own SOCKS listener that follows the ordinary rules, for the
 /// app's downloads that should go where user traffic goes.
 pub const ROUTED: &str = "routed";
-/// Listeners of rproxy itself (checks, its own downloads): their connections
+/// Listeners of homeport itself (checks, its own downloads): their connections
 /// are not the user's traffic.
 pub fn internal_listener(name: &str) -> bool {
     name == ROUTED || name.starts_with("checks-")
@@ -563,8 +586,26 @@ pub fn render(cfg: &Config, sys: &System<'_>, listeners: &[&Listener]) -> Value 
     }
     let dns = cfg.dns.as_ref().map_or_else(
         || json!({"enable": false}),
-        |d| json!({"enable": d.enable, "nameserver": d.nameservers}),
+        |d| {
+            let mut v = json!({"enable": d.enable, "nameserver": d.nameservers, "ipv6": true,
+                // Server names in the addresses above resolve through the system.
+                "default-nameserver": ["system"],
+                "enhanced-mode": if d.fake_ip { "fake-ip" } else { "redir-host" }});
+            if d.fake_ip {
+                v["fake-ip-range"] = json!("198.18.0.1/16");
+                v["fake-ip-filter"] = json!(FAKE_IP_FILTER);
+            }
+            v
+        },
     );
+    let hosts: serde_json::Map<String, Value> = cfg
+        .dns
+        .iter()
+        .flat_map(|d| &d.hosts)
+        .map(|(domain, ip)| (domain.clone(), json!(ip)))
+        .collect();
+    // Fake addresses survive a restart of the core: apps keep them in their caches.
+    let store_fake_ip = cfg.dns.as_ref().is_some_and(|d| d.enable && d.fake_ip);
     // Listeners bound to a non-loopback address are meant for other machines.
     let lan = listeners.iter().any(|l| !l.listen.is_loopback());
     // Looking up the app of a connection costs time: only with app rules.
@@ -573,7 +614,7 @@ pub fn render(cfg: &Config, sys: &System<'_>, listeners: &[&Listener]) -> Value 
     let mut root = json!({
         "log-level": log_level(), "mode": "rule", "allow-lan": lan, "find-process-mode": find_process,
         "dns": dns,
-        "profile": {"store-selected": false, "store-fake-ip": false},
+        "profile": {"store-selected": false, "store-fake-ip": store_fake_ip},
         "proxies": proxies, "proxy-groups": groups, "listeners": ls, "rules": rules,
     });
     root.as_object_mut()
@@ -595,10 +636,19 @@ pub fn render(cfg: &Config, sys: &System<'_>, listeners: &[&Listener]) -> Value 
             .collect();
         root["rule-providers"] = Value::Object(providers);
     }
+    if !hosts.is_empty() {
+        root["hosts"] = Value::Object(hosts);
+    }
     if let Some(t) = &cfg.tun {
+        // Without a resolver of the core, DNS queries go out like other traffic.
+        let hijack = if cfg.dns.as_ref().is_some_and(|d| d.enable) {
+            json!(["any:53", "tcp://any:53"])
+        } else {
+            json!([])
+        };
         root["tun"] = json!({
             "enable": true, "stack": "mixed", "auto-route": true, "auto-detect-interface": true,
-            "strict-route": t.strict_route, "dns-hijack": ["any:53", "tcp://any:53"],
+            "strict-route": t.strict_route, "dns-hijack": hijack,
         });
     }
     if cfg.sniff {
@@ -614,9 +664,9 @@ pub fn render(cfg: &Config, sys: &System<'_>, listeners: &[&Listener]) -> Value 
     root
 }
 
-/// mihomo's log level: `silent` unless `RPROXY_MIHOMO_LOG` asks for more.
+/// mihomo's log level: `silent` unless `HOMEPORT_MIHOMO_LOG` asks for more.
 pub fn log_level() -> &'static str {
-    match std::env::var("RPROXY_MIHOMO_LOG").as_deref() {
+    match std::env::var("HOMEPORT_MIHOMO_LOG").as_deref() {
         Ok("debug") => "debug",
         Ok("info") => "info",
         Ok("warning") => "warning",
@@ -790,5 +840,40 @@ mod tests {
             optional: true,
         };
         assert!(Config::compose([("x", Fragment::listeners([l]))]).is_err());
+    }
+
+    #[test]
+    fn the_tunnel_captures_dns_only_with_a_resolver() {
+        let sys = System {
+            controller: &json!({}),
+            check_ports: &[],
+            check_password: "p",
+            check_targets: &[],
+            routed_port: None,
+        };
+        let tun = Fragment {
+            tun: Some(Tun {
+                strict_route: false,
+            }),
+            ..Default::default()
+        };
+        let doc = render(&Config::compose([("tun", tun.clone())]).unwrap(), &sys, &[]);
+        assert_eq!(doc["tun"]["dns-hijack"], json!([]));
+        assert_eq!(doc["dns"]["enable"], false);
+        let dns = Fragment {
+            dns: Some(Dns {
+                enable: true,
+                nameservers: vec!["https://1.1.1.1/dns-query".into()],
+                fake_ip: true,
+                hosts: vec![("nas.home".into(), "192.168.1.5".into())],
+            }),
+            ..Default::default()
+        };
+        let cfg = Config::compose([("tun", tun), ("dns", dns)]).unwrap();
+        let doc = render(&cfg, &sys, &[]);
+        assert_eq!(doc["tun"]["dns-hijack"][0], "any:53");
+        assert_eq!(doc["dns"]["enhanced-mode"], "fake-ip");
+        assert_eq!(doc["hosts"]["nas.home"], "192.168.1.5");
+        assert_eq!(doc["profile"]["store-fake-ip"], true);
     }
 }

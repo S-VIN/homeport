@@ -51,6 +51,7 @@ htmlcov/
 
 # Local editor and assistant settings/installed skills.
 .agents/
+AGENTS.md
 .claude/
 .codex/
 .cursor/
@@ -85,7 +86,7 @@ Desktop.ini
 # Runtime profiles, databases, logs, and temporary files.
 /data/
 /docker/data/
-/rproxy-data/
+/homeport-data/
 /portable.txt
 *.sqlite*
 *.db

@@ -22,39 +22,59 @@ pub mod categories {
     pub const NETWORK: Category = Category::new("network", "Network & system");
 }
 
-/// A system a plugin can run on: a desktop operating system, or the Docker
-/// image (Linux without a desktop session, system proxy or TUN).
+/// A system a plugin can run on: a desktop operating system with the user's
+/// session, the same without it (`homeport web`), or the Docker image (Linux
+/// without a desktop session, system proxy or TUN).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Platform {
     Linux,
     Windows,
     Macos,
+    /// Linux, Windows or macOS served by `homeport web`: no desktop session.
+    Headless,
     Docker,
 }
+static HEADLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 impl Platform {
     /// For plugins without OS-specific code.
     pub const ALL: &'static [Platform] = &[
         Platform::Linux,
         Platform::Windows,
         Platform::Macos,
+        Platform::Headless,
         Platform::Docker,
     ];
     /// For plugins that integrate with a desktop session.
     pub const DESKTOP: &'static [Platform] = &[Platform::Linux, Platform::Windows, Platform::Macos];
+    /// Every system but Docker (e.g. a plugin that needs the host's tools).
+    pub const NATIVE: &'static [Platform] = &[
+        Platform::Linux,
+        Platform::Windows,
+        Platform::Macos,
+        Platform::Headless,
+    ];
+    /// No desktop session (`homeport web`): a desktop OS then reports
+    /// [`Platform::Headless`]. Call it before anything asks for the platform.
+    pub fn set_headless() {
+        HEADLESS.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     /// The system this process runs on. Plugins may branch on it at runtime,
     /// e.g. `if Platform::current() == Platform::Docker { … }`. Docker is
-    /// detected by `RPROXY_DOCKER=1` (set by the image) or the files container
+    /// detected by `HOMEPORT_DOCKER=1` (set by the image) or the files container
     /// runtimes create; other systems report their OS (`None` on e.g. FreeBSD).
     pub fn current() -> Option<Platform> {
         static CURRENT: std::sync::OnceLock<Option<Platform>> = std::sync::OnceLock::new();
         *CURRENT.get_or_init(|| {
             let container = cfg!(target_os = "linux")
-                && (std::env::var_os("RPROXY_DOCKER").is_some_and(|v| v == "1")
+                && (std::env::var_os("HOMEPORT_DOCKER").is_some_and(|v| v == "1")
                     || ["/.dockerenv", "/run/.containerenv"]
                         .iter()
                         .any(|f| std::path::Path::new(f).exists()));
+            let desktop_os = cfg!(any(target_os = "linux", windows, target_os = "macos"));
             if container {
                 Some(Platform::Docker)
+            } else if desktop_os && HEADLESS.load(std::sync::atomic::Ordering::Relaxed) {
+                Some(Platform::Headless)
             } else if cfg!(target_os = "linux") {
                 Some(Platform::Linux)
             } else if cfg!(windows) {
@@ -90,6 +110,7 @@ impl Platform {
             Platform::Linux => "Linux",
             Platform::Windows => "Windows",
             Platform::Macos => "macOS",
+            Platform::Headless => "web mode",
             Platform::Docker => "Docker",
         }
     }
@@ -102,23 +123,26 @@ pub struct Plugin {
     pub name: &'static str,
     pub description: &'static str,
     pub category: Category,
-    /// Plugin ids that must be enabled for this one to work.
-    pub requires: &'static [&'static str],
+    /// Plugins that must be enabled for this one to work: the crates whose
+    /// states, ops and slots it uses (`&[&plugin_servers::PLUGIN]`).
+    pub requires: &'static [&'static Plugin],
     /// Required plugins cannot be disabled.
     pub required: bool,
-    pub default_enabled: bool,
     /// Systems the plugin supports. The plugin writes its own code for each of
     /// them (`#[cfg(...)]` inside the crate); the crate must still compile on
     /// every system. On others the plugin is listed in Settings as unavailable
     /// and never set up.
     pub platforms: &'static [Platform],
+    /// `(file name, SQL)` of the scripts that create and change the plugin's
+    /// tables, run once each in name order: `homeport_kernel::migrations!()`.
+    pub migrations: &'static [(&'static str, &'static str)],
     pub setup: fn(&mut Setup) -> Result<()>,
 }
 impl Plugin {
     /// The usual values; a plugin states only what differs:
     /// `Plugin { id: "routing", name: "Routing", setup, ..Plugin::DEFAULT }`.
-    /// Off by default only with `default_enabled: false`; every system unless
-    /// `platforms` says otherwise.
+    /// Off until a preset or the user turns it on (unless `required`); every
+    /// system unless `platforms` says otherwise.
     pub const DEFAULT: Plugin = Plugin {
         id: "",
         name: "",
@@ -126,8 +150,8 @@ impl Plugin {
         category: categories::NETWORK,
         requires: &[],
         required: false,
-        default_enabled: true,
         platforms: Platform::ALL,
+        migrations: &[],
         setup: |_| Ok(()),
     };
     /// Whether the plugin runs on this system.
@@ -139,6 +163,9 @@ impl Plugin {
         let has = |list: &[Platform]| list.iter().all(|p| self.platforms.contains(p));
         if has(Platform::ALL) {
             return None;
+        }
+        if has(Platform::NATIVE) {
+            return Some("Not available in Docker".into());
         }
         if has(Platform::DESKTOP) {
             return Some("Desktop only".into());
@@ -163,9 +190,8 @@ mod tests {
             category: categories::NETWORK,
             requires: &[],
             required: false,
-            default_enabled: true,
             platforms,
-            setup: |_| Ok(()),
+            ..Plugin::DEFAULT
         }
     }
     #[test]

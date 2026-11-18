@@ -12,14 +12,14 @@
 //! The plugin does not decide where client traffic goes: Routing does. An exit
 //! node is this plugin plus the rule `*` → Direct (the page offers it); a relay
 //! node sends client traffic via its own selected server.
-use plugin_routing as routing;
-use plugin_servers as servers;
-use rproxy_kernel::{
+use homeport_kernel::{
     kit::{self, theme},
     mihomo::{Listener, ListenerKind, Reality, VlessListener, Xhttp},
     prelude::*,
     ui::{Column, ListEditor},
 };
+use plugin_routing as routing;
+use plugin_servers as servers;
 use std::net::IpAddr;
 
 pub mod site;
@@ -28,8 +28,8 @@ pub static PLUGIN: Plugin = Plugin {
     id: "vless-inbound",
     name: "VLESS inbound",
     description: "Let other devices connect to this device over VLESS with REALITY and XHTTP, disguised as your own website.",
-    requires: &["servers", "routing"],
-    default_enabled: false,
+    requires: &[&plugin_servers::PLUGIN, &plugin_routing::PLUGIN],
+    migrations: homeport_kernel::migrations!(),
     setup,
     ..Plugin::DEFAULT
 };
@@ -174,7 +174,7 @@ fn settings_problem(c: &Settings, keys: &Keys) -> Option<&'static str> {
 /// Share link of one client (VLESS + REALITY + XHTTP).
 pub fn link(snap: &Snapshot, client: &Client) -> String {
     let (c, k) = (snap.get(&CONFIG), snap.get(&KEYS));
-    // Ranged connection reuse and padding for xray-based clients (rproxy applies the same).
+    // Ranged connection reuse and padding for xray-based clients (homeport applies the same).
     let extra = r#"{"xPaddingBytes":"100-1000","xmux":{"maxConcurrency":"16-32","hMaxRequestTimes":"600-900","hMaxReusableSecs":"1800-3000"}}"#;
     let mut u = url::Url::parse("vless://placeholder").expect("static URL");
     let _ = u.set_username(&client.id.to_string());
@@ -240,10 +240,10 @@ fn setup(p: &mut Setup) -> Result<()> {
     p.list(&CLIENTS).validate(|_, c, _, others| {
         c.name = c.name.trim().to_owned();
         if c.name.is_empty() {
-            bail!("Enter a client name.");
+            bail!("Enter a subscription link name.");
         }
         if others.iter().any(|o| o.name.eq_ignore_ascii_case(&c.name)) {
-            bail!("A client with this name already exists.");
+            bail!("A subscription link with this name already exists.");
         }
         Ok(())
     });
@@ -274,7 +274,9 @@ fn setup(p: &mut Setup) -> Result<()> {
             w.update(&CONFIG, |c| c.enabled = on);
             Ok(())
         })
-        .await
+        .await?;
+        info!("VLESS inbound turned {}", if on { "on" } else { "off" });
+        Ok(())
     });
     p.core(|snap| {
         let Some(l) = listener(snap) else {
@@ -305,9 +307,21 @@ fn setup(p: &mut Setup) -> Result<()> {
             })
         },
         |cx: Cx, spec: site::Spec| async move {
-            site::run(spec, move |state| cx.set_live(&CERTIFICATE, state))
-                .await
-                .map_err(Error::msg)
+            site::run(spec, move |state| {
+                if *cx.live(&CERTIFICATE) != state {
+                    match &state {
+                        site::Certificate::Starting => {}
+                        site::Certificate::SelfSigned(why) => {
+                            info!("Self-signed certificate: {why}")
+                        }
+                        site::Certificate::Issued => info!("Let's Encrypt certificate in use"),
+                        site::Certificate::Failed(e) => warn!("Certificate: {e}"),
+                    }
+                }
+                cx.set_live(&CERTIFICATE, state)
+            })
+            .await
+            .map_err(Error::msg)
         },
     );
     ui(p);
@@ -322,19 +336,12 @@ fn status_rows(ui: &mut egui::Ui, cx: &mut UiCx) {
     let c = snap.get(&CONFIG);
     let pal = kit::colors(ui);
     let core = cx.core_status();
-    let line = |ui: &mut egui::Ui, icon: Icon, color: egui::Color32, label: &str, text: &str| {
-        kit::property_with(ui, label, |ui| {
-            ui.spacing_mut().item_spacing.x = 6.;
-            kit::icon(ui, icon, 14., color);
-            ui.add(egui::Label::new(egui::RichText::new(text).color(pal.foreground)).wrap());
-        });
-    };
     match core.listener_errors.get("vless") {
-        Some(e) => line(
+        Some(e) => kit::property_status(
             ui,
+            "Listener",
             Icon::Error,
             pal.danger,
-            "Port",
             &format!(
                 "{e}{}",
                 if cfg!(target_os = "linux") && c.port < 1024 {
@@ -344,14 +351,14 @@ fn status_rows(ui: &mut egui::Ui, cx: &mut UiCx) {
                 }
             ),
         ),
-        None if listener(&snap).is_some() && core.running() => line(
+        None if listener(&snap).is_some() && core.running() => kit::property_status(
             ui,
+            "Listener",
             Icon::Connected,
             pal.success,
-            "Port",
             &format!("Listening on port {}", c.port),
         ),
-        None => line(ui, Icon::Info, pal.muted, "Port", "Off"),
+        None => kit::property_status(ui, "Listener", Icon::Info, pal.muted, "Off"),
     }
     if c.website == Website::Builtin {
         let (icon, color, text) = match &*snap.live(&CERTIFICATE) {
@@ -376,31 +383,29 @@ fn status_rows(ui: &mut egui::Ui, cx: &mut UiCx) {
                 ),
             ),
         };
-        line(ui, icon, color, "Website", &text);
+        kit::property_status(ui, "Certificate", icon, color, &text);
     }
     if routing::route_for(&snap, CLIENTS_RULE) == routing::Route::Direct {
-        line(
+        kit::property_status(
             ui,
+            "Client traffic",
             Icon::Exit,
             pal.success,
-            "Client traffic",
             "Leaves from this device",
         );
         return;
     }
-    kit::property_with(ui, "Client traffic", |ui| {
-        ui.spacing_mut().item_spacing.x = 6.;
-        let via = if servers::selected(&snap).is_some() {
-            "goes via the selected server"
-        } else {
-            "is blocked: no server is selected"
-        };
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(format!("Follows Routing and {via}.")).color(pal.muted),
-            )
-            .wrap(),
-        );
+    // Where the main route sends it: the selected server, or what a plugin
+    // put in front of it (e.g. a chain exit), after the routing rules.
+    let (tone, icon, via) = servers::route_text(&snap);
+    let text = if tone == kit::Tone::Neutral {
+        format!("Follows Routing; {}", via.to_lowercase())
+    } else {
+        via.to_owned()
+    };
+    kit::property_status(ui, "Client traffic", icon, pal.tone(tone), &text);
+    // Under the text, at its start: side by side they overflow a phone.
+    kit::property_action(ui, |ui| {
         if kit::Button::ghost("Send directly")
             .tone(kit::Tone::Accent)
             .show(ui)
@@ -417,58 +422,70 @@ fn status_rows(ui: &mut egui::Ui, cx: &mut UiCx) {
 }
 
 fn ui(p: &mut Setup) {
-    p.page_fn(
-        PageSpec {
-            id: "vless-inbound",
-            title: "VLESS inbound",
-            icon: Icon::Shield,
-            order: 55,
-        },
-        |ui, cx| {
-            let snap = cx.snapshot().clone();
-            let c = (*snap.get(&CONFIG)).clone();
-            let clients = snap.get(&CLIENTS);
-            let counter = if c.enabled {
-                format!("On · {}", kit::plural(clients.len(), "client", "clients"))
-            } else {
-                "Off".into()
-            };
-            kit::page_header(ui, "VLESS inbound", &counter, |ui| {
-                let mut on = c.enabled;
-                if kit::toggle_named(ui, &mut on, "", "VLESS inbound").changed() {
-                    cx.submit("enabled", SetEnabled(on));
-                }
-            });
-
-            if let Some(why) = problem(&snap).filter(|_| c.enabled) {
-                kit::banner(ui, kit::Tone::Warning, why, None);
-            }
-            kit::page_scroll(ui, "vless-inbound", |ui| body(ui, cx, &c));
-        },
-    );
+    p.page::<VlessPage>(PageSpec {
+        title: "VLESS inbound",
+        icon: Icon::Shield,
+        order: 55,
+    });
     status_chip(p);
 }
 
-fn body(ui: &mut egui::Ui, cx: &mut UiCx, c: &Settings) {
+/// The client whose QR code is shown, kept per window.
+#[derive(Default)]
+struct VlessPage {
+    qr: Option<Id>,
+}
+impl Page for VlessPage {
+    fn ui(&mut self, ui: &mut egui::Ui, cx: &mut UiCx) {
+        let snap = cx.snapshot().clone();
+        let c = (*snap.get(&CONFIG)).clone();
+        let clients = snap.get(&CLIENTS);
+        let counter = if c.enabled {
+            format!("On · {}", kit::plural(clients.len(), "client", "clients"))
+        } else {
+            "Off".into()
+        };
+        cx.page_header(ui, &counter, |_, _| {});
+
+        if let Some(why) = problem(&snap).filter(|_| c.enabled) {
+            kit::banner(ui, kit::Tone::Warning, why, None);
+        }
+        let qr = std::cell::Cell::new(self.qr);
+        kit::page_scroll(ui, "vless-inbound", |ui| body(ui, cx, &c, &qr));
+        self.qr = qr.get();
+    }
+}
+
+fn body(ui: &mut egui::Ui, cx: &mut UiCx, c: &Settings, qr: &std::cell::Cell<Option<Id>>) {
     server_settings(ui, cx, c);
-    ui.add_space(theme::SECTION_GAP);
     kit::card(ui, |ui| status_rows(ui, cx));
-    ui.add_space(theme::SECTION_GAP);
     kit::section(
         ui,
         "Clients",
         Some("Each client gets its own link. Remove a client to revoke its access."),
     );
-    clients(ui, cx);
-    shown_client(ui, cx, c);
+    clients(ui, cx, qr);
+    shown_client(ui, cx, c, qr.get());
 }
 
 fn server_settings(ui: &mut egui::Ui, cx: &mut UiCx, c: &Settings) {
     kit::settings_card(ui, |ui| {
+        let mut on = c.enabled;
         kit::settings_row(
+            ui,
+            "VLESS inbound",
+            "Accept VLESS clients on this device",
+            |ui| {
+                if kit::toggle_named(ui, &mut on, "", "VLESS inbound").changed() {
+                    cx.submit("enabled", SetEnabled(on));
+                }
+            },
+        );
+        field_row(
             ui,
             "Domain",
             "Your domain; its DNS record points to this device",
+            true,
             |ui| {
                 if let Some(d) = kit::field(ui, "domain", &c.domain, "example.com", 190.) {
                     let d = d.trim().trim_end_matches('.').to_lowercase();
@@ -476,7 +493,7 @@ fn server_settings(ui: &mut egui::Ui, cx: &mut UiCx, c: &Settings) {
                 }
             },
         );
-        kit::settings_row(ui, "Port", "", |ui| {
+        field_row(ui, "Port", "", true, |ui| {
             if let Some(port) = kit::field(ui, "port", &c.port.to_string(), "443", 70.) {
                 match port.trim().parse::<u16>() {
                     Ok(p) if p > 0 => cx.update("port", &CONFIG, move |s| s.port = p),
@@ -500,10 +517,11 @@ fn server_settings(ui: &mut egui::Ui, cx: &mut UiCx, c: &Settings) {
             },
         );
         if c.website == Website::Own {
-            kit::settings_row(
+            field_row(
                 ui,
                 "Site address",
                 "Your HTTPS server for this domain, host:port",
+                true,
                 |ui| {
                     if let Some(own) =
                         kit::field(ui, "own-site", &c.own_site, "127.0.0.1:8443", 190.)
@@ -515,10 +533,11 @@ fn server_settings(ui: &mut egui::Ui, cx: &mut UiCx, c: &Settings) {
                 },
             );
         } else {
-            kit::settings_row(
+            field_row(
                 ui,
                 "Certificate email",
-                "Optional; Let's Encrypt writes here before a certificate expires",
+                "Let's Encrypt writes here before a certificate expires",
+                false,
                 |ui| {
                     if let Some(email) = kit::field(ui, "email", &c.email, "you@example.com", 190.)
                     {
@@ -541,7 +560,37 @@ fn server_settings(ui: &mut egui::Ui, cx: &mut UiCx, c: &Settings) {
     });
 }
 
-fn clients(ui: &mut egui::Ui, cx: &mut UiCx) {
+/// A settings row with a text field, marked as required or optional.
+fn field_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    help: &str,
+    required: bool,
+    control: impl FnOnce(&mut egui::Ui),
+) {
+    let pal = kit::colors(ui);
+    kit::settings_item(
+        ui,
+        label,
+        |ui| {
+            ui.horizontal(|ui| {
+                let r = ui.label(egui::RichText::new(label).color(pal.foreground));
+                if !help.is_empty() {
+                    r.on_hover_text(help);
+                }
+                let mark = if required { "Required" } else { "Optional" };
+                ui.label(
+                    egui::RichText::new(mark)
+                        .size(theme::SMALL)
+                        .color(pal.faint),
+                );
+            });
+        },
+        control,
+    );
+}
+
+fn clients(ui: &mut egui::Ui, cx: &mut UiCx, qr: &std::cell::Cell<Option<Id>>) {
     ListEditor::new(&CLIENTS)
         .unordered()
         .add_form(
@@ -555,16 +604,17 @@ fn clients(ui: &mut egui::Ui, cx: &mut UiCx) {
                     ui,
                     "name",
                     &mut c.name,
-                    "Client name, e.g. Phone",
+                    "Subscription link name, e.g. Phone",
                     width,
-                    false,
                 );
                 kit::submitted(ui, &r) && !c.name.trim().is_empty()
             },
         )
-        .column(Column::edit("Name", "Client name", |c: &mut Client| {
-            &mut c.name
-        }))
+        .column(Column::edit(
+            "Subscription link name",
+            "Subscription link name",
+            |c: &mut Client| &mut c.name,
+        ))
         .column(
             Column::custom("Link", 64., |ui, cx, client: &Client| {
                 let ready = valid_domain(&cx.get(&CONFIG).domain);
@@ -572,7 +622,7 @@ fn clients(ui: &mut egui::Ui, cx: &mut UiCx) {
                     ui.ctx().copy_text(link(cx.snapshot(), client));
                     cx.notify("Link copied");
                 }
-                let open = shown_qr(ui) == Some(client.id);
+                let open = qr.get() == Some(client.id);
                 if kit::icon_button(
                     ui,
                     Icon::QrCode,
@@ -581,7 +631,7 @@ fn clients(ui: &mut egui::Ui, cx: &mut UiCx) {
                 )
                 .clicked()
                 {
-                    ui.data_mut(|d| d.insert_temp(qr_key(), (!open).then_some(client.id)));
+                    qr.set((!open).then_some(client.id));
                 }
             })
             .right(),
@@ -595,10 +645,9 @@ fn clients(ui: &mut egui::Ui, cx: &mut UiCx) {
 }
 
 /// The QR code of one client, large enough for a phone camera.
-fn shown_client(ui: &mut egui::Ui, cx: &mut UiCx, c: &Settings) {
+fn shown_client(ui: &mut egui::Ui, cx: &mut UiCx, c: &Settings, qr: Option<Id>) {
     let snap = cx.snapshot().clone();
-    let client =
-        shown_qr(ui).and_then(|id| snap.get(&CLIENTS).iter().find(|c| c.id == id).cloned());
+    let client = qr.and_then(|id| snap.get(&CLIENTS).iter().find(|c| c.id == id).cloned());
     if let Some(client) = client.filter(|_| valid_domain(&c.domain)) {
         kit::card(ui, |ui| {
             ui.horizontal(|ui| {
@@ -619,14 +668,6 @@ fn shown_client(ui: &mut egui::Ui, cx: &mut UiCx, c: &Settings) {
             });
         });
     }
-}
-
-fn qr_key() -> egui::Id {
-    egui::Id::unique("vless-inbound-qr")
-}
-/// The client whose QR code is shown.
-fn shown_qr(ui: &egui::Ui) -> Option<Id> {
-    ui.data(|d| d.get_temp::<Option<Id>>(qr_key())).flatten()
 }
 
 fn status_chip(p: &mut Setup) {

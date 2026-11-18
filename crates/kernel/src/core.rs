@@ -63,6 +63,24 @@ pub(crate) fn compose(reg: &Registry, snap: &Snapshot) -> Result<(Config, Labels
     Ok((cfg, labels))
 }
 
+/// mihomo names a refused proxy by its place ("proxy 3: …"): say which
+/// server it is, and every other name in the user's words.
+fn refused(cfg: &Config, labels: &Labels, text: &str) -> String {
+    let at = text.to_ascii_lowercase().find("proxy ");
+    let named = at.and_then(|at| {
+        let rest = &text[at + "proxy ".len()..];
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        let proxy = cfg.proxies.get(rest[..digits].parse::<usize>().ok()?)?;
+        let tail = rest[digits..].strip_prefix(':')?;
+        Some(format!(
+            "{}{}:{tail}",
+            &text[..at],
+            labels.name(&proxy.name)
+        ))
+    });
+    labels.text(&named.unwrap_or_else(|| text.to_owned()))
+}
+
 /// The names the core reports in the user's words, from the fragments'
 /// [`labels`](mihomo::Fragment::labels) of the last composed configuration:
 /// servers instead of their ids, `*.youtube.com` instead of a regex.
@@ -195,6 +213,14 @@ impl Core {
         match result {
             Ok((m, report)) => {
                 let version = m.version().await.ok();
+                log::info!(
+                    "Mihomo {} started",
+                    version.as_deref().unwrap_or("(unknown version)")
+                );
+                if let Some(e) = &tun_error {
+                    log::warn!("TUN is off: {e}");
+                }
+                log_listeners(&BTreeMap::new(), &report.listener_errors);
                 *proc = Some(m);
                 self.set(|s| {
                     s.state = CoreState::Running;
@@ -218,9 +244,12 @@ impl Core {
             Ok(report) => Ok((m, report)),
             Err(e) => {
                 m.stop().await;
-                Err(Error::msg(e))
+                Err(self.refused(cfg, &e))
             }
         }
+    }
+    fn refused(&self, cfg: &Config, text: &str) -> Error {
+        Error::msg(refused(cfg, &self.labels.read().unwrap(), text))
     }
     /// Apply the configuration of `snap` if the core runs. While it is offline
     /// configuration stays editable and is applied on the next start.
@@ -250,8 +279,11 @@ impl Core {
                 None => Ok(()),
             };
         }
-        let report = m.apply(&cfg).await.map_err(Error::msg)?;
-        if self.status.read().unwrap().listener_errors != report.listener_errors {
+        let report = m.apply(&cfg).await.map_err(|e| self.refused(&cfg, &e))?;
+        log::debug!("Mihomo configuration applied");
+        let before = self.status.read().unwrap().listener_errors.clone();
+        if before != report.listener_errors {
+            log_listeners(&before, &report.listener_errors);
             self.set(|s| s.listener_errors = report.listener_errors);
         }
         Ok(())
@@ -260,6 +292,7 @@ impl Core {
         let mut proc = self.proc.lock().await;
         if proc.as_mut().is_some_and(|m| !m.alive()) {
             *proc = None;
+            log::error!("Mihomo stopped unexpectedly");
             self.set(|s| {
                 s.state = CoreState::Failed(
                     "Mihomo stopped. Restart the core to restore the saved configuration.".into(),
@@ -276,6 +309,7 @@ impl Core {
     pub async fn stop(&self) {
         if let Some(mut m) = self.proc.lock().await.take() {
             m.stop().await;
+            log::info!("Mihomo stopped");
             // Not running until started again.
             self.set(|s| s.state = CoreState::Starting);
         }
@@ -540,9 +574,39 @@ impl CoreApi {
     }
 }
 
+/// Listeners that went down or came back since `before`.
+fn log_listeners(before: &BTreeMap<String, String>, now: &BTreeMap<String, String>) {
+    for (name, e) in now.iter().filter(|(n, e)| before.get(*n) != Some(e)) {
+        log::warn!("Listener {name} is down: {e}");
+    }
+    for name in before.keys().filter(|n| !now.contains_key(*n)) {
+        log::info!("Listener {name} is up again");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_refused_proxy_is_named() {
+        let mut cfg = Config::default();
+        for name in ["p-a", "p-b"] {
+            cfg.proxies.push(mihomo::Proxy {
+                name: name.into(),
+                protocol: "http".into(),
+                server: "127.0.0.1".into(),
+                port: 1,
+                options: Default::default(),
+                dialer: None,
+            });
+        }
+        let labels = Labels::new(&cfg, vec![("p-b".into(), "Amsterdam".into())]);
+        assert_eq!(
+            refused(&cfg, &labels, "proxy 1: invalid REALITY public key"),
+            "Amsterdam: invalid REALITY public key"
+        );
+        assert_eq!(refused(&cfg, &labels, "proxy 7: bad"), "proxy 7: bad");
+    }
     #[test]
     fn labels_replace_whole_words_only() {
         let cfg = Config::default();

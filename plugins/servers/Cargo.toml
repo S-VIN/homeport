@@ -5,9 +5,11 @@ edition = "2024"
 publish = false
 
 [dependencies]
-rproxy-kernel = { path = "../../crates/kernel" }
+homeport-kernel = { path = "../../crates/kernel" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 percent-encoding = "2.3.2"
+tokio = { workspace = true }
+reqwest = { workspace = true }

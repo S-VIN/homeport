@@ -13,21 +13,22 @@
 //! does not answer (order: exit → WARP → blocked). The entry can also be "this
 //! machine": on a node that serves clients, the exit is then dialed directly,
 //! so client traffic never leaves from the node's own address.
-use kit::Tone;
-use plugin_servers as servers;
-use rproxy_kernel::{
+use homeport_kernel::{
     kit::{self, theme},
     mihomo,
     prelude::*,
     ui::{Column, ListEditor},
 };
+use kit::Tone;
+use plugin_servers as servers;
 use std::time::Duration;
 
 pub static PLUGIN: Plugin = Plugin {
     id: "chain-exit",
     name: "Chain exit",
     description: "Send proxied traffic through the current server, then one stable exit server.",
-    requires: &["servers"],
+    requires: &[&plugin_servers::PLUGIN],
+    migrations: homeport_kernel::migrations!(),
     setup,
     ..Plugin::DEFAULT
 };
@@ -94,7 +95,7 @@ pub struct SetUpWarp;
 impl Op for SetUpWarp {
     type Reply = ();
     fn job(&self) -> Option<JobSpec> {
-        Some(JobSpec::new("Set up WARP").page("chain-exit"))
+        Some(JobSpec::new("Set up WARP").page(&PLUGIN))
     }
 }
 /// Forget the WARP device.
@@ -142,6 +143,19 @@ pub fn plan(snap: &Snapshot) -> Option<Plan> {
 fn through_entry(snap: &Snapshot) -> bool {
     snap.get(&SETTINGS).entry == Entry::Selected
 }
+/// While traffic goes server → exit, servers are tested the same way: each
+/// through the exit (`via-<server>`), so a rating says how the chain works.
+fn tests_through_exit(snap: &Snapshot) -> bool {
+    through_entry(snap)
+        && plan(snap).is_some_and(|p| match &p {
+            Plan::Exit(e) | Plan::ExitThenWarp(e) => proxy(&e.link).is_ok(),
+            Plan::Warp => true,
+        })
+}
+/// The mihomo name of the exit dialed through server `id`.
+fn via(id: Id) -> String {
+    format!("via-{id}")
+}
 
 /// Use an exit server, or turn the second hop off with `None`.
 pub struct Use(pub Option<Id>);
@@ -154,7 +168,7 @@ pub struct CheckExit;
 impl Op for CheckExit {
     type Reply = u32;
     fn job(&self) -> Option<JobSpec> {
-        Some(JobSpec::new("Test proxy chain").quiet().page("chain-exit"))
+        Some(JobSpec::new("Test proxy chain").quiet().page(&PLUGIN))
     }
 }
 
@@ -222,6 +236,9 @@ fn setup(p: &mut Setup) -> Result<()> {
     p.on(redial_on_new_entry).latest();
     p.core(fragment);
     p.hook(&servers::ROUTE, |snap, _| route(snap));
+    p.hook(&servers::TEST_PATH, |snap, s| {
+        tests_through_exit(snap).then(|| via(s.id))
+    });
     ui(p);
     Ok(())
 }
@@ -242,6 +259,7 @@ async fn set_up_warp(cx: Cx, _: SetUpWarp) -> Result<()> {
     })
     .await?;
     cx.set_live(&PROBE, None);
+    info!("WARP account registered");
     cx.summary("WARP is ready");
     cx.spawn(CheckExit)?;
     Ok(())
@@ -254,6 +272,7 @@ async fn remove_warp(cx: Cx, _: RemoveWarp) -> Result<()> {
         Ok(())
     })
     .await?;
+    info!("WARP removed");
     cx.set_live(&PROBE, None);
     Ok(())
 }
@@ -267,6 +286,11 @@ async fn use_exit(cx: Cx, Use(id): Use) -> Result<()> {
         Ok(())
     })
     .await?;
+    let exit = id.and_then(|id| cx.get(&EXITS).iter().find(|e| e.id == id).cloned());
+    match exit {
+        Some(e) => info!("Exit server {} in use", e.name),
+        None => info!("Exit server off"),
+    }
     cx.set_live(&PROBE, None);
     if id.is_some() {
         cx.spawn(CheckExit)?;
@@ -287,13 +311,21 @@ async fn check_exit(cx: Cx, _: CheckExit) -> Result<u32> {
         .delay(plan.target(), mihomo::PROBE_URL, 6000)
         .await
         .map_err(|e| e.message);
+    // When it starts or stops answering, not on every check.
+    let before = (*cx.live(&PROBE)).as_ref().map(|(r, _)| r.is_ok());
+    match &result {
+        Err(e) if before != Some(false) => warn!("The exit server does not answer: {e}"),
+        Ok(ms) if before == Some(false) => info!("The exit server answers again ({ms} ms)"),
+        _ => {}
+    }
     cx.set_live(&PROBE, Some((result.clone(), now())));
     result.map_err(|_| Error::msg("The exit did not answer."))
 }
 
 /// The exit keeps its transport connections (XHTTP reuse) open for a long
-/// time. A new entry or a disconnect must take effect now: rebuild the exit
-/// so new connections are dialed through the current entry, or not at all.
+/// time. A new entry must take effect now: rebuild the exit so new
+/// connections are dialed through the current entry ([`route`] blocks
+/// without one).
 async fn redial_on_new_entry(cx: Cx, _: servers::SelectionChanged) -> Result<()> {
     let snap = cx.snapshot();
     if plan(&snap).is_some() && through_entry(&snap) {
@@ -314,20 +346,38 @@ fn fragment(snap: &Snapshot) -> Fragment {
         ],
         ..Fragment::default()
     };
-    if let Plan::Exit(e) | Plan::ExitThenWarp(e) = &plan {
-        let Ok(px) = proxy(&e.link) else { return f };
-        f.proxies.push(mihomo::Proxy {
-            name: EXIT.into(),
+    let exit = match &plan {
+        Plan::Exit(e) | Plan::ExitThenWarp(e) => match proxy(&e.link) {
+            Ok(px) => Some(px),
+            Err(_) => return f,
+        },
+        Plan::Warp => None,
+    };
+    let account = snap.get(&WARP_ACCOUNT);
+    // The exit as a mihomo proxy dialed through `dial`.
+    let hop = |name: String, dial: Option<Target>| match &exit {
+        Some(px) => Some(mihomo::Proxy {
+            name,
             protocol: px.protocol.to_string(),
-            server: px.server,
+            server: px.server.clone(),
             port: px.port,
-            options: px.options,
-            dialer: dial.clone(),
-        });
-    }
-    if let (Plan::Warp | Plan::ExitThenWarp(_), Some(account)) = (&plan, &*snap.get(&WARP_ACCOUNT))
-    {
+            options: px.options.clone(),
+            dialer: dial,
+        }),
+        None => (*account).as_ref().map(|a| warp::proxy(&name, a, dial)),
+    };
+    f.proxies
+        .extend(hop(EXIT.into(), dial.clone()).filter(|_| exit.is_some()));
+    if let (Plan::Warp | Plan::ExitThenWarp(_), Some(account)) = (&plan, &*account) {
         f.proxies.push(warp::proxy(WARP, account, dial));
+    }
+    // Every server as the entry, for its tests (see [`tests_through_exit`]).
+    if tests_through_exit(snap) {
+        for s in snap.get(&servers::SERVERS).iter() {
+            f.proxies
+                .extend(hop(via(s.id), Some(Target::Proxy(s.id.to_string()))));
+            f.labels.push((via(s.id), format!("{} → exit", s.name)));
+        }
     }
     if matches!(plan, Plan::ExitThenWarp(_)) {
         f.groups.push(mihomo::Group {
@@ -343,11 +393,14 @@ fn fragment(snap: &Snapshot) -> Fragment {
     f
 }
 
-/// Fail closed: an exit in use that cannot be built blocks instead of skipping it.
+/// Fail closed: an exit in use that cannot be built, or that dials through
+/// an entry while none is connected, blocks instead of skipping it. The
+/// block lands in the same commit as the disconnect, not after a redial.
 fn route(snap: &Snapshot) -> Option<Target> {
     let plan = plan(snap)?;
     let broken = matches!(&plan, Plan::Exit(e) | Plan::ExitThenWarp(e) if proxy(&e.link).is_err());
-    Some(if broken {
+    let no_entry = through_entry(snap) && snap.get(&servers::SELECTED).is_none();
+    Some(if broken || no_entry {
         Target::Reject
     } else if matches!(plan, Plan::ExitThenWarp(_)) {
         Target::Group(EXIT_ROUTE.into())
@@ -401,7 +454,6 @@ fn route_line(ui: &mut egui::Ui, snap: &Snapshot, plan: &Plan) {
 fn ui(p: &mut Setup) {
     p.page_fn(
         PageSpec {
-            id: "chain-exit",
             title: "Chain exit",
             icon: Icon::Exit,
             order: 45,
@@ -415,7 +467,7 @@ fn ui(p: &mut Setup) {
                 None if exits.is_empty() && snap.get(&WARP_ACCOUNT).is_none() => String::new(),
                 None => "Off".into(),
             };
-            kit::page_header(ui, "Chain exit", &counter, |ui| {
+            cx.page_header(ui, &counter, |ui, cx| {
                 if current.is_some() {
                     cx.job_button(ui, Icon::Checks, "Test", cx.core_status().running(), || {
                         CheckExit
@@ -437,11 +489,9 @@ fn body(ui: &mut egui::Ui, cx: &mut UiCx, snap: &Snapshot, current: Option<&Plan
             let (text, tone) = latency_text(snap);
             kit::tone_text(ui, text, tone);
         });
-        ui.add_space(theme::SECTION_GAP);
     }
     // Like every page: the add bar and list first, then the settings.
     exits(ui, cx);
-    ui.add_space(theme::SECTION_GAP);
     route_settings(ui, cx, snap, &settings);
 }
 
@@ -519,12 +569,11 @@ fn exits(ui: &mut egui::Ui, cx: &mut UiCx) {
                     &mut e.link,
                     "Exit server link (vless://, hysteria2://…)",
                     width,
-                    false,
                 );
                 kit::submitted(ui, &r) && !e.link.trim().is_empty()
             },
         )
-        .leading(16., |ui, cx, e: &Exit| {
+        .leading("", 16., |ui, cx, e: &Exit| {
             let pal = kit::colors(ui);
             let on = *cx.get(&ACTIVE) == Some(e.id);
             kit::icon(
@@ -579,7 +628,7 @@ fn status(p: &mut Setup) {
     p.fill(&PANELS, "exit", 15, |ui, cx, _| {
         let snap = cx.snapshot().clone();
         let Some(e) = plan(&snap) else { return };
-        rproxy_kernel::shell::panel_title_page(ui, cx, "Chain exit", "chain-exit");
+        homeport_kernel::shell::panel_title_page(ui, cx, "Chain exit", &PLUGIN);
         route_line(ui, &snap, &e);
         let (text, tone) = latency_text(&snap);
         kit::tone_text(ui, text, tone);

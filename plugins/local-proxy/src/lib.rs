@@ -2,7 +2,7 @@
 //! One local HTTP + SOCKS5 proxy (mihomo `mixed`) with optional login, the
 //! system proxy pointed at it and TUN. A port that cannot bind is reported on
 //! the page; the rest keeps working.
-use rproxy_kernel::{
+use homeport_kernel::{
     kit::{self, theme},
     mihomo::{self, Listener, ListenerKind},
     prelude::*,
@@ -113,7 +113,7 @@ impl FromStr for Listen {
 }
 
 /// Why the port is not running (from the last core apply).
-pub fn error(status: &rproxy_kernel::core::CoreStatus) -> Option<String> {
+pub fn error(status: &homeport_kernel::core::CoreStatus) -> Option<String> {
     status.listener_errors.get(LISTENER).cloned()
 }
 
@@ -144,12 +144,18 @@ fn validate(p: &mut Proxy, previous: &Proxy) -> Result<()> {
 }
 
 async fn save_proxy(cx: Cx, SaveProxy(mut next): SaveProxy) -> Result<()> {
-    cx.write(move |w| {
-        validate(&mut next, &w.get(&PROXY))?;
-        w.set(&PROXY, next);
-        Ok(())
-    })
-    .await
+    let p = cx
+        .write(move |w| {
+            validate(&mut next, &w.get(&PROXY))?;
+            w.set(&PROXY, next.clone());
+            Ok(next)
+        })
+        .await?;
+    match p.enabled {
+        true => info!("Proxy port {}:{} saved", p.listen.0, p.port),
+        false => info!("Proxy port turned off"),
+    }
+    Ok(())
 }
 
 // Keep mutation ownership inside the blocking worker. Cancelling a service
@@ -186,12 +192,14 @@ fn setup(p: &mut Setup) -> Result<()> {
     p.service("system-proxy", system_proxy_address, system_proxy)
         .on_stop(|cx: Cx, _| async move {
             let result = apply_system_proxy(journal(&cx), None).await;
+            if result.is_ok() {
+                info!("System proxy restored");
+            }
             cx.set_live(&SYSTEM_PROXY, None);
             result.map(drop).map_err(Error::msg)
         });
     p.core(fragment);
     p.page::<ProxyPage>(PageSpec {
-        id: "local-proxy",
         title: "Local proxy",
         icon: Icon::Listeners,
         order: 50,
@@ -201,13 +209,16 @@ fn setup(p: &mut Setup) -> Result<()> {
     Ok(())
 }
 
-/// What rproxy changed in the system proxy settings, kept across a crash or logoff.
+/// What homeport changed in the system proxy settings, kept across a crash or logoff.
 fn journal(cx: &Cx) -> std::path::PathBuf {
     cx.data_dir().join("system-proxy.json")
 }
 
 async fn read_tun(cx: Cx, _: ReadTun) -> Result<()> {
     let up = cx.core().tun_enabled().await.ok();
+    if up.is_some() && up != *cx.live(&TUN_UP) {
+        info!("TUN is {}", if up == Some(true) { "up" } else { "down" });
+    }
     cx.set_live(&TUN_UP, up);
     Ok(())
 }
@@ -219,6 +230,7 @@ async fn restore_after_crash(cx: Cx, _: Started) -> Result<()> {
         apply_system_proxy(journal, None)
             .await
             .map_err(Error::msg)?;
+        info!("System proxy left by the last run restored");
     }
     Ok(())
 }
@@ -240,6 +252,10 @@ async fn system_proxy(cx: Cx, address: std::net::SocketAddr) -> Result<()> {
                     Err("The proxy port is not running. Previous system proxy settings are restored until it starts.".into())
                 }
             });
+            match &result {
+                Ok(_) => info!("System proxy set to {address}"),
+                Err(e) => warn!("System proxy not set: {e}"),
+            }
             cx.set_live(&SYSTEM_PROXY, Some(result));
         }
         if changes.changed().await.is_err() {
@@ -248,7 +264,7 @@ async fn system_proxy(cx: Cx, address: std::net::SocketAddr) -> Result<()> {
     }
 }
 
-/// The listener, and the tunnel with its DNS when traffic capture is on.
+/// The listener, and the tunnel when traffic capture is on.
 fn fragment(snap: &Snapshot) -> Fragment {
     let p = snap.get(&PROXY);
     let tunnel = (p.tun && tun_control()).then_some(mihomo::Tun {
@@ -269,14 +285,9 @@ fn fragment(snap: &Snapshot) -> Fragment {
         optional: true,
     });
     let mut f = Fragment::listeners(listener);
-    if tunnel.is_some() {
-        // The tunnel answers DNS itself; the system resolver is the fallback.
-        f.dns = Some(mihomo::Dns {
-            enable: true,
-            nameservers: vec!["https://1.1.1.1/dns-query".into(), "system".into()],
-        });
-        f.sniff = true;
-    }
+    // Domain rules see names in captured traffic. DNS is the DNS plugin's:
+    // without it queries leave through the tunnel to the system's server.
+    f.sniff = tunnel.is_some();
     f.tun = tunnel;
     f
 }
@@ -301,7 +312,7 @@ fn listeners_chip(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
 
 fn listeners_panel(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
     let pal = kit::colors(ui);
-    rproxy_kernel::shell::panel_title_page(ui, cx, "Local proxy", "local-proxy");
+    homeport_kernel::shell::panel_title_page(ui, cx, "Local proxy", &PLUGIN);
     let p = cx.get(&PROXY);
     if !p.enabled {
         kit::hint(ui, "Off");
@@ -330,20 +341,20 @@ fn listeners_panel(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
 }
 
 fn copy_button(ui: &mut egui::Ui, cx: &mut UiCx, p: &Proxy) {
-    if kit::icon_button(ui, Icon::Copy, "Copy address", true).clicked() {
+    if kit::icon_button(ui, Icon::Copy, "Copy address", p.enabled).clicked() {
         ui.ctx()
             .copy_text(mihomo::local_address(p.listen.0, p.port).to_string());
         cx.notify("Address copied");
     }
 }
 
-/// Lock icon and "Login" / "No auth".
+/// Lock icon and "Login" / "No login".
 fn auth_label(ui: &mut egui::Ui, p: &Proxy) {
     let pal = kit::colors(ui);
     let (icon, text) = if p.login.is_some() {
         (Icon::Lock, "Login")
     } else {
-        (Icon::Unlock, "No auth")
+        (Icon::Unlock, "No login")
     };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.;
@@ -405,13 +416,18 @@ struct ProxyPage {
 impl Page for ProxyPage {
     fn ui(&mut self, ui: &mut egui::Ui, cx: &mut UiCx) {
         let saved = (*cx.get(&PROXY)).clone();
-        kit::page_header(ui, "Local proxy", "", |_| {});
+        cx.page_header(ui, "", |_, _| {});
         kit::page_scroll(ui, "local-proxy", |ui| {
             self.proxy_card(ui, cx, &saved);
             device_card(ui, cx, &saved);
         });
     }
 }
+
+/// Widths of the address fields; a single field spans both.
+const IP: f32 = 140.;
+const PORT: f32 = 72.;
+const FIELD: f32 = IP + theme::HORIZONTAL_GAP + PORT;
 
 impl ProxyPage {
     fn proxy_card(&mut self, ui: &mut egui::Ui, cx: &mut UiCx, saved: &Proxy) {
@@ -433,11 +449,6 @@ impl ProxyPage {
         kit::settings_card(ui, |ui| {
             let mut on = saved.enabled;
             kit::settings_row(ui, "Proxy", "HTTP and SOCKS5 on one port", |ui| {
-                ui.spacing_mut().item_spacing.x = theme::HORIZONTAL_GAP;
-                // Copy before the switch: every switch ends at the same edge.
-                if saved.enabled {
-                    copy_button(ui, cx, saved);
-                }
                 if kit::toggle_named(ui, &mut on, "", "Proxy").changed() {
                     cx.update("enabled", &PROXY, move |p| p.enabled = on);
                 }
@@ -448,9 +459,11 @@ impl ProxyPage {
                     "Address",
                     "0.0.0.0 accepts other devices on your network",
                     |ui| {
-                        let r = kit::input(ui, "ip", &mut draft.ip, "127.0.0.1", 140., false);
+                        // The copy button leads, so the fields end where the others do.
+                        copy_button(ui, cx, saved);
+                        let r = kit::input(ui, "ip", &mut draft.ip, "127.0.0.1", IP);
                         enter |= kit::submitted(ui, &r);
-                        let r = kit::input(ui, "port", &mut draft.port, "Port", 72., false);
+                        let r = kit::input(ui, "port", &mut draft.port, "Port", PORT);
                         enter |= kit::submitted(ui, &r);
                     },
                 );
@@ -459,7 +472,7 @@ impl ProxyPage {
                 });
                 if draft.auth {
                     kit::settings_row(ui, "Login", "", |ui| {
-                        let r = kit::input(ui, "login", &mut draft.login, "user", 218., false);
+                        let r = kit::input(ui, "login", &mut draft.login, "user", FIELD);
                         enter |= kit::submitted(ui, &r);
                     });
                     let has = saved.login.is_some();
@@ -470,7 +483,7 @@ impl ProxyPage {
                     };
                     kit::settings_row(ui, "Password", help, |ui| {
                         let hint = if has { "Unchanged" } else { "Password" };
-                        let r = kit::input(ui, "password", &mut draft.password, hint, 218., true);
+                        let r = kit::password(ui, "password", &mut draft.password, hint, FIELD);
                         enter |= kit::submitted(ui, &r);
                     });
                 }
@@ -498,14 +511,19 @@ impl ProxyPage {
             let dirty = draft != Draft::of(saved);
             if dirty {
                 ui.add_space(theme::SPACE_M);
+                // On the right, under the controls they apply.
                 let (save, cancel) = ui
-                    .horizontal(|ui| {
-                        let save = kit::Button::primary("Save")
-                            .enabled(!busy)
-                            .show(ui)
-                            .clicked();
-                        (save, kit::Button::ghost("Cancel").show(ui).clicked())
-                    })
+                    .allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), theme::CONTROL),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let save = kit::Button::primary("Save")
+                                .enabled(!busy)
+                                .show(ui)
+                                .clicked();
+                            (save, kit::Button::ghost("Cancel").show(ui).clicked())
+                        },
+                    )
                     .inner;
                 ui.add_space(theme::SPACE_M);
                 if cancel {
@@ -528,7 +546,7 @@ impl ProxyPage {
     }
 }
 
-/// System proxy and TUN: how this computer itself uses rproxy.
+/// System proxy and TUN: how this computer itself uses homeport.
 fn device_card(ui: &mut egui::Ui, cx: &mut UiCx, p: &Proxy) {
     if Platform::is_docker() {
         kit::tone_text(
@@ -573,7 +591,7 @@ fn device_card(ui: &mut egui::Ui, cx: &mut UiCx, p: &Proxy) {
         kit::settings_row(
             ui,
             "TUN mode",
-            "Route every app through rproxy with a virtual network interface (TUN)",
+            "Route every app through homeport with a virtual network interface (TUN)",
             |ui| {
                 ui.add_enabled_ui(!cx.pending("tun"), |ui| {
                     if kit::toggle_named(ui, &mut tun, "", "TUN mode").changed() {
@@ -588,7 +606,9 @@ fn device_card(ui: &mut egui::Ui, cx: &mut UiCx, p: &Proxy) {
                 "Applying TUN mode… Confirm the system authorization dialog if prompted.",
                 kit::Tone::Neutral,
             );
-        } else if let rproxy_kernel::ui::Request::Done(Err(e)) = cx.request::<()>("tun") {
+        } else if let homeport_kernel::ui::Request::Done(Err(e)) =
+            cx.request::<Update<Proxy>>("tun")
+        {
             kit::tone_text(ui, e, kit::Tone::Danger);
         } else if p.tun {
             match (cx.core_status().tun_error, *cx.live(&TUN_UP)) {

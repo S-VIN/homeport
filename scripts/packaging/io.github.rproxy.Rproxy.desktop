@@ -1,9 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=rproxy
-Comment=Proxy manager
-Exec=rproxy
-Icon=io.github.rproxy.Rproxy
-Terminal=false
-Categories=Network;
-StartupWMClass=io.github.rproxy.Rproxy

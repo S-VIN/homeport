@@ -1,1 +1,0 @@
-NotoColorEmoji.ttf is Google's Noto Color Emoji in COLRv1 format (Fedora package google-noto-color-emoji-fonts-20260921, file Noto-COLRv1.ttf). It is licensed under the SIL Open Font License; see OFL.txt. egui draws its color glyphs on demand (epaint feature `color_fonts`).

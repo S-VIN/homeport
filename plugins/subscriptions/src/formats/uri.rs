@@ -4,8 +4,8 @@ use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE},
 };
+use homeport_kernel::prelude::*;
 use plugin_servers::{Proxy, is_link};
-use rproxy_kernel::prelude::*;
 
 fn invalid(m: impl Into<String>) -> Error {
     Error::msg(m)
@@ -32,14 +32,32 @@ pub fn decode_base64(body: &str) -> Result<String> {
     String::from_utf8(bytes).map_err(|_| invalid("Subscription is not UTF-8."))
 }
 
-/// Parse supported share links without dropping any entries from mixed lists.
+/// Parse share links, one per line; a link that cannot be read is skipped
+/// (see [`super::usable`]).
 pub fn parse_links(body: &str) -> Result<Vec<Proxy>> {
-    plain(body)
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(Proxy::from_link)
-        .collect()
+    let links = plain(body).lines().map(str::trim).filter(|s| !s.is_empty());
+    super::usable(
+        links
+            .enumerate()
+            .map(|(i, link)| (link_name(link, i), Proxy::from_link(link).map(|p| vec![p]))),
+    )
+}
+/// The name in a link's `#fragment`, else its line number.
+fn link_name(link: &str, i: usize) -> String {
+    let name = link.rsplit_once('#').map(|(_, name)| {
+        let (mut out, bytes) = (Vec::new(), name.as_bytes());
+        let mut at = 0;
+        while at < bytes.len() {
+            let hex = name.get(at + 1..at + 3).filter(|_| bytes[at] == b'%');
+            match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                Some(b) => (out.push(b), at += 3),
+                None => (out.push(bytes[at]), at += 1),
+            };
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    });
+    name.filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("Line {}", i + 1))
 }
 
 pub(crate) fn register(p: &mut Setup) {
@@ -59,6 +77,6 @@ pub(crate) fn register(p: &mut Setup) {
     p.handle(|_: Cx, op: Parse| async move { parse_links(&op.body) })
         .claim(|_, op| is_link(plain(&op.body)).then_some(Claim::content(80)));
     p.hook(&LINK, |_, raw| {
-        is_link(raw).then(|| Proxy::from_link(raw).map(drop).map_err(|e| e.message))
+        is_link(raw).then(|| Proxy::from_link(raw).map(drop))
     });
 }
