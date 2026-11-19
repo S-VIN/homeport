@@ -92,13 +92,17 @@ pub(super) fn plugin_manager(ui: &mut egui::Ui, cx: &mut UiCx) {
                         }
                     },
                     |ui| {
-                        if restart {
-                            kit::badge(ui, "Restart required", Tone::Warning);
-                        }
                         if unsupported.is_some() {
                             return;
                         }
-                        changed = kit::toggle_named(ui, &mut on, "", pl.name).changed();
+                        let toggle = kit::toggle_named(ui, &mut on, "", pl.name);
+                        changed = toggle.changed();
+                        // Waiting for a restart: a dot in room kept for it, so rows never reflow.
+                        let (dot, _) = ui.allocate_exact_size(vec2(8., 8.), egui::Sense::hover());
+                        if restart {
+                            ui.painter().circle_filled(dot.center(), 3.5, p.warning);
+                            toggle.on_hover_text("Applies after a restart");
+                        }
                     },
                 );
                 if changed && let Err(e) = cx.k.set_plugin(pl.id, on) {

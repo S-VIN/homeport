@@ -456,6 +456,11 @@ pub const ROUTED: &str = "routed";
 pub fn internal_listener(name: &str) -> bool {
     name == ROUTED || name.starts_with("checks-")
 }
+/// Groups of homeport's check lanes (`test-i`, see [`System`]).
+pub fn internal_group(name: &str) -> bool {
+    name.strip_prefix("test-")
+        .is_some_and(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit()))
+}
 
 /// Kernel-owned additions: isolated check lanes. Lane `i` is the SOCKS listener
 /// `checks-i` on `check_ports[i]`, routed to the select group `test-i`.

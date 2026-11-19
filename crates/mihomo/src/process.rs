@@ -251,14 +251,18 @@ impl Controller {
             .await
             .map_err(|e| e.to_string())
     }
-    /// The core's live log, one JSON object per line (`{"type":"info","payload":"…"}`);
-    /// the response streams until the core stops.
-    pub async fn logs(&self, level: &str) -> Result<reqwest::Response> {
-        let url = self.url(&format!("logs?level={level}"));
+    /// The core's live log from `level` up; it follows until the core stops.
+    pub async fn logs(&self, level: LogLevel) -> Result<LogStream> {
+        let url = self.url(&format!("logs?level={}", level.as_str()));
         // The client's short timeout is for requests; a stream stays open while
         // the core runs (a day here, then the reader opens a new one).
-        self.send(self.http.get(url).timeout(Duration::from_secs(86_400)))
-            .await
+        let response = self
+            .send(self.http.get(url).timeout(Duration::from_secs(86_400)))
+            .await?;
+        Ok(LogStream {
+            response,
+            raw: Vec::new(),
+        })
     }
     pub async fn close_connection(&self, id: &str) -> Result<()> {
         self.send(self.http.delete(self.url(&format!("connections/{id}"))))
@@ -969,5 +973,54 @@ mod tests {
         assert!(newer("1.20.0", "1.19.99"));
         assert!(!newer("1.19.32", "Mihomo Meta v1.19.32"));
         assert!(!newer("garbage", "1.19.32"));
+    }
+}
+
+/// How serious a line of the core's log is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warning,
+    #[serde(alias = "fatal")]
+    Error,
+}
+impl LogLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+}
+/// One line of the core's log.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct LogLine {
+    #[serde(rename = "type")]
+    pub level: LogLevel,
+    pub payload: String,
+}
+/// The core's live log ([`Controller::logs`]).
+pub struct LogStream {
+    response: reqwest::Response,
+    /// Bytes of the line not yet complete: a character may span two chunks.
+    raw: Vec<u8>,
+}
+impl LogStream {
+    /// The next line; `None` once the core stops. Cancel-safe: nothing read is lost.
+    pub async fn next(&mut self) -> Option<LogLine> {
+        loop {
+            while let Some(end) = self.raw.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = self.raw.drain(..=end).collect();
+                if let Ok(line) = serde_json::from_slice(&line) {
+                    return Some(line);
+                }
+            }
+            let chunk = self.response.chunk().await.ok()??;
+            self.raw.extend_from_slice(&chunk);
+        }
     }
 }

@@ -17,19 +17,22 @@ pub(crate) fn register(p: &mut homeport_kernel::prelude::Setup) {
     amnezia::register(p);
 }
 
-/// The servers of a document that could be read; the others are skipped with
-/// one warning in the log. Fails only when there were servers and none could
-/// be read (the last working list is kept then). `name` labels each server.
+/// The servers of a document that could be read; the others are counted and
+/// skipped with one warning in the log. Fails only when there were servers and
+/// none could be read (the last working list is kept then). `name` labels each server.
 pub fn usable(
     items: impl IntoIterator<Item = (String, homeport_kernel::Result<Vec<plugin_servers::Proxy>>)>,
-) -> homeport_kernel::Result<Vec<plugin_servers::Proxy>> {
+) -> homeport_kernel::Result<crate::Parsed> {
     const NAMED: usize = 3;
-    let (mut good, mut bad, mut read) = (Vec::new(), Vec::new(), 0);
+    let (mut good, mut bad, mut why, mut read) = (Vec::new(), Vec::new(), Vec::new(), 0);
     for (name, item) in items {
         read += 1;
         match item {
             Ok(p) => good.extend(p),
-            Err(e) => bad.push(format!("{name}: {e}")),
+            Err(e) => {
+                bad.push(format!("{name}: {e}"));
+                why.push(e.message);
+            }
         }
     }
     if good.is_empty() && !bad.is_empty() {
@@ -47,5 +50,20 @@ pub fn usable(
             bad[..bad.len().min(NAMED)].join("; ")
         );
     }
-    Ok(good)
+    Ok(crate::Parsed {
+        proxies: good,
+        skipped: why,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unreadable_servers_are_counted() {
+        let parsed = super::uri::parse_links(
+            "vless://00000000-0000-0000-0000-000000000001@example.org:443?security=tls#A\nnot-a-link\nss://broken",
+        )
+        .unwrap();
+        assert_eq!((parsed.proxies.len(), parsed.skipped.len()), (1, 2));
+    }
 }

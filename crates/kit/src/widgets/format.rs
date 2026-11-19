@@ -8,23 +8,25 @@ pub fn age(time: u64) -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     match now.saturating_sub(time) {
-        s @ 0..=59 => {
-            if s < 5 {
-                "just now".into()
-            } else {
-                format!("{s}\u{a0}s ago")
-            }
-        }
-        s @ 60..=3599 => format!("{}\u{a0}min ago", s / 60),
-        s @ 3600..=86399 => format!("{}\u{a0}h ago", s / 3600),
-        s => format!("{}\u{a0}d ago", s / 86400),
+        0..5 => "just now".into(),
+        s => format!("{} ago", duration(s)),
     }
 }
 
-/// Rating color: red < 40 ≤ amber < 75 ≤ green.
-pub fn rating_color(ui: &Ui, rating: Option<u8>) -> Color32 {
+/// A length of time in its largest unit: "45 s", "3 min", "2 h", "5 d".
+pub fn duration(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}\u{a0}s"),
+        60..3600 => format!("{}\u{a0}min", secs / 60),
+        3600..86400 => format!("{}\u{a0}h", secs / 3600),
+        _ => format!("{}\u{a0}d", secs / 86400),
+    }
+}
+
+/// Color of a 0–100 score (none: not measured): red < 40 ≤ amber < 75 ≤ green.
+pub fn score_color(ui: &Ui, score: Option<u8>) -> Color32 {
     let p = theme::palette(ui);
-    match rating {
+    match score {
         Some(0..=39) => p.danger,
         Some(40..=74) => p.warning,
         Some(_) => p.success,

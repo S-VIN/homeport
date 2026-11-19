@@ -1,14 +1,14 @@
 //! # name-filters
 //! Exclude servers whose names match a pattern (`*` matches any text).
 //! Its own page holds the patterns; the Servers header links to it. Answers `servers::EXCLUDE`.
-use homeport_kernel::{kit, prelude::*, ui::Column, ui::ListEditor};
+use homeport_kernel::{kit, prelude::*, ui::Field, ui::ListEditor};
 use plugin_servers::{self as servers, Exclusion};
 
 pub static PLUGIN: Plugin = Plugin {
     id: "name-filters",
     name: "Exclude by name",
     description: "Hide and never use servers whose names match a pattern, e.g. *test* or RU*.",
-    category: categories::SERVERS,
+    category: plugin_servers::CATEGORY,
     requires: &[&plugin_servers::PLUGIN],
     migrations: homeport_kernel::migrations!(),
     setup,
@@ -72,15 +72,15 @@ fn setup(p: &mut Setup) -> Result<()> {
     // The Servers header keeps a shortcut with the number of patterns.
     p.fill(&servers::TOOLBAR, "filters", 50, |ui, cx, _| {
         let n = cx.get(&FILTERS).len();
-        if kit::tool_button(ui, Icon::Filter, "Exclude by name", n).clicked() {
+        if kit::tool_button(ui, Icon::EyeOff, "Exclude by name", n).clicked() {
             cx.navigate(&PLUGIN);
         }
     });
     p.page_fn(
         PageSpec {
             title: "Exclude by name",
-            icon: Icon::Filter,
-            order: 52,
+            icon: Icon::EyeOff,
+            order: 26,
         },
         page,
     );
@@ -130,17 +130,17 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
                 kit::submitted(ui, &r) && !f.pattern.trim().is_empty()
             },
         )
-        .column(Column::edit("Pattern", "Name pattern", |f: &mut Filter| {
+        .column(Field::edit("Pattern", "Name pattern", |f: &mut Filter| {
             &mut f.pattern
         }))
         .column(
-            Column::custom("Matches", 90., move |ui, _, f: &Filter| {
+            Field::custom("Matches", 90., move |ui, _, f: &Filter| {
                 let n = matches.iter().filter(|n| wildcard(&f.pattern, n)).count();
                 kit::hint(ui, kit::plural(n, "server", "servers"));
             })
             .right(),
         )
-        .empty(Icon::Filter, "No exclusions", "Add a name pattern above.")
+        .empty(Icon::EyeOff, "No exclusions", "Add a name pattern above.")
         .show(ui, cx);
 }
 

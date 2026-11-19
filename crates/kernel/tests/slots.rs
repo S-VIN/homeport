@@ -2,12 +2,12 @@
 //! `wrap_view` and `hide` edit another plugin's contributions to a zone.
 use homeport_kernel::{Host, egui, prelude::*};
 
-static ROW: Slot<()> = Slot::new("base.row", "Test zone on the base page.");
+static ROW: Slot<()> = Slot::new("base.row");
 
 static BASE: Plugin = Plugin {
     id: "base",
     name: "Base",
-    category: categories::SERVERS,
+    category: Category::new("servers", "Servers"),
     required: true,
     setup: |p| {
         p.fill(&ROW, "one", 0, |ui, _, _| {
@@ -22,7 +22,7 @@ static BASE: Plugin = Plugin {
         p.page_fn(
             PageSpec {
                 title: "Base",
-                icon: Icon::Servers,
+                icon: Icon::HardDrives,
                 order: 10,
             },
             |ui, cx| {
@@ -36,7 +36,7 @@ static BASE: Plugin = Plugin {
 static EXTRA: Plugin = Plugin {
     id: "extra",
     name: "Extra",
-    category: categories::SERVERS,
+    category: Category::new("servers", "Servers"),
     requires: &[&BASE],
     setup: |p| {
         p.replace(&ROW, "base/one", |ui, _, _| {
@@ -97,4 +97,23 @@ async fn plugins_edit_other_plugins_contributions() {
     assert!(!has("original three"), "hide: {shown:?}");
     drop(session);
     host.shutdown().await;
+}
+
+/// Fills a zone of a plugin it does not require.
+static STRAY: Plugin = Plugin {
+    id: "stray",
+    name: "Stray",
+    category: Category::new("servers", "Servers"),
+    setup: |p| {
+        p.fill(&ROW, "x", 0, |_, _, _| {});
+        Ok(())
+    },
+    ..Plugin::DEFAULT
+};
+
+#[tokio::test(flavor = "multi_thread")]
+#[should_panic(expected = "is not in its `requires`")]
+async fn a_zone_is_filled_only_by_plugins_that_require_its_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let _ = Host::start_enabled(vec![&BASE, &STRAY], dir.path()).await;
 }

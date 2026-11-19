@@ -14,18 +14,19 @@
 use homeport_kernel::{
     kit::{self, Tone, theme},
     prelude::*,
-    ui::{Column, ListEditor},
+    ui::{Field, ListEditor},
 };
 use plugin_servers::{self as servers, Proxy, ReplaceFromSource};
 use std::io::Read;
 
 pub mod formats;
+mod ui;
 
 pub static PLUGIN: Plugin = Plugin {
     id: "subscriptions",
     name: "Subscriptions",
     description: "Load servers from subscription URLs and links, refreshed on a schedule.",
-    category: categories::SERVERS,
+    category: plugin_servers::CATEGORY,
     requires: &[&plugin_servers::PLUGIN],
     required: true,
     migrations: homeport_kernel::migrations!(),
@@ -41,6 +42,9 @@ pub struct Source {
     /// Unix seconds of the last successful load.
     pub updated: Option<u64>,
     pub error: Option<String>,
+    /// Servers of the last load that could not be read, and why most of them.
+    pub skipped: u64,
+    pub skipped_why: Option<String>,
     /// What the provider calls the subscription (`profile-title`).
     pub title: Option<String>,
     /// Traffic used and allowed, in bytes, and the end of the plan (unix
@@ -58,6 +62,8 @@ impl Source {
             url: url.into(),
             updated: None,
             error: None,
+            skipped: 0,
+            skipped_why: None,
             title: None,
             used: None,
             total: None,
@@ -143,7 +149,7 @@ impl Op for RefreshSource {
     type Reply = ();
     fn job(&self) -> Option<JobSpec> {
         Some(
-            JobSpec::keyed(self.id.to_string(), "Load servers")
+            JobSpec::keyed(self.id.to_string(), "Refresh subscription")
                 .page(&PLUGIN)
                 .latest(),
         )
@@ -214,16 +220,29 @@ pub struct Parse {
     pub body: String,
 }
 impl Op for Parse {
-    type Reply = Vec<Proxy>;
+    type Reply = Parsed;
+}
+/// What a document gave: its servers, and how many could not be read (the
+/// subscription row says so; the log says why).
+#[derive(Clone, Debug, Default)]
+pub struct Parsed {
+    pub proxies: Vec<Proxy>,
+    /// Why each skipped server could not be read.
+    pub skipped: Vec<String>,
+}
+impl From<Vec<Proxy>> for Parsed {
+    fn from(proxies: Vec<Proxy>) -> Self {
+        Self {
+            proxies,
+            skipped: Vec::new(),
+        }
+    }
 }
 
 /// Accept a direct link as a source: `Some(Ok)` = valid, `Some(Err)` = known but invalid.
 pub static LINK: Hook<str, Option<Result<()>>> = Hook::new("subscriptions.link");
 /// Blocks below the subscription list.
-pub static SECTIONS: Slot<()> = Slot::new(
-    "subscriptions.sections",
-    "Subscriptions page: sections under the list",
-);
+pub static SECTIONS: Slot<()> = Slot::new("subscriptions.sections");
 
 pub const MAX_BYTES: usize = 10 * 1024 * 1024;
 
@@ -238,6 +257,10 @@ fn validate(snap: &Snapshot, s: &mut Source, others: &[Source]) -> Result<()> {
         Some(Err(e)) => return Err(e),
         // A pasted config is not a URL: formats answer for it above.
         None => {
+            // Pasted text with a colon (`proxies: …`) is not a URL either.
+            if !raw.contains("://") {
+                bail!("{HINT}");
+            }
             let url = url::Url::parse(raw).map_err(|_| Error::msg(HINT))?;
             if !matches!(url.scheme(), "http" | "https") {
                 bail!("{}:// links are not supported.", url.scheme());
@@ -311,7 +334,7 @@ pub async fn http_get(client: &reqwest::Client, url: &str, device_id: &str) -> R
     {
         return Err(Error::new(
             "device-id",
-            "The provider did not accept this installation's device ID. Contact your subscription provider to allow homeport.",
+            "The provider did not accept this installation's device ID. Contact your subscription provider to allow Homeport.",
         ));
     }
     if !res.status().is_success() {
@@ -424,31 +447,29 @@ async fn refresh_all(cx: Cx, _: RefreshAll) -> Result<()> {
     let mut failed = Vec::new();
     for (i, id) in ids.into_iter().enumerate() {
         cx.checkpoint()?;
-        if cx.call(RefreshSource { id }).await.is_err() {
+        if let Err(e) = cx.call(RefreshSource { id }).await {
             cx.checkpoint()?;
-            failed.push(id);
+            failed.push((id, e.message));
         }
         cx.progress(i as u64 + 1, total);
     }
     if failed.is_empty() {
         return Ok(());
     }
-    // Name them, and promise kept servers only where some were loaded before.
+    // One says why ("Name: reason"); promise kept servers only where some
+    // were loaded before.
     let sources = cx.get(&SOURCES);
-    let names: Vec<String> = failed
-        .iter()
-        .filter_map(|id| label(&sources, *id))
-        .collect();
-    let kept = sources
-        .iter()
-        .any(|s| failed.contains(&s.id) && s.updated.is_some());
-    let what = if names.len() == 1 {
-        names[0].clone()
-    } else {
-        kit::plural(names.len(), "subscription", "subscriptions")
+    let kept =
+        (sources.iter()).any(|s| s.updated.is_some() && failed.iter().any(|(id, _)| *id == s.id));
+    let what = match &failed[..] {
+        [(_, why)] => why.trim_end_matches('.').to_owned(),
+        _ => format!(
+            "{} could not refresh",
+            kit::plural(failed.len(), "subscription", "subscriptions")
+        ),
     };
     bail!(
-        "{what} could not refresh.{}",
+        "{what}.{}",
         if kept {
             " Servers loaded before are kept."
         } else {
@@ -457,17 +478,14 @@ async fn refresh_all(cx: Cx, _: RefreshAll) -> Result<()> {
     )
 }
 
-/// One log line when a refresh changed something: the servers, or whether it fails.
-fn report(cx: &Cx, id: Id, result: &Result<(Info, servers::Replaced)>) {
+/// One log line when a refresh changed the servers (an error is the job's).
+fn report(cx: &Cx, id: Id, result: &Result<((Info, Vec<String>), servers::Replaced)>) {
     let sources = cx.get(&SOURCES);
     let (Some(name), Some(source)) = (label(&sources, id), sources.iter().find(|s| s.id == id))
     else {
         return;
     };
     match result {
-        Err(e) if source.error.as_ref() != Some(&e.message) => {
-            warn!("{name} could not refresh: {e}")
-        }
         Ok((_, r)) if !r.added.is_empty() || !r.removed.is_empty() || source.error.is_some() => {
             let change = match (r.added.len(), r.removed.len()) {
                 (0, 0) => String::new(),
@@ -501,22 +519,25 @@ async fn refresh_source(cx: Cx, op: RefreshSource) -> Result<()> {
         let Document { body, info } = cx
             .or_cancel(cx.call(Fetch { source: op.id, url }))
             .await??;
-        let proxies = if body.trim().trim_start_matches('\u{feff}').trim().is_empty() {
-            Vec::new()
-        } else {
-            cx.call(Parse {
-                source: op.id,
-                body,
-            })
-            .await?
-        };
+        let Parsed { proxies, skipped } =
+            if body.trim().trim_start_matches('\u{feff}').trim().is_empty() {
+                Parsed::default()
+            } else {
+                cx.call(Parse {
+                    source: op.id,
+                    body,
+                })
+                .await?
+            };
         cx.checkpoint()?;
         let replace = ReplaceFromSource {
             source: op.id,
             proxies,
             guard: Some(input.guard()),
         };
-        cx.call(replace).await.map(|replaced| (info, replaced))
+        cx.call(replace)
+            .await
+            .map(|replaced| ((info, skipped), replaced))
     }
     .await;
     if result.as_ref().is_err_and(|e| e.cancelled()) {
@@ -530,9 +551,11 @@ async fn refresh_source(cx: Cx, op: RefreshSource) -> Result<()> {
         w.update(&SOURCES, |list| {
             if let Some(s) = list.iter_mut().find(|s| s.id == op.id) {
                 match outcome {
-                    Ok(info) => {
+                    Ok((info, skipped)) => {
                         s.updated = Some(now());
                         s.error = None;
+                        s.skipped = skipped.len() as u64;
+                        s.skipped_why = most_common(skipped);
                         (s.title, s.used, s.total, s.expires) =
                             (info.title, info.used, info.total, info.expires);
                     }
@@ -543,7 +566,13 @@ async fn refresh_source(cx: Cx, op: RefreshSource) -> Result<()> {
         Ok(())
     })
     .await?;
-    result.map(drop)
+    // The kernel logs a job's error once: it names the subscription.
+    result
+        .map(drop)
+        .map_err(|e| match label(&cx.get(&SOURCES), op.id) {
+            Some(name) => Error::msg(format!("{name}: {}", e.message)),
+            None => e,
+        })
 }
 
 fn setup(p: &mut Setup) -> Result<()> {
@@ -559,23 +588,12 @@ fn setup(p: &mut Setup) -> Result<()> {
     p.handle(refresh_source);
     p.handle(fetch).rank(Rank::Fallback);
     p.handle(|_: Cx, _: Parse| async move {
-        Err::<Vec<Proxy>, _>(Error::msg("Unrecognized subscription format."))
+        Err::<Parsed, _>(Error::msg("Unrecognized subscription format."))
     })
     .rank(Rank::Fallback);
-
+    p.wrap(remove_with_servers);
     p.on(|cx: Cx, e: Added<Source>| async move { cx.spawn(RefreshSource { id: e.item.id }).map(drop) });
-    p.on(|cx: Cx, e: Saved<Source>| async move {
-        if e.before.url != e.item.url {
-            cx.spawn(RefreshSource { id: e.item.id })?;
-        }
-        Ok(())
-    });
-    p.on(|cx: Cx, e: Removed<Source>| async move {
-        if let Some(run) = cx.running(&RefreshSource { id: e.item.id }) {
-            let _ = cx.cancel(run.id);
-        }
-        cx.call(servers::RemoveSource(e.item.id)).await
-    });
+    p.on(link_changed);
     p.on(|cx: Cx, _: Started| async move {
         if !cx.get(&SOURCES).is_empty() {
             cx.spawn(RefreshAll)?;
@@ -591,210 +609,52 @@ fn setup(p: &mut Setup) -> Result<()> {
         },
         || RefreshAll,
     );
-    p.hook(&servers::SOURCE, |snap, id| {
-        let sources = snap.get(&SOURCES);
-        let rank = sources.iter().position(|s| s.id == *id)?;
-        let s = &sources[rank];
-        Some(servers::SourceInfo {
-            kind: "Subscription",
-            label: label(&sources, s.id)?,
-            hue: s.hue.map_or_else(|| servers::hue_of(s.id), usize::from),
-            rank,
-        })
-    });
-
-    p.page_fn(
-        PageSpec {
-            title: "Subscriptions",
-            icon: Icon::Subscriptions,
-            order: 20,
-        },
-        page,
-    );
-    p.fill(&servers::EMPTY, "add", 0, |ui, cx, _| {
-        let sources = cx.get(&SOURCES);
-        if let Some(e) = sources.iter().find_map(|s| s.error.as_deref()) {
-            let short = e.lines().next().unwrap_or(e).trim_end_matches('.');
-            kit::tone_text(ui, format!("Subscription failed: {short}"), Tone::Warning);
-            ui.add_space(theme::SPACE_M);
-        } else if sources.is_empty() {
-            kit::hint(ui, "Add a subscription to get servers.");
-            ui.add_space(theme::SPACE_M);
-        }
-        let open = if sources.is_empty() {
-            kit::Button::primary("Add subscription").icon(Icon::Add)
-        } else {
-            kit::Button::secondary("Open Subscriptions")
-        };
-        if open.show(ui).clicked() {
-            cx.navigate(&PLUGIN);
-        }
-    });
-    p.fill(&SETTINGS_SECTIONS, "refresh", 0, |ui, cx, _| {
-        cx.setting(
-            ui,
-            "Auto update",
-            &SETTINGS,
-            |s| &mut s.refresh_secs,
-            |ui, v| kit::interval(ui, "refresh", v),
-        );
-    });
+    p.hook(&servers::SOURCE, source_info);
+    ui::register(p);
     Ok(())
 }
 
-/// Traffic and term of the plan, when the provider reports them.
-fn plan(s: &Source) -> Option<(String, bool)> {
-    let traffic = match (s.used, s.total) {
-        (Some(used), Some(total)) => Some(format!("{} of {}", kit::bytes(used), kit::bytes(total))),
-        // Without a limit only real use says something.
-        (Some(used), None) if used > 0 => Some(format!("{} used", kit::bytes(used))),
-        _ => None,
-    };
-    // Providers put a far-away date for "no end"; past ten years it is that.
-    let left = s
-        .expires
-        .map(|end| i64::try_from(end).unwrap_or(i64::MAX) - now() as i64)
-        .filter(|left| *left < 10 * 365 * 86_400);
-    let term = left.map(|left| match (left + 43_200) / 86_400 {
-        _ if left <= 0 => "expired".to_owned(),
-        0 => "expires today".to_owned(),
-        days => format!("expires in {}", kit::plural(days as usize, "day", "days")),
-    });
-    let alarming =
-        left.is_some_and(|l| l <= 3 * 86_400) || s.used.zip(s.total).is_some_and(|(u, t)| u >= t);
-    let text: Vec<String> = traffic.into_iter().chain(term).collect();
-    (!text.is_empty()).then(|| (text.join(" · "), alarming))
+/// A new link loads the servers again.
+async fn link_changed(cx: Cx, e: Saved<Source>) -> Result<()> {
+    if e.before.url != e.item.url {
+        cx.spawn(RefreshSource { id: e.item.id })?;
+    }
+    Ok(())
 }
 
-fn status(s: &Source, loading: bool) -> (String, Tone) {
-    if !s.remote() {
-        return match &s.error {
-            Some(e) => (e.trim_end_matches('.').to_owned(), Tone::Warning),
-            None => ("Added manually".into(), Tone::Neutral),
-        };
+/// Its servers go first: a crash between the two steps leaves a subscription
+/// without servers, which the next refresh fills, never servers of a gone one.
+async fn remove_with_servers(cx: Cx, op: Remove<Source>, next: Next<Remove<Source>>) -> Result<()> {
+    if let Some(run) = cx.running(&RefreshSource { id: op.id }) {
+        let _ = cx.cancel(run.id);
     }
-    let (text, tone) = load_status(s, loading);
-    match plan(s).filter(|_| !loading) {
-        Some((plan, alarming)) => {
-            let tone = if alarming { Tone::Warning } else { tone };
-            // The plan first, so a narrow row cuts "updated …" instead;
-            // a failed refresh still leads.
-            let text = match s.error {
-                Some(_) => format!("{text} · {plan}"),
-                None => format!("{plan} · {}", text.to_lowercase()),
-            };
-            (text, tone)
-        }
-        None => (text, tone),
-    }
+    cx.call(servers::RemoveSource(op.id)).await?;
+    next.run(&cx, op).await
 }
 
-fn load_status(s: &Source, loading: bool) -> (String, Tone) {
-    let age = s.updated.filter(|&t| t > 0).map(kit::age);
-    match (&s.error, loading) {
-        (_, true) => ("Loading…".into(), Tone::Neutral),
-        (Some(e), _) => (
-            match age {
-                Some(a) => format!(
-                    "Refresh failed · {} · last loaded {a}",
-                    e.trim_end_matches('.')
-                ),
-                None => format!("Refresh failed · {}", e.trim_end_matches('.')),
-            },
-            Tone::Warning,
-        ),
-        (None, _) => (
-            age.map_or_else(|| "Not loaded yet".into(), |a| format!("Updated {a}")),
-            Tone::Neutral,
-        ),
-    }
-}
-
-fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
-    let snap = cx.snapshot().clone();
+/// How the servers list labels and orders the servers of a subscription.
+fn source_info(snap: &Snapshot, id: &Id) -> Option<servers::SourceInfo> {
     let sources = snap.get(&SOURCES);
-    let servers = snap.get(&servers::SERVERS);
-    let counter = if sources.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "{} · {}",
-            kit::plural(sources.len(), "subscription", "subscriptions"),
-            kit::plural(servers.len(), "server", "servers")
-        )
-    };
-    cx.page_header(ui, &counter, |ui, cx| {
-        cx.job_button(
-            ui,
-            Icon::Refresh,
-            "Refresh all",
-            !sources.is_empty(),
-            || RefreshAll,
-        );
-    });
+    let rank = sources.iter().position(|s| s.id == *id)?;
+    let s = &sources[rank];
+    Some(servers::SourceInfo {
+        kind: "Subscription",
+        label: label(&sources, s.id)?,
+        hue: s.hue.map_or_else(|| servers::hue_of(s.id), usize::from),
+        rank,
+    })
+}
 
-    let loading = cx.live(&LOADING);
-    ListEditor::new(&SOURCES)
-        .add_form(
-            "Add subscription",
-            || Source::new(""),
-            |ui, s, width| {
-                let r = kit::input(
-                    ui,
-                    "url",
-                    &mut s.url,
-                    "Subscription URL or server link",
-                    width,
-                );
-                kit::submitted(ui, &r) && !s.url.trim().is_empty()
-            },
-        )
-        .leading("", 8., |ui, cx, s: &Source| {
-            kit::tag_dot(ui, servers::source(cx.snapshot(), s.id).hue)
-                .on_hover_text("Tag color of its servers");
-        })
-        .column(
-            Column::edit("Subscription", "Subscription URL", |s: &mut Source| {
-                &mut s.url
-            })
-            .display(move |s: &Source| label(&sources, s.id).unwrap_or_else(|| s.label())),
-        )
-        .column(
-            Column::custom("Servers", 56., |ui, cx, s: &Source| {
-                if loading.contains(&s.id) {
-                    kit::spinner(ui);
-                } else {
-                    let n = cx
-                        .get(&servers::SERVERS)
-                        .iter()
-                        .filter(|x| x.source == s.id)
-                        .count();
-                    ui.label(n.to_string());
-                }
-            })
-            .right(),
-        )
-        .column(
-            Column::custom("", 30., move |ui, cx, s: &Source| {
-                // A link or config is kept as pasted: nothing to refresh.
-                if !s.remote() {
-                    return;
-                }
-                let idle = !cx.live(&LOADING).contains(&s.id);
-                if kit::icon_button(ui, Icon::Refresh, "Refresh", idle).clicked() {
-                    cx.run(RefreshSource { id: s.id });
-                }
-            })
-            .right(),
-        )
-        .subtitle(|rows, i| Some(status(&rows[i], loading.contains(&rows[i].id))))
-        .empty(
-            Icon::Subscriptions,
-            "No subscriptions",
-            "Paste a subscription link or a vless:// link above.",
-        )
-        .show(ui, cx);
-    cx.slot(ui, &SECTIONS, &());
+/// The reason most skipped servers share.
+fn most_common(reasons: Vec<String>) -> Option<String> {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for r in reasons {
+        match counts.iter_mut().find(|(x, _)| *x == r) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((r, 1)),
+        }
+    }
+    counts.into_iter().max_by_key(|(_, n)| *n).map(|(r, _)| r)
 }
 
 #[cfg(test)]
@@ -825,7 +685,7 @@ mod tests {
         let mut s = Source::new("https://example.org/sub");
         (s.title, s.used, s.total, s.expires) = (info.title, info.used, info.total, info.expires);
         assert_eq!(s.label(), "My VPN");
-        let (text, alarming) = plan(&s).unwrap();
+        let (text, alarming) = ui::plan(&s).unwrap();
         assert!(text.starts_with("2.9 KB of 10.0 GB · expires in"), "{text}");
         assert!(!alarming);
     }

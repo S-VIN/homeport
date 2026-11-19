@@ -3,7 +3,7 @@ use crate::{
 };
 use homeport_kernel::{
     prelude::*,
-    ui::{Column, ListEditor, Page},
+    ui::{Field, ListEditor, Page},
 };
 use std::cell::Cell;
 
@@ -13,6 +13,8 @@ const FIELD: f32 = 190.;
 pub struct DeployPage {
     options: Options,
     installing: bool,
+    /// Install was pressed with something missing: the form says what.
+    tried: bool,
     /// The server being uninstalled, with the SSH access the user enters.
     removal: Option<Removal>,
 }
@@ -68,12 +70,20 @@ impl DeployPage {
             self.options.panel_password.clear();
         }
         self.installing = installing;
-        let o = &mut self.options;
+        let (o, tried) = (&mut self.options, self.tried);
+        let missing = |v: &str| tried && v.trim().is_empty();
+        let (host, login, password) = (missing(&o.host), missing(&o.login), missing(&o.password));
         ui.add_enabled_ui(!installing, |ui| {
             kit::settings_card(ui, |ui| {
-                text(ui, "Server address", "IP address or host name of your Linux server", &mut o.host, "203.0.113.10");
-                text(ui, "SSH login", "root, or a user who may use sudo", &mut o.login, "root");
-                secret(ui, "SSH password", "Used for this installation only; never saved", &mut o.password, "");
+                kit::invalid_scope(ui, host, |ui| {
+                    text(ui, "Server address", "IP address or host name of your Linux server", &mut o.host, "203.0.113.10")
+                });
+                kit::invalid_scope(ui, login, |ui| {
+                    text(ui, "SSH login", "root, or a user who may use sudo", &mut o.login, "root")
+                });
+                kit::invalid_scope(ui, password, |ui| {
+                    secret(ui, "SSH password", "Used for this installation only; never saved", &mut o.password, "")
+                });
                 text(ui, "Panel login", "For the server's web panel", &mut o.panel_login, "admin");
                 secret(ui, "Panel password", "", &mut o.panel_password, "Generated if empty");
                 kit::settings_row(
@@ -87,8 +97,8 @@ impl DeployPage {
                 kit::settings_card(ui, |ui| {
                     text(ui, "Domain", "panel.<domain> and auth.<domain> must point to the server. Empty: an sslip.io name of the server's address, no setup needed.", &mut o.domain, "Automatic");
                     text(ui, "Certificate email", "Optional; Let's Encrypt writes here before a certificate expires", &mut o.email, "you@example.com");
-                    port(ui, cx, "SSH port", &mut o.ssh_port);
-                    port(ui, cx, "Panel port", &mut o.https_port);
+                    port(ui, "SSH port", &mut o.ssh_port);
+                    port(ui, "Panel port", &mut o.https_port);
                     text(ui, "Folder", "On the server; ~/ is the home folder of the SSH login. Installing again to it updates the installation and keeps its data.", &mut o.directory, "~/homeport");
                     text(ui, "Container image", "", &mut o.image, "");
                 });
@@ -96,13 +106,16 @@ impl DeployPage {
         });
         ui.add_space(kit::theme::SPACE_M);
         let problem = self.options.problem();
+        if problem.is_none() {
+            self.tried = false;
+        }
         // The form's main action on the right, like every page's; its status beside it.
         let row = egui::vec2(ui.available_width(), kit::theme::CONTROL);
         ui.allocate_ui_with_layout(
             row,
             egui::Layout::right_to_left(egui::Align::Center),
             |ui| {
-                let options = &self.options;
+                let (options, tried) = (&self.options, &mut self.tried);
                 // While it runs, the button stops it.
                 if installing {
                     cx.job_button(ui, Icon::Terminal, "Install", true, || {
@@ -111,13 +124,13 @@ impl DeployPage {
                 } else {
                     let r = kit::Button::primary("Install")
                         .icon(Icon::Terminal)
-                        .enabled(problem.is_none() && !uninstalling)
+                        .enabled(!uninstalling)
                         .show(ui);
                     if r.clicked() {
-                        cx.run(Install(options.clone()));
-                    }
-                    if let Some(problem) = problem {
-                        r.on_disabled_hover_text(problem);
+                        match problem {
+                            None => cx.run(Install(options.clone())),
+                            Some(_) => *tried = true,
+                        }
                     }
                 }
                 // Nothing to fix is shown for a form that was not touched yet.
@@ -127,6 +140,9 @@ impl DeployPage {
                     }
                     _ if installing => kit::tone_text(ui, "Starting…", kit::Tone::Neutral),
                     Status::Failed(why) => kit::tone_text(ui, why, kit::Tone::Danger),
+                    _ if *tried => {
+                        kit::tone_text(ui, problem.unwrap_or_default(), kit::Tone::Danger)
+                    }
                     _ if *options != Options::default() => {
                         kit::tone_text(ui, problem.unwrap_or_default(), kit::Tone::Neutral)
                     }
@@ -188,15 +204,16 @@ fn secret(ui: &mut egui::Ui, label: &str, help: &str, value: &mut String, placeh
         kit::password(ui, label, value, placeholder, FIELD);
     });
 }
-fn port(ui: &mut egui::Ui, cx: &mut UiCx, label: &str, value: &mut u16) {
+fn port(ui: &mut egui::Ui, label: &str, value: &mut u16) {
+    let mut port = Ok(None);
     row(ui, label, "", 70., |ui| {
-        if let Some(text) = kit::field(ui, label, &value.to_string(), "", 70.) {
-            match text.trim().parse() {
-                Ok(port) if port > 0 => *value = port,
-                _ => cx.notify_error("Enter a port from 1 to 65535."),
-            }
-        }
+        port = kit::checked_field(ui, label, &value.to_string(), "", 70., kit::port);
     });
+    match port {
+        Ok(Some(p)) => *value = p,
+        Err(e) => drop(kit::field_error(ui, &e, None)),
+        Ok(None) => {}
+    }
 }
 /// A settings row whose input has its full width from the first frame (a
 /// text input alone only grows into the room the row gave it last time).
@@ -230,7 +247,7 @@ impl DeployPage {
             ));
             kit::tone_text(
                 ui,
-                "Removes homeport and its data from the server, and what the installer added: Docker and other packages, package sources, the IPv6 setting. Then the server leaves this list.",
+                "Removes Homeport and its data from the server, and what the installer added: Docker and other packages, package sources, the IPv6 setting. Then the server leaves this list.",
                 kit::Tone::Warning,
             );
             ui.add_space(kit::theme::SPACE_S);
@@ -253,14 +270,12 @@ impl DeployPage {
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
                     if running {
-                        cx.job_button(ui, Icon::Uninstall, "Uninstall", true, || {
-                            uninstall(removal)
-                        });
+                        cx.job_button(ui, Icon::Broom, "Uninstall", true, || uninstall(removal));
                     } else {
                         let ready =
                             !removal.login.trim().is_empty() && !removal.password.is_empty();
                         let r = kit::Button::danger("Uninstall")
-                            .icon(Icon::Uninstall)
+                            .icon(Icon::Broom)
                             .enabled(ready && !self.installing)
                             .show(ui);
                         if r.clicked() {
@@ -303,9 +318,9 @@ fn servers_list(
     ListEditor::new(&DEPLOYMENTS)
         .unordered()
         .no_headers()
-        .column(Column::text("Server", |d: &Deployment| d.host.clone()))
+        .column(Field::text("Server", |d: &Deployment| d.host.clone()))
         .column(
-            Column::custom("", 3. * 30., move |ui, cx, d| {
+            Field::custom("", 3. * 30., move |ui, cx, d| {
                 actions(ui, cx, d, busy, chosen)
             })
             .right(),
@@ -328,7 +343,7 @@ fn servers_list(
         })
         .empty(
             Icon::Terminal,
-            "Nothing installed yet",
+            "No installed servers",
             "Enter your server's SSH access above and press Install.",
         )
         .show(ui, cx);
@@ -342,8 +357,8 @@ fn actions(
     chosen: &Cell<Option<Deployment>>,
 ) {
     // Far from the row's Delete, which only forgets the server here.
-    let label = "Uninstall from the server: removes homeport and what its installer added";
-    if kit::icon_button(ui, Icon::Uninstall, label, !busy).clicked() {
+    let label = "Uninstall from the server: removes Homeport and what its installer added";
+    if kit::icon_button(ui, Icon::Broom, label, !busy).clicked() {
         chosen.set(Some(d.clone()));
     }
     if kit::icon_button(ui, Icon::Key, "Copy panel password", true).clicked() {

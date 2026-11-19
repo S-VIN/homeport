@@ -243,6 +243,14 @@ impl Registry {
     }
     pub(crate) fn finish(&mut self) {
         for (i, (table, state)) in self.tables.iter().enumerate() {
+            let owner = self.owners[state].map_or("kernel", |p| self.plugins[p].id);
+            let prefix = owner.replace('-', "_");
+            assert!(
+                table
+                    .strip_prefix(&prefix)
+                    .is_some_and(|r| r.is_empty() || r.starts_with('_')),
+                "table {table} of {state} must start with `{prefix}`"
+            );
             if let Some((_, other)) = self.tables[..i].iter().find(|(t, _)| t == table) {
                 panic!(
                     "lists {other} and {state} both store rows in table `{table}`: give one its own with `p.list(..).table(\"…\")`"
@@ -278,6 +286,17 @@ pub struct Setup<'a> {
 impl<'a> Setup<'a> {
     pub(crate) fn me(&self) -> usize {
         self.plugin.expect("kernel registrations use internal APIs")
+    }
+    /// A zone this plugin may fill: the shell's, its own or one of a plugin it
+    /// `requires` (the zone id starts with the owner's id, like state names).
+    pub(crate) fn check_zone(&self, zone: &str) {
+        let owner = zone.split('.').next().unwrap_or_default();
+        let me = self.reg.plugins[self.me()];
+        assert!(
+            owner == "shell" || owner == me.id || me.requires.iter().any(|r| r.id == owner),
+            "{} fills `{zone}`, but `{owner}` is not in its `requires`",
+            me.id
+        );
     }
     pub fn plugin_id(&self) -> &'static str {
         self.plugin.map_or("kernel", |p| self.reg.plugins[p].id)
@@ -668,6 +687,7 @@ impl<'a> Setup<'a> {
         f: impl Fn(&mut egui::Ui, &mut UiCx, &P) + Send + Sync + 'static,
     ) {
         let plugin = self.me();
+        self.check_zone(slot.id);
         let id = format!("{}/{id}", self.plugin_id());
         self.reg.fills.push((slot.id, plugin));
         let list = self.reg.contributions_mut(slot);

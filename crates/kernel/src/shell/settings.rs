@@ -30,9 +30,9 @@ pub(super) fn settings(ui: &mut egui::Ui, cx: &mut UiCx) {
             kit::settings_row(
                 ui,
                 "Application",
-                "Closing the window keeps homeport running in the background",
+                "Closing the window keeps Homeport running in the background",
                 |ui| {
-                    if kit::Button::secondary("Quit homeport").show(ui).clicked() {
+                    if kit::Button::secondary("Quit Homeport").show(ui).clicked() {
                         cx.s.exit_requested = true;
                     }
                 },
@@ -64,7 +64,7 @@ pub(super) fn settings(ui: &mut egui::Ui, cx: &mut UiCx) {
     // actions at the right edge.
     kit::settings_card(ui, |ui| {
         kit::settings_row(ui, "Version", "", |ui| {
-            ui.label(format!("homeport {}", env!("CARGO_PKG_VERSION")));
+            ui.label(format!("Homeport {}", env!("CARGO_PKG_VERSION")));
         });
         core_row(ui, cx, &status);
         let dir = cx.k.data_dir.display().to_string();
@@ -198,7 +198,7 @@ pub(super) fn core_row(ui: &mut egui::Ui, cx: &mut UiCx, status: &crate::core::C
             if installed
                 && kit::Button::ghost("Use bundled")
                     .show(ui)
-                    .on_hover_text("Remove the update and run the core shipped with homeport")
+                    .on_hover_text("Remove the update and run the core shipped with Homeport")
                     .clicked()
             {
                 result = k.remove_core_update();

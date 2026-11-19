@@ -16,7 +16,7 @@ pub(crate) fn register(p: &mut Setup) {
 
 /// Parse an Xray document (one profile or a list of profiles); a server that
 /// cannot be read is skipped (see [`super::usable`]).
-pub fn parse(body: &str) -> Result<Vec<Proxy>> {
+pub fn parse(body: &str) -> Result<crate::Parsed> {
     let doc: Value = serde_json::from_str(body.trim_start_matches('\u{feff}'))
         .map_err(|_| invalid("Invalid Xray JSON."))?;
     super::usable(profiles(&doc)?.into_iter().map(|(name, servers)| {
@@ -446,7 +446,7 @@ mod tests {
 
     #[test]
     fn unknown_settings_are_ignored() {
-        let servers = parse(&format!("[{GERMANY}]")).unwrap();
+        let servers = parse(&format!("[{GERMANY}]")).unwrap().proxies;
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "Germany");
         assert!(!servers[0].options.contains_key("ech-opts"));
@@ -455,7 +455,7 @@ mod tests {
     #[test]
     fn ech_config_list_turns_ech_on() {
         let body = GERMANY.replace(r#""newOption":1"#, r#""echConfigList":"AEX+DQ""#);
-        let servers = parse(&body).unwrap();
+        let servers = parse(&body).unwrap().proxies;
         assert_eq!(
             servers[0].options["ech-opts"],
             json!({"enable": true, "config": "AEX+DQ"})
@@ -467,7 +467,7 @@ mod tests {
         let broken = GERMANY
             .replace("Germany", "Broken")
             .replace(r#""flow":"""#, r#""flow":"xtls-rprx-vision-udp443""#);
-        let servers = parse(&format!("[{GERMANY},{broken}]")).unwrap();
+        let servers = parse(&format!("[{GERMANY},{broken}]")).unwrap().proxies;
         let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["Germany"]);
         let e = parse(&format!("[{broken}]")).unwrap_err();

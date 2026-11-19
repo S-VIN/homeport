@@ -2383,9 +2383,7 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "plugin-autostart",
  "plugin-chain-exit",
- "plugin-connections",
  "plugin-dns",
- "plugin-health-checks",
  "plugin-install-to-server",
  "plugin-local-proxy",
  "plugin-logs",
@@ -2394,6 +2392,7 @@ dependencies = [
  "plugin-servers",
  "plugin-statistics",
  "plugin-subscriptions",
+ "plugin-url-tests",
  "plugin-vless-inbound",
  "reqwest",
  "rfd",
@@ -4040,20 +4039,11 @@ dependencies = [
  "base64 0.23.1",
  "homeport-kernel",
  "plugin-servers",
+ "plugin-subscriptions",
  "reqwest",
  "serde",
  "serde_json",
  "x25519-dalek",
-]
-
-[[package]]
-name = "plugin-connections"
-version = "0.1.0"
-dependencies = [
- "homeport-kernel",
- "plugin-servers",
- "serde_json",
- "tokio",
 ]
 
 [[package]]
@@ -4062,17 +4052,6 @@ version = "0.1.0"
 dependencies = [
  "homeport-kernel",
  "serde",
- "url",
-]
-
-[[package]]
-name = "plugin-health-checks"
-version = "0.2.0"
-dependencies = [
- "homeport-kernel",
- "plugin-servers",
- "serde",
- "tokio",
  "url",
 ]
 
@@ -4106,7 +4085,6 @@ version = "0.1.0"
 dependencies = [
  "homeport-kernel",
  "reqwest",
- "serde_json",
  "tokio",
 ]
 
@@ -4133,6 +4111,7 @@ dependencies = [
 name = "plugin-servers"
 version = "0.2.0"
 dependencies = [
+ "base64 0.23.1",
  "homeport-kernel",
  "percent-encoding",
  "reqwest",
@@ -4170,6 +4149,17 @@ dependencies = [
  "serde_json",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "plugin-url-tests"
+version = "0.2.0"
+dependencies = [
+ "homeport-kernel",
+ "plugin-servers",
+ "serde",
+ "tokio",
+ "url",
 ]
 
 [[package]]

@@ -25,11 +25,10 @@ plugin-subscriptions = { path = "plugins/subscriptions" }
 plugin-name-filters = { path = "plugins/name-filters" }
 plugin-routing = { path = "plugins/routing" }
 plugin-local-proxy = { path = "plugins/local-proxy" }
-plugin-health-checks = { path = "plugins/health-checks" }
+plugin-url-tests = { path = "plugins/url-tests" }
 plugin-autostart = { path = "plugins/autostart", optional = true }
 plugin-chain-exit = { path = "plugins/chain-exit" }
 plugin-vless-inbound = { path = "plugins/vless-inbound" }
-plugin-connections = { path = "plugins/connections" }
 plugin-logs = { path = "plugins/logs" }
 plugin-statistics = { path = "plugins/statistics" }
 plugin-dns = { path = "plugins/dns" }

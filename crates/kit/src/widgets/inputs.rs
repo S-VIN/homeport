@@ -28,14 +28,17 @@ fn text_input(
     width: f32,
     secret: bool,
 ) -> Response {
-    let width = width * super::settings::stretch(ui);
+    // The frame's stroke lies outside the asked width: take it off, so the
+    // field ends where the layout planned (aligned with the cards below).
+    let stroke = ui.visuals().widgets.inactive.bg_stroke.width;
+    let width = (width * super::settings::stretch(ui) - 2. * stroke).max(24.);
     ui.push_id(id, |ui| {
         ui.add(
             egui::TextEdit::singleline(value)
-                .desired_width(width.max(24.))
+                .desired_width(width)
                 // Keep the asked width when the row is short of room: a layout
                 // that measures its controls must see their real size.
-                .min_size(vec2(width.max(24.), CONTROL))
+                .min_size(vec2(width, CONTROL))
                 .hint_text(placeholder)
                 .password(secret)
                 .margin(egui::Margin::symmetric(8, 5)),
@@ -123,7 +126,25 @@ pub fn field(
     placeholder: &str,
     width: f32,
 ) -> Option<String> {
+    checked_field(ui, id, saved, placeholder, width, |s| {
+        Ok::<_, String>(s.to_owned())
+    })
+    .ok()
+    .flatten()
+}
+/// [`field`] whose text must pass `check` ([`port`]): a wrong value stays in
+/// the field, outlined in red, and comes back as `Err` (shown by
+/// [`field_error`] under the row) until it is fixed or Escape restores it.
+pub fn checked_field<T, E: Into<String>>(
+    ui: &mut Ui,
+    id: impl egui::AsIdSalt,
+    saved: &str,
+    placeholder: &str,
+    width: f32,
+    check: impl FnOnce(&str) -> Result<T, E>,
+) -> Result<Option<T>, String> {
     let key = egui::Id::unique(("kit-field", &id));
+    let wrong = key.with("error");
     let mut draft: String = ui
         .data(|d| d.get_temp(key))
         .unwrap_or_else(|| saved.to_owned());
@@ -131,18 +152,81 @@ pub fn field(
     let mut out = None;
     if r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         draft = saved.to_owned();
+        ui.data_mut(|d| d.remove::<String>(wrong));
     }
-    if committed(ui, &r) {
-        if draft != saved {
-            out = Some(draft.clone());
+    let done = committed(ui, &r);
+    if done && draft != saved {
+        match check(&draft) {
+            Ok(v) => out = Some(v),
+            Err(e) => ui.data_mut(|d| {
+                d.insert_temp(wrong, e.into());
+            }),
         }
-        ui.data_mut(|d| d.remove::<String>(key));
-    } else if r.has_focus() || draft != saved {
+    }
+    if done && (out.is_some() || draft == saved) {
+        ui.data_mut(|d| d.remove::<String>(wrong));
+    }
+    // The draft lives while it is edited or differs (a wrong one too).
+    if out.is_none() && (r.has_focus() || draft != saved) {
         ui.data_mut(|d| d.insert_temp(key, draft));
     } else {
         ui.data_mut(|d| d.remove::<String>(key));
     }
-    out
+    match ui.data(|d| d.get_temp::<String>(wrong)) {
+        Some(e) => {
+            invalid(ui, &r);
+            Err(e)
+        }
+        None => Ok(out),
+    }
+}
+/// A port number from 1 to 65535.
+pub fn port(text: &str) -> Result<u16, String> {
+    match text.trim().parse::<u16>() {
+        Ok(p) if p > 0 => Ok(p),
+        _ => Err("Enter a port from 1 to 65535.".into()),
+    }
+}
+/// Outline a field whose value is wrong; [`field_error`] says why.
+pub fn invalid(ui: &Ui, field: &Response) {
+    ui.painter().rect_stroke(
+        field.rect,
+        theme::RADIUS_CONTROL,
+        egui::Stroke::new(1., theme::palette(ui).danger),
+        egui::StrokeKind::Inside,
+    );
+}
+/// Draw `add` with every field outlined as [`invalid`] when `invalid`: for a
+/// row of fields whose one error [`field_error`] shows under it.
+pub fn invalid_scope<R>(ui: &mut Ui, invalid: bool, add: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.scope(|ui| {
+        if invalid {
+            let stroke = egui::Stroke::new(1., theme::palette(ui).danger);
+            let v = ui.visuals_mut();
+            (v.widgets.inactive.bg_stroke, v.widgets.hovered.bg_stroke) = (stroke, stroke);
+            // Also while typing in it.
+            v.selection.stroke = stroke;
+        }
+        add(ui)
+    })
+    .inner
+}
+/// What is wrong with the fields of the row above, right under it, with an
+/// optional action that fixes it ("Retry"); true when the action is clicked.
+/// The one way to show a wrong input: not a toast.
+pub fn field_error(ui: &mut Ui, text: &str, action: Option<&str>) -> bool {
+    ui.add_space(-theme::SPACE_S);
+    let clicked = ui
+        .horizontal_wrapped(|ui| {
+            let text = RichText::new(text)
+                .size(theme::SMALL)
+                .color(theme::palette(ui).danger);
+            ui.add(egui::Label::new(text).wrap());
+            action.is_some_and(|a| Button::ghost(a).tone(Tone::Accent).show(ui).clicked())
+        })
+        .inner;
+    ui.add_space(theme::SPACE_M);
+    clicked
 }
 pub fn committed(ui: &Ui, response: &Response) -> bool {
     ui.is_enabled() && (response.lost_focus() || submitted(ui, response))
@@ -278,11 +362,15 @@ impl<'a> Fields<'a> {
             .filter(|f| matches!(f, Field::Input { .. }))
             .count() as f32;
         // Too narrow (a phone): one field per line, full width, in the same order.
-        let stacked = inputs > 0. && natural > 0. && self.width - natural < inputs * (160. + gap);
+        let stacked = natural > 0.
+            && (phone(ui) || (inputs > 0. && self.width - natural < inputs * (160. + gap)));
         // Choices give up width (down to their share) before inputs get narrower than 80.
         let room = self.width - inputs * (80. + gap);
         let scale = if natural > room && natural > 0. {
             (room / natural).max(0.5)
+        } else if inputs == 0. && natural > 0. {
+            // Only choices: they share the whole row, the button stays at its end.
+            (self.width + gap) / natural
         } else {
             1.
         };
@@ -297,15 +385,10 @@ impl<'a> Fields<'a> {
             0.
         };
         let width = self.width;
-        let fit = move |text: &str| {
-            if stacked {
-                width
-            } else {
-                (fit(text) + gap) * scale - gap
-            }
-        };
+        let fit = move |text: &str| (fit(text) + gap) * scale - gap;
         let mut submitted = false;
-        let mut draw = |ui: &mut Ui, field: Field<'a>| match field {
+        // `shared`: the width of a choice on a stacked line.
+        let mut draw = |ui: &mut Ui, field: Field<'a>, shared: Option<f32>| match field {
             Field::Input {
                 id,
                 value,
@@ -320,15 +403,32 @@ impl<'a> Fields<'a> {
                 };
                 submitted |= self::submitted(ui, &r);
             }
-            Field::Fixed { text, draw } => draw(ui, fit(&text)),
+            Field::Fixed { text, draw } => draw(ui, shared.unwrap_or_else(|| fit(&text))),
         };
         if stacked {
+            // In the same order: an input a line at full width, choices next
+            // to each other share a line (a type picked first stays first).
+            let mut lines: Vec<Vec<Field<'a>>> = Vec::new();
+            for f in self.items {
+                let choice = matches!(f, Field::Fixed { .. });
+                match lines.last_mut() {
+                    Some(line) if choice && matches!(line[0], Field::Fixed { .. }) => line.push(f),
+                    _ => lines.push(vec![f]),
+                }
+            }
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = theme::SPACE_S;
-                self.items.into_iter().for_each(|f| draw(ui, f));
+                for line in lines {
+                    let n = line.len() as f32;
+                    let shared = (width - gap * (n - 1.)) / n;
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        line.into_iter().for_each(|f| draw(ui, f, Some(shared)));
+                    });
+                }
             });
         } else {
-            self.items.into_iter().for_each(|f| draw(ui, f));
+            self.items.into_iter().for_each(|f| draw(ui, f, None));
         }
         submitted
     }

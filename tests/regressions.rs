@@ -206,7 +206,8 @@ async fn real_hwid_subscriptions_return_servers() {
                 body,
             })
             .await
-            .unwrap();
+            .unwrap()
+            .proxies;
         assert!(
             proxies.len() > 1,
             "subscription {} still returned a placeholder",
@@ -344,7 +345,8 @@ fn hysteria_ipv6_and_old_subscription_settings_remain_compatible() {
     let links = plugin_subscriptions::formats::uri::parse_links(
         "hy2://secret@[2001:db8::1]:8443?sni=example.org#IPv6",
     )
-    .unwrap();
+    .unwrap()
+    .proxies;
     assert_eq!(links[0].server, "2001:db8::1");
     assert_eq!(links[0].port, 8443);
     assert_eq!(links[0].name, "IPv6");
@@ -450,7 +452,7 @@ mod demo_format {
             let node = serde_json::json!({
                 "name": "Demo", "type": "http", "server": host, "port": port.parse::<u16>().unwrap()
             });
-            Ok(vec![Proxy::from_value(node, 1)?])
+            Ok(vec![Proxy::from_value(node, 1)?].into())
         })
         .claim(|_, op| {
             op.body
@@ -490,5 +492,72 @@ async fn a_plugin_adds_a_subscription_format() {
     let servers = k.snapshot().get(&plugin_servers::SERVERS);
     assert_eq!(servers[0].name, "Demo");
     assert_eq!(servers[0].port, 8080);
+    host.shutdown().await;
+}
+
+/// A server excluded by name stays in its "Excluded by name" group even when
+/// it also failed its last test: the user's choice wins.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_name_filter_wins_over_a_failed_test() {
+    use plugin_servers::{RESULTS, SERVERS, TestResult};
+    let dir = tempfile::tempdir().unwrap();
+    let host = Host::start_enabled(
+        vec![
+            &plugin_servers::PLUGIN,
+            &plugin_subscriptions::PLUGIN,
+            &plugin_routing::PLUGIN,
+            &plugin_name_filters::PLUGIN,
+        ],
+        dir.path(),
+    )
+    .await
+    .unwrap();
+    let k = host.kernel();
+    let proxies = plugin_subscriptions::formats::uri::parse_links(
+        "vless://00000000-0000-0000-0000-000000000001@example.org:443?security=tls#Moscow%20test",
+    )
+    .unwrap()
+    .proxies;
+    k.cx_for("servers")
+        .call(plugin_servers::ReplaceFromSource {
+            source: homeport_kernel::Id::random(),
+            proxies,
+            guard: None,
+        })
+        .await
+        .unwrap();
+    let id = k.snapshot().get(&SERVERS)[0].id;
+    k.cx_for("servers")
+        .write(move |w| {
+            w.update(&RESULTS, |l| {
+                l.push(TestResult {
+                    id,
+                    ping_ms: None,
+                    checked: Some(1),
+                    scores: Default::default(),
+                    failure: None,
+                })
+            });
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let group = |k: &homeport_kernel::Kernel| {
+        let snap = k.snapshot();
+        let s = snap.get(&SERVERS)[0].clone();
+        plugin_servers::exclusion(&snap, &s).map(|e| e.group)
+    };
+    assert_eq!(group(&k), Some("Failed"));
+    k.cx_for("name-filters")
+        .call(Add::new(
+            &plugin_name_filters::FILTERS,
+            plugin_name_filters::Filter {
+                id: homeport_kernel::Id::random(),
+                pattern: "*test*".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(group(&k), Some("Excluded by name"));
     host.shutdown().await;
 }

@@ -1,4 +1,4 @@
-//! Share links (`vless://`, `hysteria2://`): one server each.
+//! Share links (`vless://`, `trojan://`, `ss://`, `hysteria2://`): one server each.
 use crate::Proxy;
 use homeport_kernel::{Error, Result};
 use percent_encoding::percent_decode_str;
@@ -12,7 +12,7 @@ fn invalid(m: impl Into<String>) -> Error {
 
 /// A link of a protocol [`Proxy::from_link`] reads.
 pub fn is_link(raw: &str) -> bool {
-    ["vless://", "hysteria2://", "hy2://"]
+    ["vless://", "trojan://", "ss://", "hysteria2://", "hy2://"]
         .iter()
         .any(|prefix| raw.starts_with(prefix))
 }
@@ -27,6 +27,12 @@ impl Proxy {
 fn link(raw: &str) -> Result<Value> {
     if raw.starts_with("hysteria2://") || raw.starts_with("hy2://") {
         return hysteria2(raw);
+    }
+    if raw.starts_with("trojan://") {
+        return trojan(raw);
+    }
+    if raw.starts_with("ss://") {
+        return shadowsocks(raw);
     }
     let u = Url::parse(raw).map_err(|_| invalid("Invalid VLESS link."))?;
     if u.scheme() != "vless" || u.password().is_some() {
@@ -108,6 +114,129 @@ fn link(raw: &str) -> Result<Value> {
         _ => return Err(invalid("Unsupported VLESS transport.")),
     }
     Ok(p)
+}
+
+/// `trojan://password@host:port?sni=…&type=ws&path=…#name`.
+fn trojan(raw: &str) -> Result<Value> {
+    let u = Url::parse(raw).map_err(|_| invalid("Invalid Trojan link."))?;
+    let (host, port) = endpoint(&u, "Trojan")?;
+    let password = percent_decode_str(u.username())
+        .decode_utf8()
+        .map_err(|_| invalid("Invalid Trojan password."))?;
+    if password.is_empty() {
+        return Err(invalid("Missing Trojan password."));
+    }
+    let name = percent_decode_str(u.fragment().filter(|s| !s.is_empty()).unwrap_or(&host))
+        .decode_utf8_lossy()
+        .into_owned();
+    let mut p = json!({"name":name,"type":"trojan","server":host,"port":port,"password":password,"udp":true});
+    let q: Map<String, Value> = u
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), Value::String(v.into_owned())))
+        .collect();
+    for (k, to) in [
+        ("sni", "sni"),
+        ("peer", "sni"),
+        ("fp", "client-fingerprint"),
+    ] {
+        if let Some(v) = q.get(k) {
+            p[to] = v.clone();
+        }
+    }
+    if let Some(v) = q.get("allowInsecure").or(q.get("insecure")) {
+        p["skip-cert-verify"] = json!(boolean(v)?);
+    }
+    if let Some(v) = q.get("alpn").and_then(Value::as_str) {
+        p["alpn"] = json!(v.split(',').filter(|s| !s.is_empty()).collect::<Vec<_>>());
+    }
+    match q.get("type").and_then(Value::as_str).unwrap_or("tcp") {
+        "tcp" | "raw" => {}
+        "ws" => {
+            p["network"] = json!("ws");
+            let mut opts = json!({});
+            if let Some(v) = q.get("path") {
+                opts["path"] = v.clone();
+            }
+            if let Some(v) = q.get("host") {
+                opts["headers"] = json!({"Host":v});
+            }
+            p["ws-opts"] = opts;
+        }
+        "grpc" => {
+            p["network"] = json!("grpc");
+            p["grpc-opts"] = json!({"grpc-service-name":q.get("serviceName").and_then(Value::as_str).unwrap_or("")});
+        }
+        _ => return Err(invalid("Unsupported Trojan transport.")),
+    }
+    Ok(p)
+}
+
+/// SIP002 `ss://base64(method:password)@host:port#name` (or the user info in
+/// plain text) and the older `ss://base64(method:password@host:port)#name`.
+fn shadowsocks(raw: &str) -> Result<Value> {
+    use base64::{
+        Engine,
+        engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD},
+    };
+    let decode = |text: &str| {
+        let text = text.trim_end_matches('=');
+        (URL_SAFE_NO_PAD
+            .decode(text)
+            .or_else(|_| STANDARD_NO_PAD.decode(text)))
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+    };
+    let rest = &raw["ss://".len()..];
+    let (body, name) = match rest.split_once('#') {
+        Some((body, name)) => (body, Some(name)),
+        None => (rest, None),
+    };
+    // The older form: everything but the name is one Base64 string.
+    let body = match body.contains('@') {
+        true => body.to_owned(),
+        false => decode(body.split(['/', '?']).next().unwrap_or(body))
+            .ok_or_else(|| invalid("Invalid Shadowsocks link."))?,
+    };
+    let full = format!("ss://{body}");
+    let u = Url::parse(&full).map_err(|_| invalid("Invalid Shadowsocks link."))?;
+    if u.query_pairs().any(|(k, _)| k == "plugin") {
+        return Err(invalid("Shadowsocks plugins are not supported."));
+    }
+    let (host, port) = endpoint(&u, "Shadowsocks")?;
+    let user = percent_decode_str(u.username())
+        .decode_utf8()
+        .map_err(|_| invalid("Invalid Shadowsocks link."))?
+        .into_owned();
+    let info = match u.password() {
+        Some(p) => format!("{user}:{}", percent_decode_str(p).decode_utf8_lossy()),
+        None => decode(&user).ok_or_else(|| invalid("Invalid Shadowsocks user info."))?,
+    };
+    let (cipher, password) = info
+        .split_once(':')
+        .filter(|(c, p)| !c.is_empty() && !p.is_empty())
+        .ok_or_else(|| invalid("Missing Shadowsocks method or password."))?;
+    let name = name
+        .map(|n| percent_decode_str(n).decode_utf8_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| host.clone());
+    Ok(
+        json!({"name":name,"type":"ss","server":host,"port":port,"cipher":cipher,"password":password,"udp":true}),
+    )
+}
+
+/// Host (without IPv6 brackets) and a non-zero port of a link.
+fn endpoint(u: &Url, what: &str) -> Result<(String, u16)> {
+    let host = u
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| invalid(format!("Missing {what} host.")))?
+        .trim_matches(['[', ']'])
+        .to_owned();
+    let port = u
+        .port()
+        .filter(|p| *p > 0)
+        .ok_or_else(|| invalid(format!("Missing {what} port.")))?;
+    Ok((host, port))
 }
 
 fn hysteria2(raw: &str) -> Result<Value> {
@@ -260,5 +389,41 @@ fn boolean(v: &Value) -> Result<bool> {
         v if v == "true" || v == "1" || v == &json!(1) => Ok(true),
         v if v == "false" || v == "0" || v == &json!(0) => Ok(false),
         _ => Err(invalid("Invalid boolean in subscription.")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Proxy;
+
+    #[test]
+    fn trojan_and_shadowsocks_links() {
+        let t = Proxy::from_link(
+            "trojan://secret@example.org:443?sni=cdn.example&type=ws&path=%2Fws&host=cdn.example#Trojan%20one",
+        )
+        .unwrap();
+        assert_eq!(
+            (t.name.as_str(), t.server.as_str(), t.port),
+            ("Trojan one", "example.org", 443)
+        );
+        assert_eq!(t.options["password"], "secret");
+        assert_eq!(t.options["ws-opts"]["path"], "/ws");
+        // SIP002 with Base64 user info, plain user info, and the old all-Base64 form.
+        for link in [
+            "ss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388#SS",
+            "ss://aes-256-gcm:pass@1.2.3.4:8388#SS",
+            "ss://YWVzLTI1Ni1nY206cGFzc0AxLjIuMy40OjgzODg#SS",
+        ] {
+            let s = Proxy::from_link(link).unwrap_or_else(|e| panic!("{link}: {e}"));
+            assert_eq!(
+                (s.name.as_str(), s.server.as_str(), s.port),
+                ("SS", "1.2.3.4", 8388),
+                "{link}"
+            );
+            assert_eq!(s.options["cipher"], "aes-256-gcm", "{link}");
+            assert_eq!(s.options["password"], "pass", "{link}");
+        }
+        assert!(Proxy::from_link("ss://YWVz@1.2.3.4:8388").is_err());
+        assert!(Proxy::from_link("trojan://@example.org:443").is_err());
     }
 }

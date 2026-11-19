@@ -1,6 +1,6 @@
 //! Icons from the Phosphor icon font (regular and fill weights, MIT), drawn as text
 //! glyphs so they stay crisp at any scale. Plugins reuse these or pass their own
-//! painter function via [`Icon::Custom`].
+//! painter function via [`Icon::Custom`] or a Phosphor code point via [`Icon::Glyph`].
 use egui::{self, Align2, Color32, FontFamily, FontId, Painter, Pos2};
 
 /// Font family names registered by [`crate::theme::install_fonts`].
@@ -13,6 +13,8 @@ pub const SIZE: f32 = 16.0;
 pub enum Icon {
     /// A plugin-supplied icon painter: `(painter, center, ink)`.
     Custom(fn(&Painter, Pos2, Color32)),
+    /// A Phosphor glyph by its code point, for an icon not named here.
+    Glyph(char),
     More,
     Activity,
     /// Background tasks (an hourglass).
@@ -44,13 +46,13 @@ pub enum Icon {
     Unlock,
     Open,
     Disconnect,
-    Servers,
-    Subscriptions,
-    Routing,
-    Checks,
-    Listeners,
+    HardDrives,
+    Rss,
+    ArrowsSplit,
+    Gauge,
+    Plug,
     Settings,
-    Exit,
+    SignOut,
     Shield,
     QrCode,
     Key,
@@ -62,10 +64,8 @@ pub enum Icon {
     Circle,
     /// A command prompt: work on a remote machine.
     Terminal,
-    /// Bars: amounts over time.
-    Statistics,
-    /// A broom: take away everything an installation added.
-    Uninstall,
+    ChartBar,
+    Broom,
 }
 
 impl Icon {
@@ -73,6 +73,7 @@ impl Icon {
     fn glyph(self) -> Option<(char, bool)> {
         Some(match self {
             Icon::Custom(_) => return None,
+            Icon::Glyph(c) => (c, false),
             Icon::More => ('\u{E1FE}', false),
             Icon::Activity => ('\u{E000}', false),
             Icon::Tasks => ('\u{E2B6}', false),
@@ -102,13 +103,13 @@ impl Icon {
             Icon::Unlock => ('\u{E306}', false),
             Icon::Open => ('\u{E06C}', false),
             Icon::Disconnect => ('\u{E2E4}', false),
-            Icon::Servers => ('\u{E2A0}', false),
-            Icon::Subscriptions => ('\u{E402}', false),
-            Icon::Routing => ('\u{ED3C}', false),
-            Icon::Checks => ('\u{E628}', false),
-            Icon::Listeners => ('\u{EB56}', false),
+            Icon::HardDrives => ('\u{E2A0}', false),
+            Icon::Rss => ('\u{E402}', false),
+            Icon::ArrowsSplit => ('\u{ED3C}', false),
+            Icon::Gauge => ('\u{E628}', false),
+            Icon::Plug => ('\u{EB56}', false),
             Icon::Settings => ('\u{E272}', false),
-            Icon::Exit => ('\u{E42A}', false),
+            Icon::SignOut => ('\u{E42A}', false),
             Icon::Shield => ('\u{E40C}', false),
             Icon::QrCode => ('\u{E3E6}', false),
             Icon::Key => ('\u{E2D6}', false),
@@ -118,8 +119,8 @@ impl Icon {
             Icon::EyeOff => ('\u{E224}', false),
             Icon::Circle => ('\u{E18A}', false),
             Icon::Terminal => ('\u{E47E}', false),
-            Icon::Statistics => ('\u{E150}', false),
-            Icon::Uninstall => ('\u{EC54}', false),
+            Icon::ChartBar => ('\u{E150}', false),
+            Icon::Broom => ('\u{EC54}', false),
         })
     }
 }

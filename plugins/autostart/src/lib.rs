@@ -8,7 +8,7 @@ use std::io;
 pub static PLUGIN: Plugin = Plugin {
     id: "autostart",
     name: "Start at login",
-    description: "Start homeport in the background when you log in.",
+    description: "Start Homeport in the background when you log in.",
     platforms: Platform::DESKTOP,
     setup,
     ..Plugin::DEFAULT
@@ -184,7 +184,7 @@ mod entry {
         let exe = utf8(exe)?;
         if exe.starts_with("/Volumes/") || exe.contains("/AppTranslocation/") {
             return Err(io::Error::other(
-                "Move homeport to the Applications folder and open it from there first.",
+                "Move Homeport to the Applications folder and open it from there first.",
             ));
         }
         Ok(launch_agent(exe))
@@ -291,7 +291,7 @@ mod portal {
             ("handle_token", Value::from(token.as_str())),
             (
                 "reason",
-                Value::from("Start homeport in the background when you log in."),
+                Value::from("Start Homeport in the background when you log in."),
             ),
             ("autostart", Value::from(enable)),
             ("commandline", Value::from(vec!["homeport", "background"])),

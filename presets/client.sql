@@ -4,16 +4,16 @@
 
 INSERT INTO kernel_plugins (id, enabled) VALUES
   ('local-proxy', 1),
-  ('health-checks', 1),
+  ('url-tests', 1),
   ('name-filters', 1),
   ('dns', 1),
   ('statistics', 1);
 
 INSERT INTO kernel_settings (id, json) VALUES
-  ('servers.tests', json_object('check_secs', 900)),
+  ('servers.test-settings', json_object('check_secs', 900)),
   ('servers.auto', json_object('enabled', json('true')));
 
-INSERT INTO http_tests (id, url, expected) VALUES
+INSERT INTO url_tests (id, url, expected) VALUES
   (new_id(), 'https://web.telegram.org/', 'Below400'),
   (new_id(), 'https://youtube.com/', 'Below400'),
   (new_id(), 'https://www.google.com/generate_204', 'NoContent'),

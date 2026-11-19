@@ -73,7 +73,7 @@ impl Host {
             .open(dir.join("instance.lock"))
             .map_err(io)?;
         lock.try_lock().map_err(|_| {
-            Error::msg("This data directory is already open in another homeport instance.")
+            Error::msg("This data directory is already open in another Homeport instance.")
         })?;
         let path = dir.join(DATABASE);
         if let Some(preset) = preset.filter(|_| !path.exists()) {
@@ -108,7 +108,7 @@ impl Host {
 
     async fn launch(&self) -> Result<()> {
         if self.closing.load(Ordering::Acquire) {
-            return Err(Error::msg("homeport is shutting down."));
+            return Err(Error::msg("Homeport is shutting down."));
         }
         let me = self.me.clone();
         let restart = Arc::new(move || {
@@ -144,7 +144,7 @@ impl Host {
         .await?;
         if self.closing.load(Ordering::Acquire) {
             k.shutdown().await;
-            return Err(Error::msg("homeport is shutting down."));
+            return Err(Error::msg("Homeport is shutting down."));
         }
         // Repaint every open session when state, jobs or notices change.
         let mut changes = k.changes();
@@ -212,7 +212,7 @@ impl Host {
     async fn import_inner(&self, config: Arc<crate::configuration::Import>) -> Result<()> {
         let _r = self.restarting.lock().await;
         if self.closing.load(Ordering::Acquire) {
-            return Err(Error::msg("homeport is shutting down."));
+            return Err(Error::msg("Homeport is shutting down."));
         }
         let previous = tempfile::tempdir().map_err(crate::configuration::io)?;
         let rollback = previous.path().join("rollback.sqlite3");
@@ -357,7 +357,7 @@ impl Session {
                     match failure {
                         Some(e) => {
                             ui.label(crate::kit::bold(
-                                "homeport could not start its plugins",
+                                "Homeport could not start its plugins",
                                 15.,
                             ));
                             ui.label(e);

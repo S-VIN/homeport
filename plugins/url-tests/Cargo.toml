@@ -1,11 +1,12 @@
 [package]
-name = "plugin-connections"
-version = "0.1.0"
+name = "plugin-url-tests"
+version = "0.2.0"
 edition = "2024"
 publish = false
 
 [dependencies]
 homeport-kernel = { path = "../../crates/kernel" }
 plugin-servers = { path = "../servers" }
-serde_json = { workspace = true }
+serde = { workspace = true }
 tokio = { workspace = true }
+url = { workspace = true }

@@ -4,14 +4,14 @@
 use homeport_kernel::{Host, prelude::*};
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Table)]
-#[table(name = "test_notes")]
+#[table(name = "m_notes")]
 struct Note {
     id: Id,
     text: String,
 }
 /// The same table one version later: `stars` is new and required.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Table)]
-#[table(name = "test_notes")]
+#[table(name = "m_notes")]
 struct NoteV2 {
     id: Id,
     text: String,
@@ -19,7 +19,7 @@ struct NoteV2 {
 }
 /// The same rows one more version later, in a renamed table.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Table)]
-#[table(name = "test_cards")]
+#[table(name = "m_cards")]
 struct Card {
     id: Id,
     text: String,
@@ -36,21 +36,15 @@ static CONF: State<Conf> = State::new("m.conf");
 
 const CREATE: (&str, &str) = (
     "001-notes.sql",
-    "CREATE TABLE test_notes (id TEXT NOT NULL PRIMARY KEY, text TEXT NOT NULL) STRICT;",
+    "CREATE TABLE m_notes (id TEXT NOT NULL PRIMARY KEY, text TEXT NOT NULL) STRICT;",
 );
-const EXCLAIM: (&str, &str) = (
-    "002-exclaim.sql",
-    "UPDATE test_notes SET text = text || '!';",
-);
+const EXCLAIM: (&str, &str) = ("002-exclaim.sql", "UPDATE m_notes SET text = text || '!';");
 const STARS: (&str, &str) = (
     "003-stars.sql",
-    "ALTER TABLE test_notes ADD COLUMN stars INT NOT NULL DEFAULT 0;
-     UPDATE test_notes SET stars = length(text) + 1;",
+    "ALTER TABLE m_notes ADD COLUMN stars INT NOT NULL DEFAULT 0;
+     UPDATE m_notes SET stars = length(text) + 1;",
 );
-const RENAME: (&str, &str) = (
-    "004-cards.sql",
-    "ALTER TABLE test_notes RENAME TO test_cards;",
-);
+const RENAME: (&str, &str) = ("004-cards.sql", "ALTER TABLE m_notes RENAME TO m_cards;");
 
 fn plugin(
     migrations: &'static [(&'static str, &'static str)],
@@ -59,7 +53,7 @@ fn plugin(
     Plugin {
         id: "m",
         name: "Migrations",
-        category: categories::SERVERS,
+        category: Category::new("servers", "Servers"),
         required: true,
         migrations,
         setup,
@@ -165,7 +159,7 @@ async fn a_table_that_differs_from_its_type_stops_the_start() {
         .err()
         .expect("the table lacks a column");
     assert!(
-        error.message.contains("test_notes lacks column stars"),
+        error.message.contains("m_notes lacks column stars"),
         "{}",
         error.message
     );

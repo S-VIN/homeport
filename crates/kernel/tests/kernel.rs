@@ -8,13 +8,13 @@ use std::sync::{
 use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Table)]
-#[table(name = "test_parents")]
+#[table(name = "a_parents")]
 struct Parent {
     id: Id,
     name: String,
 }
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Table)]
-#[table(name = "test_children")]
+#[table(name = "b_children")]
 struct Child {
     id: Id,
     parent: Id,
@@ -51,12 +51,12 @@ impl Op for Trespass {
 static A: Plugin = Plugin {
     id: "a",
     name: "A",
-    category: categories::SERVERS,
+    category: Category::new("servers", "Servers"),
     required: true,
     migrations: &[(
         "001-tables.sql",
-        "CREATE TABLE test_parents (id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL) STRICT;
-         CREATE TABLE test_parents_archive (id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL) STRICT;",
+        "CREATE TABLE a_parents (id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL) STRICT;
+         CREATE TABLE a_archive (id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL) STRICT;",
     )],
     setup: |p| {
         p.list(&PARENTS).validate(|_, item, _, others| {
@@ -66,7 +66,7 @@ static A: Plugin = Plugin {
             }
             Ok(())
         });
-        p.list(&ARCHIVE).table("test_parents_archive");
+        p.list(&ARCHIVE).table("a_archive");
         p.handle(|_, Echo(s): Echo| async move { Ok(format!("a({s})")) });
         p.handle(|_, Slow(ms): Slow| async move {
             tokio::time::sleep(Duration::from_millis(ms)).await;
@@ -88,11 +88,11 @@ static A: Plugin = Plugin {
 static B: Plugin = Plugin {
     id: "b",
     name: "B",
-    category: categories::SERVERS,
+    category: Category::new("servers", "Servers"),
     requires: &[&A],
     migrations: &[(
         "001-children.sql",
-        "CREATE TABLE test_children (id TEXT NOT NULL PRIMARY KEY, parent TEXT NOT NULL) STRICT;",
+        "CREATE TABLE b_children (id TEXT NOT NULL PRIMARY KEY, parent TEXT NOT NULL) STRICT;",
     )],
     setup: |p| {
         p.collection(&CHILDREN);
@@ -245,7 +245,7 @@ async fn failed_commit_keeps_the_state() {
     )
     .unwrap();
     db.execute_batch(
-        "CREATE TRIGGER refuse BEFORE INSERT ON test_parents_archive
+        "CREATE TRIGGER refuse BEFORE INSERT ON a_archive
          BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
     )
     .unwrap();

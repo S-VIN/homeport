@@ -1,6 +1,7 @@
 //! The pure Auto select policy: ranking, quarantine, switch budget and
 //! the watch schedule, with no I/O.
 use super::*;
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Reason {
@@ -50,21 +51,28 @@ pub(super) struct World {
     pub(super) selected: Option<Id>,
     /// Ranked sources ([`order`]).
     pub(super) sources: Vec<Id>,
+    /// Every tested server's report, read once.
+    pub(super) reports: HashMap<Id, Report>,
 }
 impl World {
     pub(super) fn new(snap: Snapshot) -> Self {
+        let checks = servers::checks::checks(&snap);
+        let reports = (snap.get(&servers::RESULTS).iter())
+            .map(|h| (h.id, Report::of(&checks, h)))
+            .collect();
         Self {
+            reports,
             servers: snap.get(&servers::SERVERS).to_vec(),
             selected: *snap.get(&servers::SELECTED),
             sources: order(&snap),
             snap,
         }
     }
-    pub(super) fn health(&self, id: Id) -> Option<Report> {
-        report(&self.snap, id)
+    pub(super) fn last_test(&self, id: Id) -> Option<Report> {
+        self.reports.get(&id).cloned()
     }
     pub(super) fn rating(&self, id: Id) -> Option<u8> {
-        self.health(id).and_then(|h| h.rating)
+        self.last_test(id).and_then(|h| h.rating)
     }
     pub(super) fn excluded(&self, s: &Server) -> bool {
         servers::exclusion(&self.snap, s).is_some()
@@ -77,7 +85,7 @@ impl World {
             .map_or(0, |i| self.sources.len() - i)
     }
     pub(super) fn ideal(&self, s: &Server) -> bool {
-        self.health(s.id)
+        self.last_test(s.id)
             .is_some_and(|h| h.checked.is_some() && h.ideal())
     }
     pub(super) fn current(&self) -> Option<&Server> {

@@ -370,7 +370,7 @@ impl Window {
             };
             let result = async {
                 let dialog =
-                    rfd::AsyncFileDialog::new().add_filter("homeport configuration", &["sqlite3"]);
+                    rfd::AsyncFileDialog::new().add_filter("Homeport configuration", &["sqlite3"]);
                 match action {
                     FileAction::Export => {
                         let Some(file) = dialog
@@ -579,7 +579,7 @@ fn windows(
             let opts = eframe::NativeOptions {
                 viewport: egui::ViewportBuilder::default()
                     .with_app_id("io.github.homeport.Homeport")
-                    .with_title("homeport")
+                    .with_title("Homeport")
                     .with_decorations(true)
                     .with_inner_size([640., 560.])
                     .with_min_inner_size([375., 360.])
@@ -650,7 +650,7 @@ fn windows(
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("io.github.homeport.Homeport")
-            .with_title("homeport")
+            .with_title("Homeport")
             .with_decorations(true)
             .with_inner_size([640., 560.])
             .with_min_inner_size([375., 360.])

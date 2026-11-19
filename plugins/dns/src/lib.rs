@@ -5,7 +5,7 @@
 use homeport_kernel::{
     kit,
     prelude::*,
-    ui::{Column, ListEditor},
+    ui::{Field, ListEditor},
 };
 use std::net::IpAddr;
 
@@ -107,7 +107,7 @@ fn setup(p: &mut Setup) -> Result<()> {
         PageSpec {
             title: "DNS",
             icon: Icon::Globe,
-            order: 55,
+            order: 34,
         },
         page,
     );
@@ -151,20 +151,16 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
             },
         );
         if s.server == Server::Custom {
+            let mut address = Ok(None);
             kit::settings_row(ui, "Address", "", |ui| {
-                if let Some(text) = kit::field(
-                    ui,
-                    "custom",
-                    &s.custom,
-                    "https://dns.example/dns-query",
-                    260.,
-                ) {
-                    match check_address(&text) {
-                        Ok(a) => cx.update("custom", &SETTINGS, move |s| s.custom = a),
-                        Err(e) => cx.notify_error(e),
-                    }
-                }
+                let hint = "https://dns.example/dns-query";
+                address = kit::checked_field(ui, "custom", &s.custom, hint, 260., check_address);
             });
+            match address {
+                Ok(Some(a)) => cx.update("custom", &SETTINGS, move |s| s.custom = a),
+                Err(e) => drop(kit::field_error(ui, &e, None)),
+                Ok(None) => {}
+            }
         }
         let mut fake_ip = s.fake_ip;
         kit::settings_row(
@@ -198,10 +194,10 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
                     && !h.ip.trim().is_empty()
             },
         )
-        .column(Column::edit("Domain", "example.com", |h: &mut Host| {
+        .column(Field::edit("Domain", "example.com", |h: &mut Host| {
             &mut h.domain
         }))
-        .column(Column::edit("IP address", "192.168.1.10", |h: &mut Host| &mut h.ip).width(160.))
+        .column(Field::edit("IP address", "192.168.1.10", |h: &mut Host| &mut h.ip).width(160.))
         .empty(
             Icon::Globe,
             "No hosts",

@@ -113,7 +113,7 @@ impl Store {
             .map_err(db)?;
         if !ours || !safe || integrity != "ok" {
             return Err(Error::msg(
-                "This file is not a valid homeport configuration. Your settings have not changed.",
+                "This file is not a valid Homeport configuration. Your settings have not changed.",
             ));
         }
         Ok(())

@@ -6,10 +6,11 @@
 //! Geo rules (`geosite:category-ru`, `geoip:ru`) use rule sets from the
 //! MetaCubeX geo database. The core downloads them, keeps them in its home
 //! folder and refreshes them daily; the page can refresh them on demand.
-use homeport_kernel::core::Labels;
 use homeport_kernel::mihomo::{RuleBehavior, RuleProvider};
-use homeport_kernel::{kit, mihomo::ipnet::IpNet, prelude::*, ui::Column, ui::ListEditor};
+use homeport_kernel::{kit, mihomo::ipnet::IpNet, prelude::*};
 use plugin_servers as servers;
+
+mod ui;
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr},
@@ -281,7 +282,7 @@ pub fn rule_pattern(pattern: &str) -> Result<(String, Option<IpNet>)> {
         }
         if app.is_empty() || app.contains([',', '\n']) {
             return Err(Error::msg(
-                "Enter an app name, for example app:Telegram or app:chrome.exe.",
+                "Enter an app name, for example Telegram or chrome.exe.",
             ));
         }
         return Ok((format!("app:{app}"), None));
@@ -293,7 +294,7 @@ pub fn rule_pattern(pattern: &str) -> Result<(String, Option<IpNet>)> {
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c))
         {
-            return Err(Error::msg("Choose an inbound, for example VLESS clients."));
+            return Err(Error::msg("Choose an inbound."));
         }
         return Ok((format!("inbound:{name}"), None));
     }
@@ -306,10 +307,11 @@ pub fn rule_pattern(pattern: &str) -> Result<(String, Option<IpNet>)> {
     if p == "*" || geo(&p).is_some() {
         return Ok((p, None));
     }
-    if p.starts_with("geosite:") || p.starts_with("geoip:") {
-        return Err(Error::msg(
-            "Enter a geo list name, for example geosite:category-ru or geoip:ru.",
-        ));
+    if p.starts_with("geoip:") {
+        return Err(Error::msg("Choose a country."));
+    }
+    if p.starts_with("geosite:") {
+        return Err(Error::msg("Enter a list name, for example category-ru."));
     }
     if let Ok(net) = p.parse::<IpNet>() {
         return Ok((net.trunc().to_string(), Some(net.trunc())));
@@ -363,352 +365,118 @@ async fn above_catch_all(cx: Cx, mut op: Add<Rule>, next: Next<Add<Rule>>) -> Re
 }
 
 fn setup(p: &mut Setup) -> Result<()> {
+    p.list(&RULES)
+        .validate(|_, rule, _, others| validate(rule, others));
     p.wrap(above_catch_all);
     p.handle(set_route);
-    p.on(|_: Cx, e: Added<Rule>| async move {
-        info!("Rule added: {} → {}", e.item.pattern, e.item.action);
-        Ok(())
-    });
-    p.on(|_: Cx, e: Saved<Rule>| async move {
-        info!("Rule changed: {} → {}", e.item.pattern, e.item.action);
-        Ok(())
-    });
-    p.on(|_: Cx, e: Removed<Rule>| async move {
-        info!("Rule removed: {}", e.item.pattern);
-        Ok(())
-    });
-    p.list(&RULES).validate(|_, rule, _, others| {
-        let (pattern, network) = rule_pattern(&rule.pattern)?;
-        let clash = others.iter().any(|r| {
-            r.pattern == pattern
-                || network.is_some()
-                    && rule_pattern(&r.pattern).ok().and_then(|(_, n)| n) == network
-        });
-        if clash {
-            bail!("Routing pattern already exists.");
-        }
-        rule.pattern = pattern;
-        Ok(())
-    });
+    p.on(rule_added);
+    p.on(rule_saved);
+    p.on(rule_removed);
     p.live(&GEO, HashMap::new);
-    p.core(|snap| {
-        let via = servers::route(snap);
-        let (mut rules, mut labels) = (Vec::new(), Vec::new());
-        for r in snap.get(&RULES).iter() {
-            let Ok(core) = core_rule(r, &via) else {
-                continue;
-            };
-            // Connections and Logs show the rule as the user wrote it.
-            if r.pattern != "*" {
-                labels.push((core.reported(), r.pattern.clone()));
-            }
-            rules.push(core);
-        }
-        Fragment {
-            rule_providers: geo_providers(snap),
-            labels,
-            ..Fragment::rules(Stage::User, rules)
-        }
-    });
-    p.handle(|cx: Cx, _: UpdateGeo| async move {
-        let sets = geo_providers(&cx.snapshot());
-        let total = Some(sets.len() as u64);
-        let mut failed = Vec::new();
-        for (i, p) in sets.iter().enumerate() {
-            cx.checkpoint()?;
-            if cx.core().update_rule_provider(&p.name).await.is_err() {
-                failed.push(p.name.clone());
-            }
-            cx.progress(i as u64 + 1, total);
-        }
-        let _ = read_geo(&cx).await;
-        if !failed.is_empty() {
-            bail!("Could not download {}.", failed.join(", "));
-        }
-        info!("Geo lists updated: {}", sets.len());
-        cx.summary(kit::plural(
-            sets.len(),
-            "geo list updated",
-            "geo lists updated",
-        ));
-        Ok(())
-    });
+    p.core(fragment);
+    p.handle(update_geo);
     p.handle(|cx: Cx, _: RefreshGeo| async move { read_geo(&cx).await });
     p.every(
         "geo-status",
         |s| (!geo_providers(s).is_empty()).then_some(Duration::from_secs(60)),
         || RefreshGeo,
     );
-    // New geo rules download in the background; show their state soon after
-    // the last of several quick edits.
-    p.watch(
-        |s| s.get(&RULES),
-        |cx: Cx, _| async move {
-            if !geo_providers(&cx.snapshot()).is_empty() {
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                read_geo(&cx).await?;
-            }
-            Ok(())
-        },
-    )
-    .latest();
+    p.watch(|s| s.get(&RULES), geo_after_edit).latest();
     p.page_fn(
         PageSpec {
             title: "Routing",
-            icon: Icon::Routing,
+            icon: Icon::ArrowsSplit,
             order: 30,
         },
-        page,
+        ui::page,
     );
     Ok(())
 }
 
-/// What a pattern matches, for the small type badge.
-fn kind(pattern: &str) -> &'static str {
-    match rule_pattern(pattern) {
-        Ok((p, _)) if p == "*" => "Everything",
-        Ok((p, _)) if p.starts_with("app:") => "App",
-        Ok((p, _)) if p.starts_with("inbound:") => "Inbound",
-        Ok((p, _)) if p.starts_with("geosite:") => "GeoSite",
-        Ok((p, _)) if p.starts_with("geoip:") => "GeoIP",
-        Ok((_, Some(net))) if net.prefix_len() == net.max_prefix_len() => "IP",
-        Ok((_, Some(_))) => "Network",
-        _ => "Domain",
-    }
-}
-
-choices!(
-    /// The type picked in the add bar; it only decides the pattern's prefix.
-    enum Kind {
-        Domain => "Domain",
-        Ip => "IP",
-        GeoIp => "GeoIP",
-        GeoSite => "GeoSite",
-        App => "App",
-        Inbound => "Inbound",
-        Everything => "Everything",
-    }
-);
-impl Kind {
-    fn prefix(self) -> &'static str {
-        match self {
-            Kind::GeoIp => "geoip:",
-            Kind::GeoSite => "geosite:",
-            Kind::App => "app:",
-            Kind::Inbound => "inbound:",
-            _ => "",
-        }
-    }
-    fn of(pattern: &str) -> Option<Kind> {
-        let p = pattern.trim();
-        Kind::ALL
-            .iter()
-            .copied()
-            .find(|k| !k.prefix().is_empty() && p.starts_with(k.prefix()))
-            .or((p == "*").then_some(Kind::Everything))
-    }
-}
-
-/// GeoIP lists offered in the add bar; any other code still works typed as `geoip:xx`.
-const COUNTRIES: &[(&str, &str)] = &[
-    ("private", "Private networks (LAN)"),
-    ("ru", "🇷🇺 Russia"),
-    ("by", "🇧🇾 Belarus"),
-    ("ua", "🇺🇦 Ukraine"),
-    ("kz", "🇰🇿 Kazakhstan"),
-    ("cn", "🇨🇳 China"),
-    ("ir", "🇮🇷 Iran"),
-    ("tr", "🇹🇷 Turkey"),
-    ("us", "🇺🇸 United States"),
-    ("gb", "🇬🇧 United Kingdom"),
-    ("de", "🇩🇪 Germany"),
-    ("nl", "🇳🇱 Netherlands"),
-    ("fr", "🇫🇷 France"),
-    ("fi", "🇫🇮 Finland"),
-    ("se", "🇸🇪 Sweden"),
-    ("pl", "🇵🇱 Poland"),
-    ("jp", "🇯🇵 Japan"),
-    ("kr", "🇰🇷 South Korea"),
-    ("sg", "🇸🇬 Singapore"),
-    ("hk", "🇭🇰 Hong Kong"),
-    ("in", "🇮🇳 India"),
-    ("ae", "🇦🇪 United Arab Emirates"),
-    ("ca", "🇨🇦 Canada"),
-    ("br", "🇧🇷 Brazil"),
-];
-
-/// The add bar: a type, then what it needs. The draft keeps the full pattern.
-fn rule_fields(ui: &mut egui::Ui, inbounds: &[(String, String)], r: &mut Rule, width: f32) -> bool {
-    let sandboxed = sandboxed();
-    let kinds: Vec<Kind> = Kind::ALL
-        .iter()
-        .copied()
-        .filter(|k| match k {
-            Kind::App => !sandboxed,
-            Kind::Inbound => !inbounds.is_empty(),
-            _ => true,
-        })
-        .collect();
-    let key = ui.scope_id().with("rule-kind");
-    let mut kind: Kind = ui
-        .data(|d| d.get_temp(key))
-        .or_else(|| Kind::of(&r.pattern))
-        .unwrap_or(Kind::Domain);
-    let pattern = r.pattern.trim();
-    let mut value = match Kind::of(pattern) {
-        Some(k) if k == kind => pattern[k.prefix().len()..].to_owned(),
-        _ => pattern.to_owned(),
-    };
-    if value == "*" {
-        value.clear();
-    }
-    let mut picked = kind;
-    let fields = kit::Fields::new(width).choice("kind", &mut picked, &kinds);
-    let fields = match kind {
-        Kind::Domain => fields
-            .input("pattern", &mut value, "example.org or *tube*")
-            .help("example.org also covers its subdomains; =example.org only that name; * matches any text. A pasted link works too."),
-        Kind::Ip => fields.input("pattern", &mut value, "10.0.0.0/8, 1.2.3.4 or 192.168.*"),
-        Kind::GeoIp => {
-            let options = COUNTRIES.iter().map(|(v, l)| (v.to_string(), l.to_string()));
-            fields.options("country", &mut value, options.collect(), "Country")
-        }
-        Kind::GeoSite => fields
-            .input("pattern", &mut value, "category-ru, youtube, google…")
-            .help("A list name from the MetaCubeX geo database (meta-rules-dat)."),
-        Kind::App => fields
-            .input("pattern", &mut value, "Telegram or chrome.exe")
-            .help("The process name, as Logs and Connections show it."),
-        Kind::Inbound => {
-            fields.options("inbound", &mut value, inbounds.to_vec(), "Inbound")
-        }
-        Kind::Everything => fields,
-    };
-    let enter = fields.choice("route", &mut r.action, Route::ALL).show(ui);
-    if picked != kind {
-        ui.data_mut(|d| d.insert_temp(key, picked));
-        // A country or an inbound means nothing as typed text, and back.
-        let closed = |k| matches!(k, Kind::GeoIp | Kind::Inbound);
-        if closed(picked) || closed(kind) {
-            value.clear();
-        }
-        kind = picked;
-    }
-    r.pattern = match kind {
-        Kind::Everything => "*".into(),
-        _ if value.trim().is_empty() => String::new(),
-        k => format!("{}{}", k.prefix(), value.trim()),
-    };
-    enter && !r.pattern.is_empty()
-}
-
-/// How a rule's pattern reads in the list: inbounds by their label.
-fn pattern_label(labels: &Labels, pattern: &str) -> Option<String> {
-    let name = pattern.strip_prefix("inbound:")?;
-    labels.get(name).map(str::to_owned)
-}
-
-fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
-    let geo_status = (*cx.live(&GEO)).clone();
-    let n = cx.get(&RULES).len();
-    let counter = kit::count(n, "rule", "rules");
-    let has_geo = !geo_providers(cx.snapshot()).is_empty();
-    cx.page_header(ui, &counter, |ui, cx| {
-        if has_geo {
-            cx.job_button(
-                ui,
-                Icon::Refresh,
-                "Update geo data",
-                cx.core_status().running(),
-                || UpdateGeo,
-            );
-        }
+/// A rule's pattern in its normal form, unless another rule has it.
+fn validate(rule: &mut Rule, others: &[Rule]) -> Result<()> {
+    let (pattern, network) = rule_pattern(&rule.pattern)?;
+    let clash = others.iter().any(|r| {
+        r.pattern == pattern
+            || network.is_some() && rule_pattern(&r.pattern).ok().and_then(|(_, n)| n) == network
     });
-    // Listeners other plugins label (`vless` → "VLESS clients").
-    let labels = cx.core().labels();
-    let inbounds = labels.inbounds().to_vec();
-    ListEditor::new(&RULES)
-        .add_form(
-            "Add routing rule",
-            || Rule {
-                id: Id::random(),
-                pattern: String::new(),
-                action: Route::Proxy,
-            },
-            move |ui, r, width| rule_fields(ui, &inbounds, r, width),
-        )
-        // The type leads, as in the add form.
-        .leading("Type", 76., |ui, _, r: &Rule| {
-            kit::badge(ui, kind(&r.pattern), kit::Tone::Neutral);
-        })
-        .column(
-            Column::edit("Pattern", "Domain, IP or network", |r: &mut Rule| {
-                &mut r.pattern
-            })
-            .display(move |r: &Rule| {
-                pattern_label(&labels, &r.pattern).unwrap_or_else(|| r.pattern.clone())
-            }),
-        )
-        .column(Column::choice(
-            "Route",
-            120.,
-            |r: &mut Rule| &mut r.action,
-            Route::ALL,
-        ))
-        .subtitle(move |rows, i| rule_note(rows, i, &geo_status))
-        .empty(
-            Icon::Routing,
-            "No routing rules",
-            "All traffic goes to the connected server until you add a rule.",
-        )
-        .show(ui, cx);
+    if clash {
+        bail!("Routing pattern already exists.");
+    }
+    rule.pattern = pattern;
+    Ok(())
 }
 
-/// The line under a rule: shadowed by an earlier `*`, or how many entries
-/// its geo list has.
-fn rule_note(
-    rows: &[Rule],
-    i: usize,
-    geo: &HashMap<String, GeoStatus>,
-) -> Option<(String, kit::Tone)> {
-    if rows[..i].iter().any(|r| r.pattern == "*") {
-        return Some((
-            "Never used: the * rule above matches everything first".into(),
-            kit::Tone::Warning,
-        ));
+async fn rule_added(_: Cx, e: Added<Rule>) -> Result<()> {
+    info!("Rule added: {} → {}", e.item.pattern, e.item.action);
+    Ok(())
+}
+async fn rule_saved(_: Cx, e: Saved<Rule>) -> Result<()> {
+    info!("Rule changed: {} → {}", e.item.pattern, e.item.action);
+    Ok(())
+}
+async fn rule_removed(_: Cx, e: Removed<Rule>) -> Result<()> {
+    info!("Rule removed: {}", e.item.pattern);
+    Ok(())
+}
+
+/// The rules in the core: the user's in order, then whatever no rule caught
+/// goes via the server.
+fn fragment(snap: &Snapshot) -> Fragment {
+    let via = servers::route(snap);
+    let (mut rules, mut labels) = (Vec::new(), Vec::new());
+    for r in snap.get(&RULES).iter() {
+        let Ok(core) = core_rule(r, &via) else {
+            continue;
+        };
+        // Connections and Logs show the rule as the user wrote it.
+        if r.pattern != "*" {
+            labels.push((core.reported(), r.pattern.clone()));
+        }
+        rules.push(core);
     }
-    // Say, imported from a desktop install.
-    if rows[i].pattern.starts_with("app:") && (sandboxed()) {
-        return Some((
-            "Never used: Flatpak and Docker hide other apps".into(),
-            kit::Tone::Warning,
-        ));
+    labels.push(("Match".into(), "Everything else".into()));
+    let mut fragment = Fragment::rules(Stage::User, rules);
+    fragment.rules.push((Stage::Final, CoreRule::Match(via)));
+    Fragment {
+        rule_providers: geo_providers(snap),
+        labels,
+        ..fragment
     }
-    let (kind, name) = self::geo(&rows[i].pattern)?;
-    let what = if kind == Geo::Site {
-        ("domain", "domains")
-    } else {
-        ("network", "networks")
-    };
-    Some(match geo.get(&provider(kind, name).name) {
-        Some(GeoStatus {
-            rules,
-            updated: Some(_),
-        }) if *rules > 0 => (
-            kit::plural(*rules as usize, what.0, what.1),
-            kit::Tone::Neutral,
-        ),
-        Some(GeoStatus {
-            updated: Some(_), ..
-        }) => (
-            "The list is empty. Check the name".into(),
-            kit::Tone::Warning,
-        ),
-        _ => (
-            "Not downloaded yet. Check the name or update geo data".into(),
-            kit::Tone::Warning,
-        ),
-    })
+}
+
+async fn update_geo(cx: Cx, _: UpdateGeo) -> Result<()> {
+    let sets = geo_providers(&cx.snapshot());
+    let total = Some(sets.len() as u64);
+    let mut failed = Vec::new();
+    for (i, p) in sets.iter().enumerate() {
+        cx.checkpoint()?;
+        if cx.core().update_rule_provider(&p.name).await.is_err() {
+            failed.push(p.name.clone());
+        }
+        cx.progress(i as u64 + 1, total);
+    }
+    let _ = read_geo(&cx).await;
+    if !failed.is_empty() {
+        bail!("Could not download {}.", failed.join(", "));
+    }
+    info!("Geo lists updated: {}", sets.len());
+    cx.summary(kit::plural(
+        sets.len(),
+        "geo list updated",
+        "geo lists updated",
+    ));
+    Ok(())
+}
+
+/// New geo rules download in the background: show their state soon after
+/// the last of several quick edits.
+async fn geo_after_edit(cx: Cx, _: std::sync::Arc<Vec<Rule>>) -> Result<()> {
+    if !geo_providers(&cx.snapshot()).is_empty() {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        read_geo(&cx).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

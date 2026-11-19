@@ -1,5 +1,5 @@
-//! # health-checks
-//! Test URLs (the Tests page): every server test opens each through the
+//! # url-tests
+//! Test URLs (its own page): every server test opens each through the
 //! server, with the expected status, by mihomo's delay test (in parallel,
 //! for every protocol). The share that passed counts in the rating as the
 //! check "Test URLs" ([`servers::CHECKS`]); a server's details list each result.
@@ -7,16 +7,16 @@ use homeport_kernel::mihomo::Delay;
 use homeport_kernel::{
     kit,
     prelude::*,
-    ui::{Column, ListEditor},
+    ui::{Field, ListEditor},
 };
 use plugin_servers::{self as servers, Probe, Reading, Server};
 use tokio::task::JoinSet;
 
 pub static PLUGIN: Plugin = Plugin {
-    id: "health-checks",
-    name: "Tests",
+    id: "url-tests",
+    name: "Test URLs",
     description: "Test servers with your own sites; the share that passes counts in the rating.",
-    category: categories::SERVERS,
+    category: plugin_servers::CATEGORY,
     requires: &[&plugin_servers::PLUGIN],
     migrations: homeport_kernel::migrations!(),
     setup,
@@ -32,17 +32,7 @@ choices!(pub enum Expected {
     Any => "Any status",
 });
 impl Expected {
-    pub fn accepts(self, code: u16) -> bool {
-        match self {
-            Self::NoContent => code == 204,
-            Self::Success => (200..300).contains(&code),
-            Self::Below400 => code < 400,
-            Self::Below500 => code < 500,
-            Self::Below503 => code < 503,
-            Self::Any => true,
-        }
-    }
-    /// The same range in mihomo's syntax (`None` accepts every status).
+    /// The range in mihomo's syntax (`None` accepts every status).
     pub fn mihomo(self) -> Option<&'static str> {
         match self {
             Self::NoContent => Some("204"),
@@ -62,44 +52,30 @@ choices!(pub enum Failure {
 });
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Table)]
-#[table(name = "http_tests")]
+#[table(name = "url_tests")]
 pub struct Test {
     pub id: Id,
     pub url: String,
     pub expected: Expected,
 }
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Table)]
-#[table(name = "test_results")]
+#[table(name = "url_tests_results")]
 pub struct Measurement {
     pub id: Id,
     pub server: Id,
     pub test: Id,
-    /// HTTP status of older checks; the delay test does not report it.
-    pub status: Option<u16>,
     pub passed: bool,
     /// Response time through the server when passed.
-    #[serde(default)]
     pub delay_ms: Option<u32>,
     /// Why the test failed, when known.
-    #[serde(default)]
     pub failure: Option<Failure>,
 }
-pub static TESTS: State<Vec<Test>> = State::new("health-checks.tests");
-pub static RESULTS: State<Vec<Measurement>> = State::new("health-checks.results");
+pub static TESTS: State<Vec<Test>> = State::new("url-tests.tests");
+pub static RESULTS: State<Vec<Measurement>> = State::new("url-tests.results");
 
-/// The check of a server with every test URL.
-pub struct UrlTests(Probe);
-impl Op for UrlTests {
-    type Reply = Option<Reading>;
-}
-impl servers::CheckOp for UrlTests {
-    fn new(probe: Probe) -> Self {
-        Self(probe)
-    }
-}
-
-/// Open every test URL through the server at once; a full test stores the results.
-async fn url_tests(cx: Cx, UrlTests(probe): UrlTests) -> Result<Option<Reading>> {
+/// The check of a server with every test URL: open them through the server
+/// at once; a full test stores the results.
+async fn url_tests(cx: Cx, probe: Probe) -> Result<Option<Reading>> {
     // An edit of the URLs meanwhile makes these results stale.
     let input = cx.input(|snap| Some(snap.get(&TESTS).to_vec()));
     let tests = input.value().cloned().unwrap_or_default();
@@ -123,7 +99,6 @@ async fn url_tests(cx: Cx, UrlTests(probe): UrlTests) -> Result<Option<Reading>>
             id: server.child(t.id.0.as_bytes()),
             server,
             test: t.id,
-            status: None,
             passed: d.ms().is_some(),
             delay_ms: d.ms(),
             failure: match d {
@@ -179,8 +154,7 @@ fn setup(p: &mut Setup) -> Result<()> {
         })
         .await
     });
-    p.handle(url_tests);
-    servers::add_check::<UrlTests>(
+    servers::add_check(
         p,
         servers::CheckSpec {
             id: "urls",
@@ -189,6 +163,7 @@ fn setup(p: &mut Setup) -> Result<()> {
             quick: true,
         },
         |snap| !snap.get(&TESTS).is_empty(),
+        url_tests,
     );
     // The user's first site is what "the server works" means to them.
     p.hook(&servers::PROBE, |snap, _| {
@@ -197,26 +172,24 @@ fn setup(p: &mut Setup) -> Result<()> {
     p.fill(&servers::DETAILS, "tests", 20, details);
     p.page_fn(
         PageSpec {
-            title: "Tests",
-            icon: Icon::Checks,
-            order: 40,
+            title: "Test URLs",
+            icon: Icon::Gauge,
+            order: 24,
         },
         page,
     );
     Ok(())
 }
 
-/// "Passed · 120 ms", "Failed · Timeout", "Failed · HTTP 404" (older checks) …
 /// "Passed · 120 ms", "Failed · Timeout", "Failed · status not 2xx".
 fn result_text(r: &Measurement, expected: Expected) -> String {
-    let detail = match (r.delay_ms, r.failure, r.status) {
-        (Some(ms), ..) => format!("{ms} ms"),
-        (None, Some(Failure::WrongStatus), _) => format!("status not {expected}"),
-        (None, Some(Failure::Failed), _) | (None, None, None) => {
+    let detail = match (r.delay_ms, r.failure) {
+        (Some(ms), _) => format!("{ms} ms"),
+        (None, Some(Failure::WrongStatus)) => format!("status not {expected}"),
+        (None, Some(Failure::Failed) | None) => {
             return if r.passed { "Passed" } else { "Failed" }.into();
         }
-        (None, Some(f), _) => f.to_string(),
-        (None, None, Some(code)) => format!("HTTP {code}"),
+        (None, Some(f)) => f.to_string(),
     };
     format!("{} · {detail}", if r.passed { "Passed" } else { "Failed" })
 }
@@ -232,15 +205,19 @@ fn host(url: &str) -> String {
 fn details(ui: &mut egui::Ui, cx: &mut UiCx, s: &Server) {
     let snap = cx.snapshot().clone();
     let pal = kit::colors(ui);
-    // One "Tests" property, a line per test: the result first, then the
-    // site, which a narrow row cuts (the full URL is on hover).
-    for (i, t) in snap.get(&TESTS).iter().enumerate() {
-        let r = snap
-            .get(&RESULTS)
+    // Under the "Test URLs" line of the server's test, a line per test: the
+    // result first, then the site, which a narrow row cuts (the full URL is
+    // on hover). Nothing before the first test.
+    let results = snap.get(&RESULTS);
+    if !results.iter().any(|r| r.server == s.id) {
+        return;
+    }
+    for t in snap.get(&TESTS).iter() {
+        let r = results
             .iter()
             .find(|r| r.server == s.id && r.test == t.id)
             .cloned();
-        kit::property_with(ui, if i == 0 { "Tests" } else { "" }, |ui| {
+        kit::property_with(ui, "", |ui| {
             ui.spacing_mut().item_spacing.x = 4.;
             let (icon, text, color) = match r {
                 None => (Icon::Info, "Not tested".to_owned(), pal.muted),
@@ -251,7 +228,7 @@ fn details(ui: &mut egui::Ui, cx: &mut UiCx, s: &Server) {
                         Icon::Error
                     },
                     result_text(&r, t.expected),
-                    if r.passed { pal.success } else { pal.danger },
+                    if r.passed { pal.success } else { pal.warning },
                 ),
             };
             kit::icon(ui, icon, 14., color);
@@ -288,7 +265,7 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
     let counter = kit::count(n, "test URL", "test URLs");
     cx.page_header(ui, &counter, |ui, cx| {
         let ok = cx.core_status().running() && !cx.get(&servers::SERVERS).is_empty();
-        cx.job_button(ui, Icon::Checks, "Test all", ok, || servers::CheckAll);
+        cx.job_button(ui, Icon::Gauge, "Test all", ok, || servers::TestAll);
     });
     let results = cx.get(&RESULTS);
 
@@ -313,19 +290,19 @@ fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
                     && !t.url.trim().is_empty()
             },
         )
-        .column(Column::edit(
+        .column(Field::edit(
             "URL",
             "https://example.org/",
             |t: &mut Test| &mut t.url,
         ))
-        .column(Column::choice(
+        .column(Field::choice(
             "Expected status",
             120.,
             |t: &mut Test| &mut t.expected,
             Expected::ALL,
         ))
         .empty(
-            Icon::Checks,
+            Icon::Gauge,
             "No test URLs",
             "Add a site above to test servers with it.",
         )

@@ -6,6 +6,5 @@ publish = false
 
 [dependencies]
 homeport-kernel = { path = "../../crates/kernel" }
-serde_json = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }

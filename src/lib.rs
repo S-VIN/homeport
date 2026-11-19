@@ -9,16 +9,15 @@ pub fn catalog() -> Vec<&'static Plugin> {
         // In page order: Settings → Plugins lists them like the navigation.
         &plugin_servers::PLUGIN,
         &plugin_subscriptions::PLUGIN,
-        &plugin_health_checks::PLUGIN,
+        &plugin_url_tests::PLUGIN,
         &plugin_name_filters::PLUGIN,
         &plugin_routing::PLUGIN,
-        &plugin_connections::PLUGIN,
+        &plugin_local_proxy::PLUGIN,
+        &plugin_vless_inbound::PLUGIN,
+        &plugin_dns::PLUGIN,
         &plugin_statistics::PLUGIN,
         &plugin_logs::PLUGIN,
         &plugin_chain_exit::PLUGIN,
-        &plugin_local_proxy::PLUGIN,
-        &plugin_dns::PLUGIN,
-        &plugin_vless_inbound::PLUGIN,
         #[cfg(feature = "desktop")]
         &plugin_install_to_server::PLUGIN,
         // Desktop integration (Flatpak uses the Background portal); the plugin

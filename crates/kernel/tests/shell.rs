@@ -31,7 +31,7 @@ mod saved {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Table)]
-    #[table(name = "test_saved_notes")]
+    #[table(name = "saved_notes")]
     struct Note {
         id: Id,
         text: String,
@@ -44,17 +44,17 @@ mod saved {
     static NOTES_PLUGIN: Plugin = Plugin {
         id: "saved",
         name: "Saved",
-        category: categories::SERVERS,
+        category: Category::new("servers", "Servers"),
         migrations: &[(
             "001-notes.sql",
-            "CREATE TABLE test_saved_notes (id TEXT NOT NULL PRIMARY KEY, text TEXT NOT NULL) STRICT;",
+            "CREATE TABLE saved_notes (id TEXT NOT NULL PRIMARY KEY, text TEXT NOT NULL) STRICT;",
         )],
         setup: |p| {
             p.list(&NOTES);
             p.page_fn(
                 PageSpec {
                     title: "Notes",
-                    icon: Icon::Servers,
+                    icon: Icon::HardDrives,
                     order: 10,
                 },
                 |ui, cx| {

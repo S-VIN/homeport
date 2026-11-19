@@ -36,6 +36,7 @@ pub(super) fn navigation(root: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette, r
             .layout(Layout::left_to_right(Align::Center)),
     );
     let ui = &mut ui;
+    // In the sidebar's order: a few fit, the rest go to More.
     let mut tabs = tabs(cx);
     let settings = Tab {
         id: SETTINGS_PAGE,
@@ -270,7 +271,9 @@ pub(super) fn sidebar(root: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette, rect
     ui.spacing_mut().item_spacing.y = 2.;
     let width = inner.width();
     let mut group = None;
-    for t in tabs(cx) {
+    let (pages, plugins): (Vec<Tab>, Vec<Tab>) =
+        tabs(cx).into_iter().partition(|t| t.id != PLUGINS_PAGE);
+    for t in pages {
         if group.is_some_and(|g| g != t.group) {
             ui.add_space(theme::SPACE_XS);
             kit::separator(ui);
@@ -281,8 +284,8 @@ pub(super) fn sidebar(root: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette, rect
             cx.s.page = t.id;
         }
     }
-    // Bottom block: save state, Activity, Settings.
-    let bottom = 24. + 2. + 32. + 2. + 32.;
+    // Bottom block: save state, Activity, Plugins, Settings.
+    let bottom = 24. + 3. * (2. + 32.);
     ui.add_space((ui.available_height() - bottom).max(theme::SPACE_L));
     // Room kept for the save state, so the rows below don't move.
     ui.allocate_ui_with_layout(
@@ -308,6 +311,11 @@ pub(super) fn sidebar(root: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette, rect
     a.mark(ui, p, r.rect.left_center() + vec2(25., -6.));
     if r.clicked() {
         a.toggle(cx);
+    }
+    for t in plugins {
+        if side_tab(ui, p, &t, cx.s.page == t.id, width).clicked() {
+            cx.s.page = t.id;
+        }
     }
     let settings = Tab {
         id: SETTINGS_PAGE,

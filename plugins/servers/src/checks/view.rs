@@ -7,13 +7,13 @@ use homeport_kernel::columns::Column;
 
 /// The reading of check `id` of a server, if tested.
 fn reading(snap: &Snapshot, server: Id, id: &str) -> Option<Reading> {
-    health(snap, server)?.scores.0.get(id).cloned()
+    last_test(snap, server)?.scores.0.get(id).cloned()
 }
 /// "3 of 4 passed · Speed 1.2 MB/s"-style line of every check, for tooltips.
 fn summary(snap: &Snapshot, s: &Server) -> String {
-    match health(snap, s.id) {
+    match last_test(snap, s.id) {
         None => "Not tested yet".into(),
-        Some(h) if h.unreachable() => "Failed the last test".into(),
+        Some(h) if h.unreachable() => h.failed_text(),
         Some(h) => {
             let latency = h.ping_ms.map(|ms| format!("Latency: {ms} ms"));
             let lines: Vec<String> = latency
@@ -34,7 +34,7 @@ fn summary(snap: &Snapshot, s: &Server) -> String {
 pub(super) fn register(p: &mut Setup) {
     p.fill(&TOOLBAR, "test-all", 20, |ui, cx, _| {
         let ok = cx.core_status().running();
-        cx.job_button(ui, Icon::Checks, "Test all", ok, || CheckAll);
+        cx.job_button(ui, Icon::Gauge, "Test all", ok, || TestAll);
     });
     let rating = Column::<Server> {
         id: "rating",
@@ -42,11 +42,7 @@ pub(super) fn register(p: &mut Setup) {
         title: "Rating",
         help: "0–100 from latency and the tests",
         secondary: false,
-        sort: Some(|snap, s| {
-            -(health(snap, s.id)
-                .and_then(|h| h.rating)
-                .map_or(-1, i64::from))
-        }),
+        sort: Some(|snap, s| -(rating_of(snap, s.id).map_or(-1, i64::from))),
     };
     p.column(&COLUMNS, rating, |ui, cx, s| {
         if cx.live(&IN_FLIGHT).contains(&s.id) {
@@ -54,13 +50,13 @@ pub(super) fn register(p: &mut Setup) {
             return;
         }
         // An unreachable server has no rating worth a red 0: it says it failed.
-        let h = health(cx.snapshot(), s.id);
-        let r = if h.as_ref().is_some_and(Health::unreachable) {
+        let h = last_test(cx.snapshot(), s.id);
+        let r = if h.as_ref().is_some_and(TestResult::unreachable) {
             kit::tone_text(ui, "Failed", kit::Tone::Warning)
         } else {
-            let rating = h.and_then(|h| h.rating);
+            let rating = rating_of(cx.snapshot(), s.id);
             let text = rating.map_or_else(|| "—".into(), |n| n.to_string());
-            ui.colored_label(kit::rating_color(ui, rating), text)
+            ui.colored_label(kit::score_color(ui, rating), text)
         };
         r.on_hover_text(summary(cx.snapshot(), s));
     });
@@ -71,11 +67,11 @@ pub(super) fn register(p: &mut Setup) {
         help: "Response time through the server",
         secondary: true,
         sort: Some(|snap, s| {
-            (health(snap, s.id).and_then(|h| h.ping_ms)).map_or(i64::MAX, i64::from)
+            (last_test(snap, s.id).and_then(|h| h.ping_ms)).map_or(i64::MAX, i64::from)
         }),
     };
     p.column(&COLUMNS, latency, |ui, cx, s| {
-        let ping = health(cx.snapshot(), s.id).and_then(|h| h.ping_ms);
+        let ping = last_test(cx.snapshot(), s.id).and_then(|h| h.ping_ms);
         muted_unless(
             ui,
             ping.is_some(),
@@ -98,13 +94,13 @@ pub(super) fn register(p: &mut Setup) {
             speed.map_or_else(|| "—".into(), |r| r.text),
         );
     });
-    p.fill(&DETAILS, "health", 10, details);
-    p.fill(&CONNECTION, "health", 10, connection_stats);
+    p.fill(&DETAILS, "tests", 10, details);
+    p.fill(&CONNECTION, "tests", 10, connection_stats);
     p.fill(&SETTINGS_SECTIONS, "interval", 0, |ui, cx, _| {
         cx.setting(
             ui,
             "Auto test",
-            &TESTING,
+            &TEST_SETTINGS,
             |s| &mut s.check_secs,
             |ui, v| kit::interval(ui, "check", v),
         );
@@ -116,11 +112,46 @@ fn muted_unless(ui: &mut egui::Ui, known: bool, text: String) {
     ui.colored_label(if known { pal.foreground } else { pal.faint }, text);
 }
 
-/// The last test of one server in its expanded row, with "Test now".
+/// The last test of one server in its expanded row: when, with "Test now",
+/// then latency and each check.
 fn details(ui: &mut egui::Ui, cx: &mut UiCx, s: &Server) {
     let snap = cx.snapshot().clone();
     let pal = kit::colors(ui);
-    let h = health(&snap, s.id);
+    let h = last_test(&snap, s.id);
+    let checked = (h.as_ref())
+        .and_then(|h| h.checked)
+        .map_or_else(|| "Never".into(), kit::age);
+    kit::property_with(ui, "Last test", |ui| {
+        ui.label(egui::RichText::new(checked).color(pal.foreground));
+        // A test of just this server, with its outcome right here.
+        // Rows stay in place while it runs: the button turns into a spinner.
+        let key = ("check", s.id);
+        let testing = cx.live(&IN_FLIGHT).contains(&s.id);
+        match cx.request::<TestServer>(key) {
+            _ if testing => {
+                kit::spinner(ui).on_hover_text("Testing…");
+            }
+            Request::Pending => {
+                kit::spinner(ui);
+            }
+            Request::Done(Ok(None)) => {
+                kit::hint(ui, "Skipped: excluded");
+            }
+            Request::Done(Err(e)) => {
+                kit::tone_text(ui, e, kit::Tone::Warning);
+            }
+            Request::Idle | Request::Done(Ok(Some(_))) => {
+                if kit::Button::ghost("Test now")
+                    .icon(Icon::Gauge)
+                    .show(ui)
+                    .clicked()
+                {
+                    cx.submit(key, TestServer { id: s.id });
+                }
+            }
+        }
+    });
+    // Then what it measured; a check's own lines (say, each test URL) follow it.
     let ping = h.as_ref().and_then(|h| h.ping_ms);
     kit::property(
         ui,
@@ -133,46 +164,13 @@ fn details(ui: &mut egui::Ui, cx: &mut UiCx, s: &Server) {
             .map(|r| r.text.clone());
         kit::property(ui, c.spec.title, &text.unwrap_or_else(|| "—".into()));
     }
-    let checked = (h.as_ref())
-        .and_then(|h| h.checked)
-        .map_or_else(|| "Never".into(), kit::age);
-    kit::property_with(ui, "Last test", |ui| {
-        ui.label(egui::RichText::new(checked).color(pal.foreground));
-        // A test of just this server, with its outcome right here.
-        // Rows stay in place while it runs: the button turns into a spinner.
-        let key = ("check", s.id);
-        let testing = cx.live(&IN_FLIGHT).contains(&s.id);
-        match cx.request::<CheckServer>(key) {
-            _ if testing => {
-                kit::spinner(ui).on_hover_text("Testing…");
-            }
-            Request::Pending => {
-                kit::spinner(ui);
-            }
-            Request::Done(Ok(None)) => {
-                kit::hint(ui, "Skipped: excluded");
-            }
-            Request::Done(Err(e)) => {
-                kit::tone_text(ui, e, kit::Tone::Danger);
-            }
-            Request::Idle | Request::Done(Ok(Some(_))) => {
-                if kit::Button::ghost("Test now")
-                    .icon(Icon::Checks)
-                    .show(ui)
-                    .clicked()
-                {
-                    cx.submit(key, CheckServer { id: s.id });
-                }
-            }
-        }
-    });
 }
 
 /// Latency, rating and the quick checks of the connected server.
 fn connection_stats(ui: &mut egui::Ui, cx: &mut UiCx, s: &Server) {
     let snap = cx.snapshot().clone();
-    let h = health(&snap, s.id);
-    let rating = h.as_ref().and_then(|h| h.rating);
+    let h = last_test(&snap, s.id);
+    let rating = rating_of(&snap, s.id);
     let mut items = vec![
         (
             "Latency",
@@ -181,13 +179,17 @@ fn connection_stats(ui: &mut egui::Ui, cx: &mut UiCx, s: &Server) {
             None,
         ),
         // The same word as the Rating column.
-        if h.as_ref().is_some_and(Health::unreachable) {
-            ("Rating", "Failed".into(), Some(kit::colors(ui).warning))
+        if let Some(h) = h.as_ref().filter(|h| h.unreachable()) {
+            let text = match &h.failure {
+                Some(why) => format!("Failed · {}", why.to_lowercase()),
+                None => "Failed".into(),
+            };
+            ("Rating", text, Some(kit::colors(ui).warning))
         } else {
             (
                 "Rating",
                 rating.map_or_else(|| "—".into(), |r| r.to_string()),
-                Some(kit::rating_color(ui, rating)),
+                Some(kit::score_color(ui, rating)),
             )
         },
     ];
@@ -197,5 +199,5 @@ fn connection_stats(ui: &mut egui::Ui, cx: &mut UiCx, s: &Server) {
         }
     }
     kit::stats(ui, &items);
-    ui.add_space(4.);
+    ui.add_space(kit::theme::SPACE_S);
 }

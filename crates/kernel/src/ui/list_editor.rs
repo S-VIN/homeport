@@ -13,7 +13,8 @@ use egui::{Color32, Ui};
 
 type Lens<T> = fn(&mut T) -> &mut String;
 
-pub struct Column<'s, T> {
+/// A column of a [`ListEditor`] row: one field of the item.
+pub struct Field<'s, T> {
     title: &'s str,
     /// `None` takes the remaining width.
     width: Option<f32>,
@@ -35,7 +36,7 @@ enum Kind<'s, T> {
     Widget(Box<dyn Fn(&mut Ui, &mut T) -> bool + 's>),
     Custom(Box<dyn Fn(&mut Ui, &mut UiCx, &T) + 's>),
 }
-impl<'s, T: 's> Column<'s, T> {
+impl<'s, T: 's> Field<'s, T> {
     /// Read-only text.
     pub fn text(title: &'s str, text: impl Fn(&T) -> String + 's) -> Self {
         Self {
@@ -131,7 +132,7 @@ type Leading<'s, T> = (&'s str, f32, Box<dyn Fn(&mut Ui, &mut UiCx, &T) + 's>);
 
 pub struct ListEditor<'s, T: Record> {
     state: &'static State<Vec<T>>,
-    columns: Vec<Column<'s, T>>,
+    columns: Vec<Field<'s, T>>,
     add: Option<(&'s str, Box<dyn Fn() -> T + 's>, Fields<'s, T>)>,
     ordered: bool,
     empty: Option<(Icon, &'s str, &'s str)>,
@@ -155,7 +156,7 @@ impl<'s, T: Record> ListEditor<'s, T> {
             added: None,
         }
     }
-    pub fn column(mut self, c: Column<'s, T>) -> Self {
+    pub fn column(mut self, c: Field<'s, T>) -> Self {
         self.columns.push(c);
         self
     }
@@ -210,7 +211,7 @@ impl<'s, T: Record> ListEditor<'s, T> {
     pub fn show(mut self, ui: &mut Ui, cx: &mut UiCx) {
         for c in self.added.map_or(Vec::new(), |list| cx.added(ui, list)) {
             let cell = c.cell.clone();
-            let column = Column::custom(
+            let column = Field::custom(
                 c.column.title,
                 crate::columns::COLUMN_WIDTH,
                 move |ui, cx, item| cx.scoped(Some(c.plugin), |cx| cell(ui, cx, item)),
@@ -220,15 +221,18 @@ impl<'s, T: Record> ListEditor<'s, T> {
         let list = egui::Id::unique(("list", self.state.name));
         let editing_id = list.with("editing");
         let mut editing: Option<Id> = ui.data(|d| d.get_temp(editing_id)).flatten();
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            editing = None;
+        if ui.input(|i| i.key_pressed(egui::Key::Escape))
+            && let Some(id) = editing.take()
+        {
+            // A closed editor takes its error with it.
+            ui.data_mut(|d| d.remove::<String>(list.with(("error", id))));
         }
         self.add_bar(ui, cx, list);
         let rows = cx.get(self.state);
         kit::list_card(ui, |ui| {
             // Rows sit inside `kit::row`'s inset; header and rows share one layout.
             let width = ui.available_width() - 2. * (theme::INSET - theme::SPACE_S);
-            let layout = self.layout(width);
+            let layout = self.layout(width, kit::phone(ui));
             if self.headers && !rows.is_empty() && self.columns.iter().any(|c| !c.title.is_empty())
             {
                 self.header(ui, &layout);
@@ -275,15 +279,19 @@ impl<'s, T: Record> ListEditor<'s, T> {
             }),
             None => {}
         }
-        if kit::add_bar(ui, label, !cx.pending(key), |ui, width| {
-            fields(ui, &mut draft, width)
-        }) {
+        let error = ui.data(|d| d.get_temp::<String>(error_id));
+        let before = draft.clone();
+        let add = kit::add_bar(ui, label, !cx.pending(key), |ui, width| {
+            kit::invalid_scope(ui, error.is_some(), |ui| fields(ui, &mut draft, width))
+        });
+        // The error is about what was submitted: editing the draft clears it.
+        if add || draft != before {
             ui.data_mut(|d| d.remove::<String>(error_id));
-            cx.submit(key, Add::new(self.state, draft.clone()));
         }
-        if let Some(e) = ui.data(|d| d.get_temp::<String>(error_id)) {
-            kit::tone_text(ui, e, Tone::Danger);
-            ui.add_space(theme::SPACE_M);
+        if add {
+            cx.submit(key, Add::new(self.state, draft.clone()));
+        } else if let Some(e) = error.filter(|_| draft == before) {
+            kit::field_error(ui, &e, None);
         }
         ui.data_mut(|d| d.insert_temp(draft_id, draft));
     }
@@ -291,7 +299,7 @@ impl<'s, T: Record> ListEditor<'s, T> {
     /// Column widths for rows `width` wide.
     /// Narrow rows put the fixed-width columns on a second line, so the main
     /// column keeps at least `MIN_FILL`: plugins don't plan for screen sizes.
-    fn layout(&self, width: f32) -> Layout {
+    fn layout(&self, width: f32, phone: bool) -> Layout {
         const MIN_FILL: f32 = 160.;
         let gap = theme::HORIZONTAL_GAP;
         let fills = self
@@ -307,7 +315,7 @@ impl<'s, T: Record> ListEditor<'s, T> {
             .map(|w| w + gap)
             .sum();
         let leading = self.leading_width();
-        let avail = width - leading - self.actions_width() - gap;
+        let avail = width - leading - self.actions_width(phone) - gap;
         if fixed > 0. && avail - fixed < MIN_FILL * fills {
             // The second line starts under the main column and has no actions.
             Layout {
@@ -328,10 +336,55 @@ impl<'s, T: Record> ListEditor<'s, T> {
             .as_ref()
             .map_or(0., |(_, w, _)| w + theme::HORIZONTAL_GAP)
     }
-    /// Row actions sit edge to edge: order arrows, edit, delete.
-    fn actions_width(&self) -> f32 {
-        (if self.ordered { 2. } else { 0. } + if self.editable() { 1. } else { 0. } + 1.)
-            * theme::CONTROL
+    /// Row actions sit edge to edge: order arrows, edit, delete; on a phone
+    /// one button opens them as a menu.
+    fn actions_width(&self, phone: bool) -> f32 {
+        let n = if self.ordered { 2. } else { 0. } + if self.editable() { 1. } else { 0. } + 1.;
+        (if phone { 1. } else { n }) * theme::CONTROL
+    }
+
+    /// The row's actions: edit clicked, and a move or delete asked.
+    fn actions(&self, ui: &mut Ui, row: &RowView<'_, T>, emphasis: Emphasis) -> (bool, Acted) {
+        let mut act = Acted::default();
+        let mut edit = false;
+        let (icon, label) = if row.editing {
+            (Icon::Check, "Close editor")
+        } else {
+            (Icon::Edit, "Edit")
+        };
+        ui.spacing_mut().item_spacing.x = 0.;
+        let phone = kit::phone(ui);
+        if phone && row.editing {
+            // The fields take full lines below; only closing stays in reach.
+            edit = kit::IconButton::new(icon, label).show(ui).clicked();
+            return (edit, act);
+        }
+        if phone && (self.ordered || self.editable()) {
+            kit::row_menu(ui, emphasis, |ui| {
+                if self.ordered {
+                    if kit::menu_item(ui, Icon::Up, "Move up", row.index > 0, false) {
+                        act.moved = Some(true);
+                    }
+                    if kit::menu_item(ui, Icon::Down, "Move down", row.index + 1 < row.len, false) {
+                        act.moved = Some(false);
+                    }
+                }
+                edit = self.editable() && kit::menu_item(ui, icon, label, true, false);
+                act.removed = kit::menu_item(ui, Icon::Delete, "Delete", true, true);
+            });
+            return (edit, act);
+        }
+        if self.ordered {
+            act.moved = kit::order(ui, row.index, row.len, emphasis);
+        }
+        ui.spacing_mut().item_spacing.x = 0.;
+        edit = self.editable()
+            && kit::IconButton::new(icon, label)
+                .emphasis(emphasis)
+                .show(ui)
+                .clicked();
+        act.removed = kit::remove(ui, emphasis);
+        (edit, act)
     }
     fn editable(&self) -> bool {
         self.columns
@@ -409,23 +462,12 @@ impl<'s, T: Record> ListEditor<'s, T> {
                     kit::row_line(ui, height, |ui| {
                         self.marker(ui, cx, row, two_lines);
                         self.cells(ui, cx, row, &mut draft, &mut save, layout, Line::Main);
-                        if self.ordered
-                            && let Some(up) = kit::order(ui, row.index, row.len, emphasis)
-                        {
+                        let (edit, act) = self.actions(ui, row, emphasis);
+                        if let Some(up) = act.moved {
                             cx.submit(key, Move::new(self.state, id, up));
                         }
-                        ui.spacing_mut().item_spacing.x = 0.;
-                        if self.editable() {
-                            let (icon, label) = if row.editing {
-                                (Icon::Check, "Close editor")
-                            } else {
-                                (Icon::Edit, "Edit")
-                            };
-                            if kit::IconButton::new(icon, label)
-                                .emphasis(emphasis)
-                                .show(ui)
-                                .clicked()
-                            {
+                        {
+                            if edit {
                                 if !row.editing {
                                     *editing = Some(id);
                                     draft = item.clone();
@@ -440,7 +482,7 @@ impl<'s, T: Record> ListEditor<'s, T> {
                                 }
                             }
                         }
-                        if kit::remove(ui, emphasis) {
+                        if act.removed {
                             cx.submit(key, Remove::new(self.state, id));
                         }
                     });
@@ -489,9 +531,8 @@ impl<'s, T: Record> ListEditor<'s, T> {
                 if let Some(e) = ui.data(|d| d.get_temp::<String>(error_id)) {
                     ui.horizontal(|ui| {
                         ui.add_space(self.leading_width());
-                        kit::tone_text(ui, e, Tone::Danger);
+                        ui.vertical(|ui| kit::field_error(ui, &e, None));
                     });
-                    ui.add_space(4.);
                 }
             });
         });
@@ -508,6 +549,10 @@ impl<'s, T: Record> ListEditor<'s, T> {
             ui.data_mut(|d| d.insert_temp(draft_id, draft));
         } else {
             ui.data_mut(|d| d.remove::<T>(draft_id));
+            if row.editing {
+                // A closed editor takes its error with it.
+                ui.data_mut(|d| d.remove::<String>(error_id));
+            }
         }
     }
 
@@ -545,7 +590,7 @@ impl<'s, T: Record> ListEditor<'s, T> {
         let Some((text, _)) = row.subtitle.as_ref().filter(|_| !row.editing) else {
             return 0;
         };
-        let long = |c: &Column<'_, T>| {
+        let long = |c: &Field<'_, T>| {
             let font = egui::FontId::proportional(theme::SMALL);
             let galley =
                 ui.fonts_mut(|f| f.layout_no_wrap(text.clone(), font, egui::Color32::WHITE));
@@ -567,6 +612,7 @@ impl<'s, T: Record> ListEditor<'s, T> {
                 egui::vec2(*width, 40.),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
+                    ui.set_width(*width);
                     ui.add_space(8.);
                     f(ui, cx, row.item);
                 },
@@ -685,6 +731,12 @@ fn edit_field<T>(
 ) {
     let r = kit::input(ui, title, text, placeholder, width)
         .on_hover_text("Enter or leave the field to save · Esc discards unsaved text");
+    if ui.data(|d| {
+        d.get_temp::<String>(row.list.with(("error", row.id)))
+            .is_some()
+    }) {
+        kit::invalid(ui, &r);
+    }
     if ui
         .data_mut(|d| d.remove_temp::<bool>(row.list.with(("focus", row.id))))
         .unwrap_or(false)
@@ -718,11 +770,19 @@ enum Line {
     Below,
 }
 impl Layout {
-    fn on<T>(&self, c: &Column<'_, T>, line: Line) -> bool {
+    fn on<T>(&self, c: &Field<'_, T>, line: Line) -> bool {
         let below = self.stacked && c.width.is_some();
         below == (line == Line::Below)
     }
-    fn width<T>(&self, c: &Column<'_, T>) -> f32 {
+    fn width<T>(&self, c: &Field<'_, T>) -> f32 {
         c.width.map_or(self.fill, |w| w * self.scale)
     }
+}
+
+/// A move or delete asked from a row's actions.
+#[derive(Default)]
+struct Acted {
+    /// `Some(true)`: up.
+    moved: Option<bool>,
+    removed: bool,
 }

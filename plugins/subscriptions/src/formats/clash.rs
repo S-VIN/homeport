@@ -6,7 +6,7 @@ use plugin_servers::Proxy;
 use serde_json::Value;
 
 /// Parse the `proxies` list of a Mihomo/Clash document.
-pub fn parse(body: &str) -> Result<Vec<Proxy>> {
+pub fn parse(body: &str) -> Result<crate::Parsed> {
     let doc: Value = serde_saphyr::from_str(body.trim_start_matches('\u{feff}'))
         .map_err(|_| Error::msg("Invalid YAML or JSON subscription."))?;
     let nodes = doc
@@ -34,7 +34,7 @@ mod tests {
         let ok =
             super::parse("proxies:\n  - { name: a, type: http, server: localhost, port: 8080 }")
                 .unwrap();
-        assert_eq!(ok.len(), 1);
+        assert_eq!(ok.proxies.len(), 1);
         assert!(
             super::parse("proxies:\n  - { name: bad, type: http, server: localhost, port: 0 }")
                 .is_err()

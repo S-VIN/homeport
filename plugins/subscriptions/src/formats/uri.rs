@@ -1,5 +1,5 @@
 //! Lists of share links ([`Proxy::from_link`]) and Base64-wrapped documents.
-use crate::{LINK, Parse};
+use crate::{LINK, Parse, Parsed};
 use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE},
@@ -34,7 +34,7 @@ pub fn decode_base64(body: &str) -> Result<String> {
 
 /// Parse share links, one per line; a link that cannot be read is skipped
 /// (see [`super::usable`]).
-pub fn parse_links(body: &str) -> Result<Vec<Proxy>> {
+pub fn parse_links(body: &str) -> Result<Parsed> {
     let links = plain(body).lines().map(str::trim).filter(|s| !s.is_empty());
     super::usable(
         links
@@ -64,7 +64,7 @@ pub(crate) fn register(p: &mut Setup) {
     p.handle(|cx: Cx, op: Parse| async move {
         let decoded = decode_base64(&op.body)?;
         if plain(&decoded).is_empty() {
-            return Ok(Vec::new());
+            return Ok(Parsed::default());
         }
         // Re-dispatch: the decoded text is claimed by whichever format knows it.
         cx.call(Parse {

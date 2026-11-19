@@ -197,7 +197,7 @@ impl ksni::Tray for Tray {
         "homeport".into()
     }
     fn title(&self) -> String {
-        "homeport".into()
+        "Homeport".into()
     }
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
         let mut i = icon(self.link);
@@ -224,7 +224,7 @@ impl ksni::Tray for Tray {
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         vec![
             StandardItem {
-                label: "Open homeport".into(),
+                label: "Open Homeport".into(),
                 activate: Box::new(|t: &mut Self| t.control.send(WindowEvent::Open)),
                 ..Default::default()
             }

@@ -4,14 +4,14 @@
 //! and escalating quarantine for servers that failed.
 //!
 //! The data plane does not wait for decisions: while Auto is on, the main group
-//! is a mihomo `fallback` group `[selected, backups…]` ([`servers::FAILOVER`]),
+//! is a mihomo `fallback` group `[selected, backups…]` ([`failover`]),
 //! so traffic moves to a live backup within seconds. Every 10 s the watch adopts
 //! such a failover, probes the connected server through mihomo's delay test and
 //! switches after two failed probes.
 //!
-//! Integration: wraps `servers::Select` (a manual choice turns Auto off), reacts
-//! to `ServersChanged`, [`Checked`] and subscription order changes.
-use crate::{self as servers, CheckAll, Checked, QuickCheck, Report, Select, Server, report};
+//! A manual [`Select`] turns Auto off; it reacts to `ServersChanged`,
+//! [`Tested`] and subscription order changes.
+use crate::{self as servers, QuickTest, Report, Select, Server, TestAll, Tested};
 use homeport_kernel::{kit, prelude::*};
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -45,7 +45,7 @@ pub struct Auto {
     pub backups: Vec<Id>,
 }
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Table)]
-#[table(name = "selection_memory")]
+#[table(name = "servers_selection_memory")]
 pub struct Memory {
     pub id: Id,
     pub score: Option<f64>,
@@ -54,7 +54,7 @@ pub struct Memory {
 }
 /// `server: Some` records a strike, `None` a rate-limited switch.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Table)]
-#[table(name = "selection_events")]
+#[table(name = "servers_selection_events")]
 pub struct Strike {
     pub id: Id,
     pub server: Option<Id>,
@@ -97,7 +97,7 @@ pub enum Trigger {
     Watch,
     Servers,
     /// Servers were checked ([`Decide::checked`]).
-    Checked,
+    Tested,
     Priorities,
     Enabled,
 }
@@ -182,7 +182,7 @@ async fn save(cx: &Cx, before: &World, mut p: Policy) -> Result<()> {
 }
 
 async fn quick(cx: &Cx, id: Id) -> Option<Report> {
-    cx.call(QuickCheck { id }).await.ok().flatten()
+    cx.call(QuickTest { id }).await.ok().flatten()
 }
 /// Quick checks of a batch of candidates running in parallel.
 struct Probes {
@@ -229,7 +229,7 @@ async fn failed_over(cx: &Cx, w: &World, p: &Policy, current: Id) -> Option<Id> 
         return None;
     }
     let now = cx.core().group_now(servers::MAIN).await.ok()??;
-    let id = w.servers.iter().find(|s| s.id.to_string() == now)?.id;
+    let id = servers::server_in(&[now]).filter(|id| w.servers.iter().any(|s| s.id == *id))?;
     (id != current && p.auto.backups.contains(&id)).then_some(id)
 }
 
@@ -324,7 +324,7 @@ async fn verdict(
     Ok(match trigger {
         Trigger::Enabled => Verdict::Search(Reason::Enabled, above),
         Trigger::Priorities => Verdict::Search(Reason::Priorities, above),
-        Trigger::Checked => {
+        Trigger::Tested => {
             let ahead = p.candidates(w, time, above, false, w.selected);
             for s in &w.servers {
                 let m = p.memory(s.id);
@@ -451,7 +451,7 @@ async fn search(cx: &Cx, w: &World, p: &mut Policy, reason: Reason, above: f64) 
             next.run.provisional = after.rating(id).is_none();
             if next.run.provisional {
                 // Rate everything soon so the provisional choice can be refined.
-                let _ = cx.spawn(CheckAll);
+                let _ = cx.spawn(TestAll);
             }
             save(cx, &after, next).await?;
             return Ok(true);
@@ -534,11 +534,9 @@ async fn set_auto(cx: Cx, SetAuto(on): SetAuto) -> Result<()> {
     Ok(())
 }
 
-/// A manual connect or disconnect turns Auto off.
-async fn manual_choice_turns_auto_off(cx: Cx, op: Select, next: Next<Select>) -> Result<()> {
-    let manual = op.auto.is_none();
-    next.run(&cx, op).await?;
-    if manual && cx.get(&AUTO).enabled {
+/// After a manual connect or disconnect ([`Select`]): Auto turns off.
+pub(crate) async fn manual_choice(cx: &Cx) -> Result<()> {
+    if cx.get(&AUTO).enabled {
         cx.call(SetAuto(false)).await?;
         cx.notify_with(
             "Auto select is off because you picked or disconnected a server yourself.",
@@ -602,7 +600,6 @@ pub(crate) fn setup(p: &mut Setup) {
 
     p.handle(set_auto);
     p.handle(decide);
-    p.wrap(manual_choice_turns_auto_off);
     // A filter dropped the connected server: stay on and connect another one.
     p.on(|cx: Cx, e: servers::Excluded| async move {
         if !cx.get(&AUTO).enabled {
@@ -616,7 +613,7 @@ pub(crate) fn setup(p: &mut Setup) {
     p.on(
         |cx: Cx, _: servers::ServersChanged| async move { request(&cx, Trigger::Servers, vec![]) },
     );
-    p.on(|cx: Cx, e: Checked| async move { request(&cx, Trigger::Checked, e.servers) });
+    p.on(|cx: Cx, e: Tested| async move { request(&cx, Trigger::Tested, e.servers) });
     p.watch(order, priorities_changed);
     p.every(
         "watch",
@@ -630,26 +627,41 @@ pub(crate) fn setup(p: &mut Setup) {
             checked: vec![],
         },
     );
-    p.hook(&servers::IDLE, |snap, _| {
-        snap.get(&AUTO).enabled.then(|| {
-            format!(
-                "Auto select · {}",
-                snap.live(&RUNTIME)
-                    .last_reason
-                    .as_deref()
-                    .unwrap_or("Looking for a server that answers…")
-            )
-        })
-    });
-    // While Auto is on, the main group fails over to the policy's backups by itself.
-    p.hook(&servers::FAILOVER, |snap, _| {
-        let auto = snap.get(&AUTO);
-        (auto.enabled && !auto.backups.is_empty()).then(|| servers::Failover {
-            backups: auto.backups.clone(),
-            url: servers::probe_url(snap),
-            interval_secs: FAILOVER_SECS,
-        })
-    });
-
     ui(p);
+}
+
+/// Why nothing is connected while Auto is on, for the connection card.
+pub(crate) fn idle(snap: &Snapshot) -> Option<String> {
+    snap.get(&AUTO).enabled.then(|| {
+        format!(
+            "Auto select · {}",
+            snap.live(&RUNTIME)
+                .last_reason
+                .as_deref()
+                .unwrap_or("Looking for a server that answers…")
+        )
+    })
+}
+
+/// Backup servers for the connected one (Auto select's). With at least one
+/// backup, [`servers::MAIN`] becomes a mihomo `fallback` group `[selected, backups…]`:
+/// traffic moves to the first live backup within seconds, without waiting for
+/// a decision. They change the member order, which is a full core reload, so
+/// they should change only when the policy decides.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Failover {
+    pub backups: Vec<Id>,
+    /// URL mihomo tests the members with.
+    pub url: String,
+    pub interval_secs: u32,
+}
+
+/// While Auto is on, the main group fails over to the policy's backups by itself.
+pub(crate) fn failover(snap: &Snapshot) -> Option<Failover> {
+    let auto = snap.get(&AUTO);
+    (auto.enabled && !auto.backups.is_empty()).then(|| Failover {
+        backups: auto.backups.clone(),
+        url: servers::probe_url(snap),
+        interval_secs: FAILOVER_SECS,
+    })
 }

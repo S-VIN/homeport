@@ -56,11 +56,13 @@ pub(super) fn activity(
                 .id_salt("activity-scroll")
                 .max_height((bounds.height() - 54.).max(0.))
                 .show(ui, |ui| {
-                    let runs: Vec<_> = board
+                    let mut runs: Vec<_> = board
                         .runs
                         .iter()
                         .filter(|r| !r.quiet || r.phase == Phase::Failed)
                         .collect();
+                    // Running ones first, then the latest to end: the times read in order.
+                    runs.sort_by_key(|r| std::cmp::Reverse(r.ended.unwrap_or(u64::MAX)));
                     let mut entries: Vec<Entry> = Vec::new();
                     for r in runs {
                         let same = |e: &Entry| {
@@ -101,7 +103,7 @@ pub(super) fn activity(
                             kit::row_line(ui, 22., |ui| {
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     ui.label(
-                                        RichText::new(format!("in {}", human(left)))
+                                        RichText::new(format!("in {}", kit::duration(left)))
                                             .size(theme::SMALL)
                                             .color(p.muted),
                                     );
@@ -143,7 +145,7 @@ pub(super) fn activity_entry(ui: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette,
         Phase::Cancelling => (p.muted, "Stopping…"),
         Phase::Succeeded => (p.success, "Done"),
         Phase::Cancelled => (p.muted, "Cancelled"),
-        Phase::Failed => (p.danger, "Failed"),
+        Phase::Failed => (p.warning, "Failed"),
     };
     ui.spacing_mut().item_spacing.y = 0.;
     kit::row_line(ui, 22., |ui| {
@@ -185,7 +187,7 @@ pub(super) fn activity_entry(ui: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette,
             },
             Tone::Neutral,
         ),
-        (Some(err), _) if r.phase == Phase::Failed => (err.message.clone(), Tone::Danger),
+        (Some(err), _) if r.phase == Phase::Failed => (err.message.clone(), Tone::Warning),
         (_, Some(summary)) => (
             summary.clone(),
             if r.phase == Phase::Succeeded {
@@ -220,13 +222,4 @@ pub(super) fn schedule_name(label: &str, name: &str) -> String {
         s.replace_range(0..1, &c.to_uppercase());
     }
     s
-}
-
-pub(super) fn human(secs: u64) -> String {
-    match secs {
-        0..=59 => format!("{secs} s"),
-        60..=3599 => format!("{} min", secs / 60),
-        3600..=86399 => format!("{} h", secs / 3600),
-        _ => format!("{} d", secs / 86400),
-    }
 }

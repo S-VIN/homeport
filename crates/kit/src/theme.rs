@@ -34,11 +34,11 @@ pub const STATUS_BAR: f32 = 34.0;
 /// Bottom navigation height.
 pub const NAVIGATION: f32 = 48.0;
 /// Width of the side panel column in a wide window.
-pub const UTILITY_WIDTH: f32 = 300.0;
+pub const UTILITY_WIDTH: f32 = 260.0;
 /// From this window width the side panel is docked on the right.
 pub const UTILITY_BREAKPOINT: f32 = 960.0;
 /// Phone-sized window: list rows trade labels for icons (see `kit::compact_row`).
-pub const PHONE: f32 = 480.0;
+pub const PHONE: f32 = 520.0;
 
 /// Fingers need about 40 px targets. On phones a tap that lands on nothing
 /// clickable goes to the closest control within this radius, so a 26 px

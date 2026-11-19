@@ -22,7 +22,7 @@ pub struct Entry {
     /// Unix seconds of the last time it was written.
     pub at: u64,
     pub level: Level,
-    /// The writing plugin's name, or "homeport" for the app itself.
+    /// The writing plugin's name, or "Homeport" for the app itself.
     pub source: &'static str,
     pub text: String,
     /// Times written in a row.
@@ -70,7 +70,7 @@ static BOOK: Mutex<Book> = Mutex::new(Book {
 });
 static CHANGES: LazyLock<tokio::sync::watch::Sender<()>> =
     LazyLock::new(|| tokio::sync::watch::Sender::new(()));
-/// Plugin names by crate name (`plugin_health_checks`).
+/// Plugin names by crate name (`plugin_url_tests`).
 static NAMES: LazyLock<RwLock<HashMap<String, &'static str>>> = LazyLock::new(Default::default);
 
 struct Logger;
@@ -86,7 +86,7 @@ impl ::log::Log for Logger {
         }
         let krate = record.target().split("::").next().unwrap_or_default();
         let source = NAMES.read().unwrap().get(krate).copied();
-        let (source, text) = (source.unwrap_or("homeport"), record.args().to_string());
+        let (source, text) = (source.unwrap_or("Homeport"), record.args().to_string());
         let (level, at) = (record.level(), crate::now());
         let mut book = BOOK.lock().unwrap();
         match book.lines.back_mut() {

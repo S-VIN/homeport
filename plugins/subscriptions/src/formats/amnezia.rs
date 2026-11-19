@@ -30,7 +30,7 @@ pub(crate) fn register(p: &mut Setup) {
 
 /// Every connection of every key (one key per line); a key that cannot be
 /// read is skipped (see [`super::usable`]).
-pub fn parse(body: &str) -> Result<Vec<Proxy>> {
+pub fn parse(body: &str) -> Result<crate::Parsed> {
     super::usable((body.split_whitespace().enumerate()).map(|(i, key)| {
         (
             format!("Key {}", i + 1),
@@ -185,7 +185,7 @@ mod tests {
                 {"container": "amnezia-xray", "xray": {"last_config": xray.to_string()}},
             ],
         }));
-        let servers = parse(&k).unwrap();
+        let servers = parse(&k).unwrap().proxies;
         assert_eq!(servers.len(), 2);
         let wg = &servers[0];
         assert_eq!(wg.name, "Office · AmneziaWG");

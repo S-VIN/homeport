@@ -470,7 +470,7 @@ impl CoreApi {
             .map_err(Error::msg)
     }
     /// The core's live log (see [`mihomo::Controller::logs`]).
-    pub async fn logs(&self, level: &str) -> Result<reqwest::Response> {
+    pub async fn logs(&self, level: mihomo::LogLevel) -> Result<mihomo::LogStream> {
         self.core
             .controller()
             .await?

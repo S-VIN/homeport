@@ -72,7 +72,8 @@ pub enum Tone {
 
 type Rgb = (u8, u8, u8);
 /// Categorical tag colors: (light ink, light fill), (dark ink, dark fill).
-/// Ink on fill keeps ≥ 4.5:1 contrast in both themes.
+/// Ink on fill keeps ≥ 4.5:1 contrast in both themes. No amber or orange:
+/// a tag must not read as a warning.
 const TAGS: [((Rgb, Rgb), (Rgb, Rgb)); 8] = [
     (
         ((29, 78, 216), (226, 234, 253)),
@@ -87,8 +88,8 @@ const TAGS: [((Rgb, Rgb), (Rgb, Rgb)); 8] = [
         ((118, 216, 156), (22, 56, 39)),
     ),
     (
-        ((150, 84, 0), (253, 241, 205)),
-        ((236, 190, 98), (60, 46, 18)),
+        ((3, 105, 161), (224, 242, 254)),
+        ((125, 200, 245), (20, 45, 64)),
     ),
     (
         ((180, 25, 92), (252, 231, 241)),
@@ -99,8 +100,8 @@ const TAGS: [((Rgb, Rgb), (Rgb, Rgb)); 8] = [
         ((104, 212, 198), (18, 55, 53)),
     ),
     (
-        ((184, 64, 14), (255, 236, 220)),
-        ((248, 166, 112), (68, 37, 20)),
+        ((162, 28, 175), (250, 232, 255)),
+        ((232, 160, 240), (66, 30, 72)),
     ),
     (
         ((77, 116, 14), (234, 244, 214)),

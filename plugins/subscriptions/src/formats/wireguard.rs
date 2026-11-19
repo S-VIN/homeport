@@ -18,7 +18,7 @@ pub fn is_config(body: &str) -> bool {
 }
 
 pub(crate) fn register(p: &mut Setup) {
-    p.handle(|_: Cx, op: Parse| async move { Ok(vec![parse(&op.body, None)?]) })
+    p.handle(|_: Cx, op: Parse| async move { Ok(vec![parse(&op.body, None)?].into()) })
         .claim(|_, op| is_config(&op.body).then_some(Claim::content(85)));
     p.hook(&LINK, |_, raw| {
         is_config(raw).then(|| parse(raw, None).map(drop))

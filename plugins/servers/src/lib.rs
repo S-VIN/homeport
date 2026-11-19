@@ -5,21 +5,26 @@
 //! with their rating ([`checks`]) and Auto select on them ([`auto`]).
 //!
 //! Extension points for other plugins:
-//! * ops [`ReplaceFromSource`], [`RemoveSource`], [`Select`], [`CheckAll`];
+//! * ops [`ReplaceFromSource`], [`RemoveSource`], [`Select`], [`TestAll`];
 //! * tests: checks that count in the rating ([`CHECKS`], [`add_check`]) and
 //!   the way tests reach a server ([`TEST_PATH`]);
 //! * hooks [`EXCLUDE`] (why a server must not be used), [`SOURCE`] (label,
-//!   color and priority of a source), [`ROUTE`], [`FAILOVER`], [`IDLE`],
-//!   [`FREEZE`]; columns ([`column`]) may sort the list;
+//!   color and priority of a source), [`ROUTE`]; columns may sort the list;
 //! * UI zones on the Servers page: [`TOOLBAR`], [`COLUMNS`],
 //!   [`DETAILS`] and in the connection card: [`CONNECTION`].
 pub mod auto;
-mod checks;
+pub mod checks;
 mod import;
 mod link;
 mod ui;
 
-pub use checks::*;
+// Extension points and what plugins read most; the rest (Auto select's own
+// state, counters) stays reachable under `auto::` and `checks::`.
+pub use checks::{
+    CHECKS, CheckSpec, PROBE, Probe, QuickTest, RESULTS, Reading, Report, TEST_PATH, TEST_SETTINGS,
+    TestAll, TestResult, TestServer, TestSettings, Tested, add_check, last_test, probe_url,
+    rating_of, report,
+};
 use homeport_kernel::{prelude::*, shell::TrayLink};
 pub use import::{Options, Proxy};
 pub use link::is_link;
@@ -29,12 +34,16 @@ pub static PLUGIN: Plugin = Plugin {
     id: "servers",
     name: "Servers",
     description: "Server catalog, manual connection and the main route.",
-    category: categories::SERVERS,
+    category: CATEGORY,
     required: true,
     migrations: homeport_kernel::migrations!(),
     setup,
     ..Plugin::DEFAULT
 };
+
+/// The group in Settings → Plugins of the catalog and of everything that
+/// fills, filters or measures it.
+pub const CATEGORY: Category = Category::new("servers", "Servers");
 
 choices!(pub enum Protocol {
     Vless => "vless",
@@ -77,7 +86,7 @@ pub struct Server {
 pub static SERVERS: State<Vec<Server>> = State::new("servers.list");
 pub static SELECTED: State<Option<Id>> = State::new("servers.selected");
 
-/// Name of the mihomo group that carries user traffic (`select`, or `fallback` with [`FAILOVER`]).
+/// Name of the mihomo group that carries user traffic (`select`, or `fallback` with Auto select's backups).
 pub const MAIN: &str = "main";
 /// Where traffic sent "via server" goes. A plugin may answer with another
 /// target, e.g. an exit server dialed through `main` (selected → exit → internet).
@@ -92,16 +101,18 @@ pub fn route(snap: &Snapshot) -> Target {
 pub fn route_text(snap: &Snapshot) -> (kit::Tone, Icon, &'static str) {
     match route(snap) {
         Target::Reject => (kit::Tone::Danger, Icon::Error, "Blocked"),
-        Target::Direct => (kit::Tone::Success, Icon::Exit, "Leaves from this device"),
+        Target::Direct => (kit::Tone::Success, Icon::SignOut, "Leaves from this device"),
         Target::Group(g) if g == MAIN && selected(snap).is_none() => (
             kit::Tone::Danger,
             Icon::Error,
             "Blocked: no server is selected",
         ),
-        Target::Group(g) if g == MAIN => {
-            (kit::Tone::Neutral, Icon::Routing, "Via the selected server")
-        }
-        _ => (kit::Tone::Neutral, Icon::Routing, "Via the proxy chain"),
+        Target::Group(g) if g == MAIN => (
+            kit::Tone::Neutral,
+            Icon::ArrowsSplit,
+            "Via the selected server",
+        ),
+        _ => (kit::Tone::Neutral, Icon::ArrowsSplit, "Via the proxy chain"),
     }
 }
 
@@ -274,27 +285,11 @@ pub struct SourceInfo {
 }
 /// About a source id; see [`source`] for the answer without an owner.
 pub static SOURCE: Hook<Id, Option<SourceInfo>> = Hook::new("servers.source");
-/// Keep row order stable (e.g. while a check updates ratings).
-pub static FREEZE: Hook<(), bool> = Hook::new("servers.freeze");
-/// Backup servers for the connected one (the hook input). With an answer and
-/// at least one backup, [`MAIN`] becomes a mihomo `fallback` group
-/// `[selected, backups…]`: traffic moves to the first live backup within
-/// seconds, without waiting for a decision. Answers change the member order, which
-/// is a full core reload, so they should change only when a policy decides.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Failover {
-    pub backups: Vec<Id>,
-    /// URL mihomo tests the members with.
-    pub url: String,
-    pub interval_secs: u32,
-}
-pub static FAILOVER: Hook<Id, Option<Failover>> = Hook::exclusive("servers.failover");
-/// Why nothing is connected (e.g. "Auto select · No server answers…"), shown in
-/// the connection card instead of the generic hint.
-pub static IDLE: Hook<(), Option<String>> = Hook::exclusive("servers.idle");
 
+/// Why `s` must not be used; the user's choice ([`Exclusion::permanent`])
+/// wins over a failed test.
 pub fn exclusion(snap: &Snapshot, s: &Server) -> Option<Exclusion> {
-    snap.first(&EXCLUDE, s)
+    (snap.hooks(&EXCLUDE, s).into_iter().flatten()).max_by_key(|e| e.permanent)
 }
 /// [`SOURCE`], or for a source nobody describes: "Source", a color its id
 /// picks and the last rank.
@@ -359,24 +354,15 @@ pub fn selected(snap: &Snapshot) -> Option<Server> {
 // ---- UI zones ---------------------------------------------------------------
 
 /// Inline controls in the Servers toolbar (toggles, task buttons).
-pub static TOOLBAR: Slot<()> =
-    Slot::new("servers.toolbar", "Servers page toolbar: compact controls");
+pub static TOOLBAR: Slot<()> = Slot::new("servers.toolbar");
 /// Under "No servers yet": ways to get servers.
-pub static EMPTY: Slot<()> = Slot::new(
-    "servers.empty",
-    "Servers page without servers: ways to add some",
-);
+pub static EMPTY: Slot<()> = Slot::new("servers.empty");
 /// Columns on the right of every row (rating, latency…): `p.column(&COLUMNS, …)`.
-pub static COLUMNS: Columns<Server> =
-    Columns::new("servers.columns", "Servers rows: extra columns");
+pub static COLUMNS: Columns<Server> = Columns::new("servers.columns");
 /// Sections in an expanded server row.
-pub static DETAILS: Slot<Server> =
-    Slot::new("servers.details", "Expanded server: extra properties");
+pub static DETAILS: Slot<Server> = Slot::new("servers.details");
 /// Lines in the connection card for the selected server.
-pub static CONNECTION: Slot<Server> = Slot::new(
-    "servers.connection",
-    "Connection card: lines about the selected server",
-);
+pub static CONNECTION: Slot<Server> = Slot::new("servers.connection");
 
 fn setup(p: &mut Setup) -> Result<()> {
     p.collection(&SERVERS);
@@ -393,12 +379,10 @@ fn setup(p: &mut Setup) -> Result<()> {
     // Red when the connected server failed its last test.
     p.hook(&homeport_kernel::shell::TRAY, |snap, _| {
         let id = (*snap.get(&SELECTED))?;
-        Some(
-            match health(snap, id).is_some_and(|h| h.rating == Some(0)) {
-                true => TrayLink::Failed,
-                false => TrayLink::Connected,
-            },
-        )
+        Some(match last_test(snap, id).is_some_and(|h| h.unreachable()) {
+            true => TrayLink::Failed,
+            false => TrayLink::Connected,
+        })
     });
     checks::register(p);
     auto::setup(p);
@@ -434,12 +418,7 @@ async fn remove_source(cx: Cx, RemoveSource(source): RemoveSource) -> Result<()>
 async fn select(cx: Cx, op: Select) -> Result<()> {
     let snap = cx.snapshot();
     if let Some(id) = op.id {
-        let server = snap
-            .get(&SERVERS)
-            .iter()
-            .find(|s| s.id == id)
-            .cloned()
-            .ok_or_else(|| Error::msg("Server no longer exists."))?;
+        let server = server(&snap, id).ok_or_else(|| Error::msg("Server no longer exists."))?;
         // A manual choice may override a failed test, never a filter.
         if let Some(e) = exclusion(&snap, &server).filter(|e| e.permanent || op.auto.is_some()) {
             bail!("{}", e.reason);
@@ -469,6 +448,7 @@ async fn select(cx: Cx, op: Select) -> Result<()> {
             Some(s) => info!("Connected to {}", s.name),
             None => info!("Disconnected"),
         }
+        auto::manual_choice(&cx).await?;
     }
     Ok(())
 }
@@ -498,8 +478,18 @@ fn set_selected(w: &mut homeport_kernel::Write<'_>, to: Option<Id>, auto: bool) 
     }
 }
 
+/// The mihomo proxy of a server (named by its id; [`server_in`] reads it back).
+pub fn proxy_of(id: Id) -> Target {
+    Target::Proxy(id.to_string())
+}
+/// The server a connection went through, from its mihomo chain (outbound
+/// names, outermost first).
+pub fn server_in(chain: &[String]) -> Option<Id> {
+    chain.iter().find_map(|n| n.parse::<Id>().ok())
+}
+
 /// Every server as a mihomo proxy, and the main group that routes through the
-/// selected one (a fallback group when a plugin offers backups).
+/// selected one (a fallback group with Auto select's backups).
 fn fragment(snap: &Snapshot) -> Fragment {
     let servers = snap.get(&SERVERS);
     let proxies: Vec<mihomo::Proxy> = servers
@@ -516,7 +506,7 @@ fn fragment(snap: &Snapshot) -> Fragment {
     let known: HashSet<Id> = servers.iter().map(|s| s.id).collect();
     let selected = (*snap.get(&SELECTED)).filter(|id| known.contains(id));
     let failover = selected
-        .and_then(|id| snap.first(&FAILOVER, &id).map(|f| (id, f)))
+        .and_then(|id| auto::failover(snap).map(|f| (id, f)))
         .map(|(id, mut f)| {
             let mut seen = HashSet::from([id]);
             f.backups.retain(|b| known.contains(b) && seen.insert(*b));
@@ -530,11 +520,8 @@ fn fragment(snap: &Snapshot) -> Fragment {
                 url: f.url,
                 interval_secs: f.interval_secs,
             },
-            members: std::iter::once(id)
-                .chain(f.backups)
-                .map(|id| Target::Proxy(id.to_string()))
-                .collect(),
-            selected: Some(Target::Proxy(id.to_string())),
+            members: std::iter::once(id).chain(f.backups).map(proxy_of).collect(),
+            selected: Some(proxy_of(id)),
         },
         None => mihomo::Group {
             name: MAIN.into(),
@@ -543,7 +530,7 @@ fn fragment(snap: &Snapshot) -> Fragment {
                 .iter()
                 .map(|p| Target::Proxy(p.name.clone()))
                 .collect(),
-            selected: selected.map(|id| Target::Proxy(id.to_string())),
+            selected: selected.map(proxy_of),
         },
     };
     let mut labels: Vec<(String, String)> = servers
@@ -551,12 +538,9 @@ fn fragment(snap: &Snapshot) -> Fragment {
         .map(|s| (s.id.to_string(), s.name.clone()))
         .collect();
     labels.push((MAIN.into(), "proxy".into()));
-    // The core's final rule: whatever no other rule caught.
-    labels.push(("Match".into(), "Everything else".into()));
     Fragment {
         groups: vec![main],
         proxies,
-        rules: vec![(Stage::Final, CoreRule::Match(route(snap)))],
         labels,
         ..Default::default()
     }
@@ -611,7 +595,13 @@ pub(crate) fn details(s: &Server) -> (Properties, Properties) {
         ("Flow", text("flow"), true),
     ] {
         if let Some(v) = value {
-            if is_rare { &mut rare } else { &mut common }.push((label.into(), v.to_owned()));
+            // Transports read as their usual names: TCP, WS, gRPC, XHTTP.
+            let v = match (label, v) {
+                ("Transport", "grpc") => "gRPC".to_owned(),
+                ("Transport", v) => v.to_uppercase(),
+                (_, v) => v.to_owned(),
+            };
+            if is_rare { &mut rare } else { &mut common }.push((label.into(), v));
         }
     }
     for (label, outer, key) in [

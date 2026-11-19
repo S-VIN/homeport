@@ -111,7 +111,8 @@ async fn warp_is_set_up_and_carries_traffic_as_the_exit() {
                 body: doc,
             })
             .await
-            .unwrap();
+            .unwrap()
+            .proxies;
         k.cx_for("servers")
             .call(plugin_servers::ReplaceFromSource {
                 source: id,
@@ -186,7 +187,7 @@ async fn slow_origin(body: &'static str, hold: Duration) -> u16 {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn connections_show_live_traffic_and_can_be_closed() {
-    use plugin_connections::{Close, TRAFFIC};
+    use plugin_statistics::{Close, TRAFFIC};
     let dir = tempfile::tempdir().unwrap();
     let host = start(dir.path()).await;
     // An open window: connections are sampled every second.
@@ -237,7 +238,7 @@ async fn connections_show_live_traffic_and_can_be_closed() {
         "the held connection is listed: {:?}",
         k.snapshot().live(&TRAFFIC).conns
     );
-    k.cx_for("connections").call(Close(None)).await.unwrap();
+    k.cx_for("statistics").call(Close(None)).await.unwrap();
     let r = request.await.unwrap();
     assert!(
         !r.is_ok_and(|r| r.status().is_success()),

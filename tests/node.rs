@@ -283,14 +283,7 @@ async fn chain_exit_chains_after_the_selected_server_and_fails_closed() {
 
     // The exit: the node's link, added on the Exit server page.
     k.cx_for("chain-exit")
-        .call(Add::new(
-            &exit::EXITS,
-            exit::Exit {
-                id: Id::random(),
-                name: String::new(),
-                link,
-            },
-        ))
+        .call(Add::new(&exit::EXITS, exit::Exit::new(link)))
         .await
         .unwrap();
     until(&k, "exit in use", |k| exit::active(&k.snapshot()).is_some()).await;

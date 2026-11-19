@@ -16,7 +16,7 @@ const CHEVRON: f32 = 16.;
 pub(crate) fn register(p: &mut Setup) {
     p.page::<ServersPage>(PageSpec {
         title: "Servers",
-        icon: Icon::Servers,
+        icon: Icon::HardDrives,
         order: 10,
     });
     p.fill(&STATUS, "connection", 0, |ui, cx, _| {
@@ -53,10 +53,10 @@ fn connection_card(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
     let Some(s) = selected(&snap) else {
         // The status bar already says "Not connected".
         homeport_kernel::shell::panel_title_page(ui, cx, "Connection", &PLUGIN);
-        match snap.first(&crate::IDLE, &()) {
+        match crate::auto::idle(&snap) {
             Some(status) => drop(kit::tone_text(ui, status, Tone::Neutral)),
             None => {
-                let text = "Traffic that should go through the proxy is blocked until you connect a server.";
+                let text = "Proxied traffic is blocked until you connect a server.";
                 let text = egui::RichText::new(text)
                     .size(theme::SMALL)
                     .color(pal.muted);
@@ -65,37 +65,33 @@ fn connection_card(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
         }
         return;
     };
-    let excluded = exclusion(&snap, &s);
-    let tone = if excluded.is_some() {
-        pal.warning
-    } else {
-        pal.success
+    // A server that failed its test is still connected: say what is wrong
+    // instead of a green "Connected".
+    let (text, icon, tone) = match exclusion(&snap, &s) {
+        Some(e) => (e.reason, Icon::Warning, pal.warning),
+        None => ("Connected".to_owned(), Icon::Connected, pal.success),
     };
     panel_title(ui, "Connection", |ui| {
-        ui.spacing_mut().item_spacing.x = 4.;
-        let r = ui.label(
-            egui::RichText::new("Connected")
-                .size(theme::SMALL)
-                .color(tone),
-        );
-        if let Some(e) = &excluded {
-            r.on_hover_text(&e.reason);
-        }
-        kit::icon(ui, Icon::Connected, 14., tone);
+        ui.spacing_mut().item_spacing.x = theme::SPACE_S;
+        ui.label(egui::RichText::new(text).size(theme::SMALL).color(tone));
+        kit::icon(ui, icon, 14., tone);
     });
     ui.scope(|ui| {
         ui.set_max_width(ui.available_width());
         kit::label(ui, &s.name, theme::bold(theme::TITLE), true);
     });
-    ui.add_space(4.);
+    ui.add_space(theme::SPACE_S);
     ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.;
-        source_tag(ui, &snap, s.source, 160.);
+        ui.spacing_mut().item_spacing.x = theme::SPACE_S;
+        // A source named like its only server (a single link) needs no tag.
+        if source(&snap, s.source).label != s.name {
+            source_tag(ui, &snap, s.source, 160.);
+        }
         kit::badge(ui, &s.protocol.to_string().to_uppercase(), Tone::Neutral);
     });
-    ui.add_space(8.);
+    ui.add_space(theme::SPACE_M);
     cx.slot(ui, &CONNECTION, &s);
-    ui.add_space(4.);
+    ui.add_space(theme::SPACE_S);
     if Button::secondary("Disconnect")
         .icon(Icon::Disconnect)
         .show(ui)
@@ -111,12 +107,16 @@ fn connection_card(ui: &mut egui::Ui, cx: &mut UiCx, _: &()) {
 /// The name column's id in the list's sort.
 const NAME: ColumnKey = ("servers", "name");
 
+/// A shown server and why it can't be used.
+type Row<'a> = (&'a Server, Option<Exclusion>);
+
 struct ServersPage {
     /// Shown subscriptions and protocols; empty shows all.
     sources: HashSet<Id>,
     protocols: HashSet<Protocol>,
     sort: kit::Sort<ColumnKey>,
-    frozen: Vec<Id>,
+    /// The order (and group captions) a running Test all keeps.
+    frozen: Vec<(Id, Option<&'static str>)>,
     expanded: HashSet<Id>,
 }
 impl Default for ServersPage {
@@ -135,30 +135,16 @@ impl Page for ServersPage {
     fn ui(&mut self, ui: &mut egui::Ui, cx: &mut UiCx) {
         let snap = cx.snapshot().clone();
         let servers = snap.get(&SERVERS);
-        // "84 servers · 1 excluded by name · 3 failed": one part per exclusion group.
-        let mut groups: Vec<(&'static str, usize)> = Vec::new();
-        for e in servers.iter().filter_map(|s| exclusion(&snap, s)) {
-            match groups.iter_mut().find(|(g, _)| *g == e.group) {
-                Some((_, n)) => *n += 1,
-                None => groups.push((e.group, 1)),
-            }
-        }
+        // The groups of excluded servers count themselves in their captions.
         let counter = match servers.len() {
             0 => String::new(),
-            n => std::iter::once(kit::plural(n, "server", "servers"))
-                .chain(
-                    groups
-                        .iter()
-                        .map(|(g, n)| format!("{n} {}", g.to_lowercase())),
-                )
-                .collect::<Vec<_>>()
-                .join(" · "),
+            n => kit::plural(n, "server", "servers"),
         };
         if servers.is_empty() {
             // The toolbar acts on servers: nothing to show it for.
             cx.page_header(ui, "", |_, _| {});
             kit::list_card(ui, |ui| {
-                kit::empty(ui, Icon::Servers, "No servers yet");
+                kit::empty(ui, Icon::HardDrives, "No servers yet");
                 ui.vertical_centered(|ui| cx.slot(ui, &EMPTY, &()));
                 ui.add_space(theme::SPACE_XL);
             });
@@ -171,26 +157,27 @@ impl Page for ServersPage {
         self.protocols
             .retain(|p| servers.iter().any(|s| s.protocol == *p));
         let key = cx.column_sort(&COLUMNS, self.sort.column);
-        let (rows, frozen) = self.rows(&snap, &servers, key);
-        self.list(ui, cx, &snap, &servers, &rows, frozen);
+        let (rows, groups) = self.rows(&snap, &servers, key);
+        self.list(ui, cx, &snap, &servers, &rows, &groups);
     }
 }
 
 impl ServersPage {
     /// The rows the filters keep, each with why it can't be used, in display
-    /// order; `true` while a check holds the order still.
+    /// order, and the group caption each falls under (held still while
+    /// Test all runs, so rows don't jump).
     fn rows<'a>(
         &mut self,
         snap: &Snapshot,
         servers: &'a [Server],
         key: Option<SortKey<Server>>,
-    ) -> (Vec<(&'a Server, Option<Exclusion>)>, bool) {
+    ) -> (Vec<Row<'a>>, Vec<Option<&'static str>>) {
         if key.is_none() && self.sort.column != NAME {
             // Its plugin was turned off.
             self.sort = kit::Sort::new(NAME);
         }
         // Each row with why it can't be used, worked out once per frame.
-        let mut rows: Vec<(&Server, Option<Exclusion>)> = servers
+        let mut rows: Vec<Row> = servers
             .iter()
             .filter(|s| {
                 (self.sources.is_empty() || self.sources.contains(&s.source))
@@ -198,23 +185,28 @@ impl ServersPage {
             })
             .map(|s| (s, exclusion(snap, s)))
             .collect();
-        let frozen = snap.hooks(&FREEZE, &()).into_iter().any(|f| f) && !self.frozen.is_empty();
-        if frozen {
-            let rank: HashMap<Id, usize> = self
+        if *snap.live(&crate::checks::TESTING) && !self.frozen.is_empty() {
+            let rank: HashMap<Id, (usize, Option<&'static str>)> = self
                 .frozen
                 .iter()
                 .enumerate()
-                .map(|(i, id)| (*id, i))
+                .map(|(i, (id, group))| (*id, (i, *group)))
                 .collect();
-            rows.sort_by_key(|(s, _)| rank.get(&s.id).copied().unwrap_or(usize::MAX));
-        } else {
-            // Unusable servers stay last, in groups, whatever the order.
+            rows.sort_by_key(|(s, _)| rank.get(&s.id).map_or(usize::MAX, |r| r.0));
+            let groups = (rows.iter())
+                .map(|(s, _)| rank.get(&s.id).and_then(|r| r.1))
+                .collect();
+            return (rows, groups);
+        }
+        {
+            // Unusable servers stay last, in groups, whatever the order:
+            // failed ones, then the user's exclusions.
             let reverse = self.sort.dir == kit::SortDir::Desc;
             let mut keyed: Vec<_> = rows
                 .into_iter()
                 .map(|row| {
                     let primary = key.map_or(0, |k| k(snap, row.0));
-                    let group = row.1.as_ref().map(|e| e.group);
+                    let group = row.1.as_ref().map(|e| (e.permanent, e.group));
                     (group, primary, natural_key(&row.0.name), row)
                 })
                 .collect();
@@ -230,9 +222,12 @@ impl ServersPage {
                     .then(a.3.0.id.cmp(&b.3.0.id))
             });
             rows = keyed.into_iter().map(|k| k.3).collect();
-            self.frozen = rows.iter().map(|(s, _)| s.id).collect();
         }
-        (rows, frozen)
+        self.frozen = (rows.iter())
+            .map(|(s, e)| (s.id, e.as_ref().map(|e| e.group)))
+            .collect();
+        let groups = self.frozen.iter().map(|(_, g)| *g).collect();
+        (rows, groups)
     }
 
     fn list(
@@ -241,11 +236,10 @@ impl ServersPage {
         cx: &mut UiCx,
         snap: &Snapshot,
         servers: &[Server],
-        rows: &[(&Server, Option<Exclusion>)],
-        frozen: bool,
+        rows: &[Row],
+        groups: &[Option<&'static str>],
     ) {
         let total = servers.len();
-        let wide = !kit::phone(ui);
         let selected_id = *snap.get(&SELECTED);
         let core_ok = cx.core_status().running();
         kit::list_card(ui, |ui| {
@@ -277,21 +271,35 @@ impl ServersPage {
                 ui.add_space(theme::SPACE_XL);
                 return;
             }
+            // A new frame of rows: carry over whether any tag was cut.
+            let changed = ui.ctx().data_mut(|d| {
+                let (last, now) = d.get_temp_mut_or(tags_id(), (false, false));
+                let changed = *last != *now;
+                (*last, *now) = (*now, false);
+                changed
+            });
+            if changed {
+                ui.ctx().request_repaint();
+            }
             egui::ScrollArea::vertical()
                 .id_salt("server-rows")
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    let group = |i: usize| rows[i].1.as_ref().map(|e| e.group);
+                    let group = |i: usize| groups[i];
                     for (i, (s, excluded)) in rows.iter().enumerate() {
                         // Servers that can't be used close the list in groups,
-                        // each under its caption (not while a check freezes the order).
-                        if let Some(name) = group(i).filter(|_| !frozen && i > 0)
-                            && group(i - 1) != Some(name)
+                        // each under its caption.
+                        if let Some(name) = group(i)
+                            && (i == 0 || group(i - 1) != Some(name))
                         {
                             let count = (i..rows.len())
                                 .take_while(|&j| group(j) == Some(name))
                                 .count();
-                            ui.add_space(theme::SPACE_M);
+                            ui.add_space(if i == 0 {
+                                theme::SPACE_S
+                            } else {
+                                theme::SPACE_M
+                            });
                             ui.horizontal(|ui| {
                                 ui.add_space(CHEVRON + theme::HORIZONTAL_GAP);
                                 kit::caption(ui, format!("{name} · {count}"));
@@ -303,7 +311,6 @@ impl ServersPage {
                                 selected: selected_id == Some(s.id),
                                 excluded,
                                 core_ok,
-                                wide,
                             };
                             self.row(ui, cx, snap, s, state)
                         });
@@ -326,7 +333,6 @@ struct RowState {
     selected: bool,
     excluded: Option<Exclusion>,
     core_ok: bool,
-    wide: bool,
 }
 
 impl ServersPage {
@@ -403,7 +409,6 @@ impl ServersPage {
             selected,
             excluded,
             core_ok,
-            wide,
         } = state;
         // A filter blocks a server; a failed test only warns (it may be wrong).
         let blocked = excluded.as_ref().is_some_and(|e| e.permanent);
@@ -422,7 +427,6 @@ impl ServersPage {
                             excluded: excluded.as_ref(),
                             expanded,
                             hovered: row.hovered,
-                            wide,
                         };
                         match title.show(ui, snap) {
                             Some(TitleClick::Toggle) => expanded = !expanded,
@@ -459,7 +463,13 @@ fn details_body(
     let pal = theme::palette(ui);
     ui.spacing_mut().item_spacing.y = 0.;
     // A long name is cut in the row.
-    kit::property(ui, "Name", &s.name);
+    if ui
+        .ctx()
+        .data(|d| d.get_temp(name_cut_id(s.id)))
+        .unwrap_or(false)
+    {
+        kit::property(ui, "Name", &s.name);
+    }
     if let Some(e) = excluded {
         kit::property_with(ui, "Status", |ui| {
             ui.add(egui::Label::new(egui::RichText::new(&e.reason).color(pal.warning)).truncate());
@@ -494,9 +504,9 @@ fn connect_button(
     core_ok: bool,
 ) -> Option<Option<Id>> {
     if selected {
-        let r = Button::ghost("Disconnect")
+        // Neutral, as in the connection card: danger is for destroying data.
+        let r = Button::secondary("Disconnect")
             .icon(Icon::Disconnect)
-            .tone(Tone::Danger)
             .width(ACTION)
             .show(ui);
         return r.clicked().then_some(None);
@@ -530,12 +540,18 @@ enum Tag {
     Pill(f32),
     Dot,
 }
+fn name_cut_id(server: Id) -> egui::Id {
+    egui::Id::unique(("server-name-cut", server))
+}
+/// Tags of the server list: (dots last frame, dots this frame).
+fn tags_id() -> egui::Id {
+    egui::Id::unique("server-tags-dots")
+}
 struct Title<'a> {
     server: &'a Server,
     excluded: Option<&'a Exclusion>,
     expanded: bool,
     hovered: bool,
-    wide: bool,
 }
 impl Title<'_> {
     fn show(&self, ui: &mut egui::Ui, snap: &Snapshot) -> Option<TitleClick> {
@@ -551,12 +567,19 @@ impl Title<'_> {
             .size()
             .x;
         let show_tag = label != s.name;
-        let tag_room = (room - name_need)
-            .min(room / 3.)
-            .min(if self.wide { 240. } else { 120. });
+        let tag_room = (room - name_need).min(room / 3.).min(240.);
+        // One look for the whole list: a tag that does not fit whole turns
+        // every row's tag into a dot (from the next frame).
+        let whole = kit::tag_width(ui, &label, f32::INFINITY);
+        let fits = whole <= tag_room;
+        let dots = ui.ctx().data_mut(|d| {
+            let (last, now) = d.get_temp_mut_or(tags_id(), (false, false));
+            *now |= show_tag && !fits;
+            *last
+        });
         let tag = match () {
             _ if !show_tag => Tag::None,
-            _ if tag_room >= 56. => Tag::Pill(kit::tag_width(ui, &label, tag_room)),
+            _ if fits && !dots => Tag::Pill(whole),
             _ => Tag::Dot,
         };
         let tag_w = match tag {
@@ -565,6 +588,9 @@ impl Title<'_> {
             Tag::Dot => 10.,
         };
         let name_w = (room - tag_w).max(40.);
+        // The details repeat the name only when the row cuts it.
+        let cut = name_need > name_w;
+        ui.ctx().data_mut(|d| d.insert_temp(name_cut_id(s.id), cut));
         let (rect, chevron) =
             ui.allocate_exact_size(egui::vec2(CHEVRON, theme::CONTROL), egui::Sense::click());
         let ink = if chevron.hovered() || self.hovered {
@@ -601,9 +627,10 @@ impl Title<'_> {
             name.inner
         };
         let name = name_line(ui);
+        // A failed test shows in Rating; a name filter's pattern only here.
         let name = match self.excluded {
-            Some(e) => name.on_hover_text(&e.reason),
-            None => name,
+            Some(e) if e.permanent => name.on_hover_text(&e.reason),
+            _ => name,
         };
         if name.double_clicked() {
             Some(TitleClick::Connect)
@@ -630,11 +657,14 @@ fn details_frame(
             .fill(if pal.dark { pal.background } else { pal.hover })
             .stroke(egui::Stroke::new(1_f32, pal.border))
             .corner_radius(theme::RADIUS_CONTROL)
-            .inner_margin(egui::Margin::symmetric(10, 6))
+            .inner_margin(egui::Margin::symmetric(
+                theme::INSET as i8,
+                theme::SPACE_M as i8,
+            ))
             .show(ui, |ui| {
-                ui.set_width(ui.available_width() - 4.);
+                ui.set_width(ui.available_width() - theme::SPACE_S);
                 ui.vertical(|ui| details_body(ui, cx, snap, s, excluded));
             });
     });
-    ui.add_space(6.);
+    ui.add_space(theme::SPACE_M);
 }

@@ -37,22 +37,13 @@ use toasts::*;
 
 /// Status bar chips (top, always visible). Keep one short chip per concern;
 /// draw it with [`UiCx::status_chip`], which opens the plugin's panel or page.
-pub static STATUS: Slot<()> = Slot::new(
-    "shell.status",
-    "Status bar: short chips with the state at a glance",
-);
+pub static STATUS: Slot<()> = Slot::new("shell.status");
 /// Detail cards for what the chips summarize. Docked on the right in a wide
 /// window, a popover under the status bar otherwise. Start with [`panel_title`].
-pub static PANELS: Slot<()> = Slot::new(
-    "shell.panels",
-    "Side panel cards with details and quick actions",
-);
+pub static PANELS: Slot<()> = Slot::new("shell.panels");
 /// A plugin's rows in Settings ([`kit::settings_row`]): each plugin gets a
 /// section under its own name; the label names the setting.
-pub static SETTINGS_SECTIONS: Slot<()> = Slot::new(
-    "shell.settings",
-    "Settings: one settings row per setting, in the plugin's section",
-);
+pub static SETTINGS_SECTIONS: Slot<()> = Slot::new("shell.settings");
 
 const SETTINGS_PAGE: &str = "settings";
 const PLUGINS_PAGE: &str = "plugins";
@@ -214,22 +205,37 @@ fn apply_theme(ctx: &egui::Context, k: &Kernel, s: &mut SessionState) {
 }
 
 fn page(ui: &mut egui::Ui, cx: &mut UiCx) {
+    // Another page opens at its top.
+    let shown = egui::Id::unique("shell-shown-page");
+    if ui.data(|d| d.get_temp::<&'static str>(shown)) != Some(cx.s.page) {
+        ui.data_mut(|d| d.insert_temp(shown, cx.s.page));
+        kit::scroll_to_top(ui);
+    }
     if cx.s.page == PLUGINS_PAGE {
         // Only the plugins with a switch: required ones are part of the app.
-        let enabled = cx.k.reg.plugins.iter().filter(|p| !p.required).count();
+        // What the switches say, applied or waiting for a restart.
+        let saved = cx.k.saved_toggles.lock().unwrap().clone();
+        let enabled = (cx.k.catalog.iter())
+            .filter(|p| !p.required && p.supported() && crate::kernel::is_enabled(p, &saved))
+            .count();
         let optional = cx.k.catalog.iter().filter(|p| !p.required).count();
-        let counter = format!("{enabled} of {optional} on");
-        kit::page_header(ui, "Plugins", &counter, |_| {});
-
-        // Pinned under the header: it never scrolls away or pushes the content.
-        if cx.k.restart_pending()
-            && kit::banner(
-                ui,
-                Tone::Warning,
-                "Restart to apply plugin changes. Traffic pauses for a moment.",
-                Some("Restart now"),
-            )
-        {
+        let pending = cx.k.restart_pending();
+        let counter = match pending {
+            false => format!("{enabled} of {optional} on"),
+            true => format!("{enabled} of {optional} on · Restart to apply"),
+        };
+        // In the header, not above the list: switching never moves the rows.
+        let mut restart = false;
+        kit::page_header(ui, "Plugins", &counter, |ui| {
+            if pending {
+                restart = kit::Button::primary("Restart now")
+                    .icon(Icon::Refresh)
+                    .show(ui)
+                    .on_hover_text("Apply plugin changes. Traffic pauses for a moment.")
+                    .clicked();
+            }
+        });
+        if restart {
             cx.k.request_restart();
         }
         kit::page_scroll(ui, "plugins", |ui| plugin_manager(ui, cx));

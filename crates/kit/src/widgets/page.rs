@@ -1,10 +1,10 @@
 use super::*;
 
 /// Page header: title and a muted counter on the left, actions on the right.
-/// A counter without room next to the title goes on the line below.
+/// Always one line, so every page's content starts at the same height: a
+/// counter without room is cut short (the whole text on hover) or hidden.
 pub fn page_header(ui: &mut Ui, title: &str, counter: &str, actions: impl FnOnce(&mut Ui)) {
     let p = theme::palette(ui);
-    let mut below = false;
     let id = ui.scope_id().with(("page-header", title));
     let actions_width: f32 = ui.data(|d| d.get_temp(id)).unwrap_or(0.);
     let width = ui.available_width();
@@ -17,21 +17,15 @@ pub fn page_header(ui: &mut Ui, title: &str, counter: &str, actions: impl FnOnce
             let title =
                 ui.add(egui::Label::new(bold(title, theme::TITLE).color(p.foreground)).truncate());
             let room = width - title.rect.width() - actions_width - 3. * theme::HORIZONTAL_GAP;
-            // A counter that does not fit goes whole on a line of its own below.
-            below = !counter.is_empty()
-                && ui
-                    .painter()
-                    .layout_no_wrap(
-                        counter.to_owned(),
-                        FontId::proportional(theme::SMALL),
-                        p.muted,
-                    )
-                    .size()
-                    .x
-                    > room;
-            if !counter.is_empty() && !below {
+            if !counter.is_empty() && room >= 48. {
                 ui.add_space(2.);
-                ui.label(RichText::new(counter).size(theme::SMALL).color(p.muted));
+                ui.scope(|ui| {
+                    ui.set_max_width(room - 2.);
+                    ui.add(
+                        egui::Label::new(RichText::new(counter).size(theme::SMALL).color(p.muted))
+                            .truncate(),
+                    );
+                });
             }
             // Not `min_rect`: the row's minimum size already spans the width.
             // The cursor already stands a gap past the last widget.
@@ -42,7 +36,9 @@ pub fn page_header(ui: &mut Ui, title: &str, counter: &str, actions: impl FnOnce
                 .horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = theme::HORIZONTAL_GAP;
                     let start = ui.cursor().left();
+                    ui.data_mut(|d| d.insert_temp(in_header_id(), true));
                     actions(ui);
+                    ui.data_mut(|d| d.remove::<bool>(in_header_id()));
                     ui.min_rect().right() - start
                 })
                 .inner;
@@ -52,9 +48,6 @@ pub fn page_header(ui: &mut Ui, title: &str, counter: &str, actions: impl FnOnce
             }
         },
     );
-    if below {
-        ui.add(egui::Label::new(RichText::new(counter).size(theme::SMALL).color(p.muted)).wrap());
-    }
     ui.add_space(theme::SPACE_S);
 }
 
@@ -158,29 +151,42 @@ pub fn settings_card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     ui.add_space(theme::SPACE_M);
     r
 }
+fn to_top() -> egui::Id {
+    egui::Id::unique("kit-page-scroll-to-top")
+}
+/// The next [`page_scroll`] starts at the top (a page was just opened).
+pub fn scroll_to_top(ui: &Ui) {
+    ui.data_mut(|d| d.insert_temp(to_top(), true));
+}
 /// Vertical scroll for a page body; keeps card borders off the clip edge.
 pub fn page_scroll<R>(ui: &mut Ui, id: impl egui::AsIdSalt, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let top = ui
+        .data_mut(|d| d.remove_temp::<bool>(to_top()))
+        .unwrap_or(false);
     // The bar runs in the page's right margin: content keeps the same right
     // edge with and without a scroll, and the bar never covers a card's border.
     let gutter = theme::SPACE_M;
     let mut rect = ui.available_rect_before_wrap();
     rect.max.x += gutter;
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-        egui::ScrollArea::vertical()
+        let mut area = egui::ScrollArea::vertical()
             .id_salt(id)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                egui::Frame::NONE
-                    .inner_margin(egui::Margin {
-                        left: 0,
-                        right: gutter as i8,
-                        top: 0,
-                        bottom: 1,
-                    })
-                    .show(ui, add)
-                    .inner
-            })
-            .inner
+            .auto_shrink([false, false]);
+        if top {
+            area = area.vertical_scroll_offset(0.);
+        }
+        area.show(ui, |ui| {
+            egui::Frame::NONE
+                .inner_margin(egui::Margin {
+                    left: 0,
+                    right: gutter as i8,
+                    top: 0,
+                    bottom: 1,
+                })
+                .show(ui, add)
+                .inner
+        })
+        .inner
     })
     .inner
 }
@@ -327,6 +333,13 @@ pub(crate) fn outside_row<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     ui.ctx().data_mut(|d| d.insert_temp(in_row_id(), outer));
     r
 }
+fn in_header_id() -> egui::Id {
+    egui::Id::unique("kit-in-header")
+}
+/// Drawing the actions of a [`page_header`] on a phone: buttons show icons.
+pub(crate) fn compact_header(ui: &Ui) -> bool {
+    phone(ui) && ui.data(|d| d.get_temp(in_header_id()).unwrap_or(false))
+}
 fn in_row_id() -> egui::Id {
     egui::Id::unique("kit-in-row")
 }
@@ -414,6 +427,70 @@ pub fn remove(ui: &mut Ui, emphasis: Emphasis) -> bool {
         .danger()
         .show(ui)
         .clicked()
+}
+
+/// One button for all actions of a row (a phone has no room for several):
+/// "Actions" opens `menu` of [`menu_item`]s.
+const MENU_WIDTH: f32 = 168.;
+pub fn row_menu(ui: &mut Ui, emphasis: Emphasis, menu: impl FnOnce(&mut Ui)) {
+    let response = IconButton::new(Icon::More, "Actions")
+        .emphasis(emphasis)
+        .show(ui);
+    // Hangs from the button's right edge, as wide as its longest item.
+    egui::Popup::menu(&response)
+        .align(egui::RectAlign::BOTTOM_END)
+        .width(MENU_WIDTH)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+        .show(|ui| {
+            ui.set_width(MENU_WIDTH);
+            ui.spacing_mut().item_spacing.y = 0.;
+            menu(ui)
+        });
+}
+
+/// One line of a menu: icon and label; `danger` turns it red under the
+/// pointer, like a delete button. True when clicked.
+pub fn menu_item(ui: &mut Ui, icon: Icon, label: &str, enabled: bool, danger: bool) -> bool {
+    let p = theme::palette(ui);
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(MENU_WIDTH, 30.),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::MenuItem, enabled, label));
+    let hovered = enabled && response.hovered();
+    if hovered {
+        ui.painter()
+            .rect_filled(rect, theme::RADIUS_CONTROL, p.hover);
+    }
+    let ink = match (enabled, hovered && danger) {
+        (false, _) => p.faint,
+        (true, true) => p.danger,
+        (true, false) => p.foreground,
+    };
+    let icon_ink = if enabled && !(hovered && danger) {
+        p.muted
+    } else {
+        ink
+    };
+    crate::icons::paint(
+        ui.painter(),
+        rect.left_center() + vec2(14., 0.),
+        icon,
+        icon_ink,
+    );
+    let text =
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), FontId::proportional(theme::BODY), ink);
+    ui.painter().galley(
+        rect.left_center() + vec2(30., -text.size().y / 2.),
+        text,
+        ink,
+    );
+    enabled && response.clicked()
 }
 
 /// Save (✓) and Cancel (✕) of an inline edit, side by side. Returns
@@ -557,6 +634,7 @@ pub fn empty_with(ui: &mut Ui, icon: Icon, title: &str, next: &str) {
         ui.add_space(30.);
         ui.label(bold(title, theme::BODY).color(p.foreground));
         if !next.is_empty() {
+            ui.add_space(theme::SPACE_XS);
             ui.add(egui::Label::new(RichText::new(next).size(theme::SMALL).color(p.muted)).wrap());
         }
     });

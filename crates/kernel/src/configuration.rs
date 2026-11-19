@@ -58,7 +58,7 @@ impl Host {
             crate::bail!("Configuration exceeds the 32 MiB file limit.");
         }
         if !bytes.starts_with(b"SQLite format 3\0") {
-            crate::bail!("Choose a configuration exported by homeport (.sqlite3).");
+            crate::bail!("Choose a configuration exported by Homeport (.sqlite3).");
         }
         let mut file = tempfile::NamedTempFile::new().map_err(io)?;
         file.write_all(bytes).map_err(io)?;
@@ -68,7 +68,7 @@ impl Host {
         // keep the real ones untouched.
         let scratch = tempfile::tempdir().map_err(io)?;
         Kernel::load_configuration(&self.catalog, &candidate, scratch.path(), true)
-            .map_err(|_| Error::msg("This configuration is damaged or incompatible with this version of homeport. Your settings have not changed."))?;
+            .map_err(|_| Error::msg("This configuration is damaged or incompatible with this version of Homeport. Your settings have not changed."))?;
         let active = Kernel::load_configuration(&self.catalog, &candidate, scratch.path(), false)?;
         crate::core::compose(&active.reg, &active)?;
         Ok(Arc::new(Import {

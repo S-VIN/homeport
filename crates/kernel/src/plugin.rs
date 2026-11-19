@@ -12,12 +12,10 @@ impl Category {
 }
 
 /// Well-known categories: the groups of Settings → Plugins. A plugin may declare
-/// its own with [`Category::new`]. Keep the list short: a group should hold
-/// several plugins.
+/// its own with [`Category::new`] (the servers plugin declares `Servers`). Keep
+/// the list short: a group should hold several plugins.
 pub mod categories {
     use super::Category;
-    /// The server catalog and everything that fills, filters or measures it.
-    pub const SERVERS: Category = Category::new("servers", "Servers");
     /// Local traffic (routing, listeners) and desktop integration.
     pub const NETWORK: Category = Category::new("network", "Network & system");
 }

@@ -7,18 +7,15 @@ use crate::{Setup, Snapshot, UiCx, egui, kit};
 use std::{marker::PhantomData, sync::Arc};
 
 /// A list that accepts columns from other plugins:
-/// `pub static COLUMNS: Columns<Server> = Columns::new("servers.columns", "…")`.
+/// `pub static COLUMNS: Columns<Server> = Columns::new("servers.columns")`.
 pub struct Columns<T: 'static> {
     pub id: &'static str,
-    /// One line for documentation: which list and what belongs there.
-    pub about: &'static str,
     _t: PhantomData<fn(&T)>,
 }
 impl<T> Columns<T> {
-    pub const fn new(id: &'static str, about: &'static str) -> Self {
+    pub const fn new(id: &'static str) -> Self {
         Self {
             id,
-            about,
             _t: PhantomData,
         }
     }
@@ -77,6 +74,7 @@ impl Setup<'_> {
         column: Column<T>,
         cell: impl Fn(&mut egui::Ui, &mut UiCx, &T) + Send + Sync + 'static,
     ) {
+        self.check_zone(list.id);
         let (plugin, key) = (self.me(), (self.plugin_id(), column.id));
         let all = &mut self
             .reg

@@ -10,7 +10,7 @@ mod page;
 pub static PLUGIN: Plugin = Plugin {
     id: "install-to-server",
     name: "Install to server",
-    description: "Install homeport with its web panel on your Linux server over SSH.",
+    description: "Install Homeport with its web panel on your Linux server over SSH.",
     platforms: Platform::NATIVE,
     migrations: homeport_kernel::migrations!(),
     setup,
@@ -19,7 +19,7 @@ pub static PLUGIN: Plugin = Plugin {
 
 /// A server installed from here.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Table)]
-#[table(name = "deployments")]
+#[table(name = "install_to_server_deployments")]
 pub struct Deployment {
     pub id: Id,
     pub host: String,

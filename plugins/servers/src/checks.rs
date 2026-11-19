@@ -3,8 +3,8 @@
 //! speed and whatever other plugins add (say, test URLs). The rating is the
 //! weighted mean of latency and the checks' values.
 //!
-//! A check is an op of its plugin ([`CheckOp`], declared with [`add_check`]);
-//! it gets a [`Probe`]: how to reach the server for tests, which a plugin may
+//! A plugin adds a check with [`add_check`]: an async function that gets a
+//! [`Probe`]: how to reach the server for tests, which a plugin may
 //! change with [`TEST_PATH`] (say, through a proxy chain).
 use crate::{Exclusion, SELECTED, SERVERS, Server, server};
 use homeport_kernel::{
@@ -17,6 +17,7 @@ use std::{
     collections::BTreeMap,
     fmt,
     future::Future,
+    marker::PhantomData,
     pin::Pin,
     str::FromStr,
     sync::Arc,
@@ -113,12 +114,13 @@ impl Probe {
         cx.core().lease(Target::Proxy(self.proxy.clone())).await
     }
 }
-/// The op of a check: built from the probe, answers its reading (`None`:
-/// nothing to say this time, it does not count).
-pub trait CheckOp: Op<Reply = Option<Reading>> {
-    fn new(probe: Probe) -> Self;
+/// The op behind a check: one type per check function `F`, handled by the
+/// plugin that added it (so the check writes that plugin's state).
+struct RunCheck<F>(Probe, PhantomData<fn() -> F>);
+impl<F: 'static> Op for RunCheck<F> {
+    type Reply = Option<Reading>;
 }
-type RunCheck = Arc<
+type Run = Arc<
     dyn Fn(&Cx, Probe) -> Pin<Box<dyn Future<Output = Result<Option<Reading>>> + Send>>
         + Send
         + Sync,
@@ -127,7 +129,7 @@ type RunCheck = Arc<
 #[derive(Clone)]
 pub struct Check {
     pub spec: CheckSpec,
-    run: RunCheck,
+    run: Run,
 }
 /// Every check of a test, from each plugin that has one now.
 pub static CHECKS: Hook<(), Option<Check>> = Hook::new("servers.checks");
@@ -141,13 +143,20 @@ pub fn probe_url(snap: &Snapshot) -> String {
 /// decides, e.g. a chain exit tests every server as its entry.
 pub static TEST_PATH: Hook<Server, Option<String>> = Hook::exclusive("servers.test-path");
 
-/// Rate servers with the op `C` too, while `applies` (say, while there is
-/// something to test). Its handler is the plugin's own `p.handle(…)`.
-pub fn add_check<C: CheckOp>(p: &mut Setup, spec: CheckSpec, applies: fn(&Snapshot) -> bool) {
+/// Rate servers with `check` too, while `applies` (say, while there is
+/// something to test). `check` gets how to reach the server and answers its
+/// reading (`None`: nothing to say this time, it does not count).
+pub fn add_check<F, Fut>(p: &mut Setup, spec: CheckSpec, applies: fn(&Snapshot) -> bool, check: F)
+where
+    F: Fn(Cx, Probe) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Option<Reading>>> + Send + 'static,
+{
+    p.handle(move |cx, RunCheck::<F>(probe, _)| check(cx, probe));
+    let run: Run = Arc::new(|cx, probe| Box::pin(cx.call(RunCheck::<F>(probe, PhantomData))));
     p.hook(&CHECKS, move |snap, _| {
         applies(snap).then(|| Check {
             spec,
-            run: Arc::new(|cx, probe| Box::pin(cx.call(C::new(probe)))),
+            run: run.clone(),
         })
     });
 }
@@ -182,18 +191,26 @@ sql_text!(Scores);
 
 /// Last test of one server; `id` is the server id.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Table)]
-#[table(name = "server_health")]
-pub struct Health {
+#[table(name = "servers_tests")]
+pub struct TestResult {
     pub id: Id,
     pub ping_ms: Option<u32>,
-    pub rating: Option<u8>,
     pub checked: Option<u64>,
     pub scores: Scores,
+    /// Why nothing answered ("Timed out"), when it did not.
+    pub failure: Option<String>,
 }
-impl Health {
+impl TestResult {
     /// Nothing answered through the server on its last test.
     pub fn unreachable(&self) -> bool {
-        self.checked.is_some() && self.ping_ms.is_none() && self.rating == Some(0)
+        self.checked.is_some() && self.ping_ms.is_none()
+    }
+    /// "Failed the last test: timed out" for an unreachable server.
+    pub fn failed_text(&self) -> String {
+        match &self.failure {
+            Some(why) => format!("Failed the last test: {}", why.to_lowercase()),
+            None => "Failed the last test".into(),
+        }
     }
 }
 /// What a test of a server found, for policies.
@@ -205,8 +222,20 @@ pub struct Report {
     pub checked: Option<u64>,
     /// `(check, value, quick)` of every check of the test.
     pub values: Vec<(&'static str, f64, bool)>,
+    /// Why nothing answered, when it did not.
+    pub failure: Option<String>,
 }
 impl Report {
+    /// The stored test `h`, read by `checks`.
+    pub(crate) fn of(checks: &[Check], h: &TestResult) -> Self {
+        Self {
+            ping_ms: h.ping_ms,
+            rating: h.checked.map(|_| rating(checks, h.ping_ms, &h.scores)),
+            checked: h.checked,
+            values: values(checks, &h.scores),
+            failure: h.failure.clone(),
+        }
+    }
     /// Reachable and no quick check failed.
     pub fn works(&self) -> bool {
         self.ping_ms.is_some() && self.values.iter().all(|(_, v, quick)| !quick || *v >= 0.5)
@@ -227,25 +256,25 @@ impl Default for TestSettings {
     }
 }
 
-pub static HEALTH: State<Vec<Health>> = State::new("servers.health");
-pub static TESTING: State<TestSettings> = State::new("servers.tests");
+pub static RESULTS: State<Vec<TestResult>> = State::new("servers.results");
+pub static TEST_SETTINGS: State<TestSettings> = State::new("servers.test-settings");
 /// True while Test all runs (rows keep their order meanwhile).
-pub static CHECKING: State<bool> = State::new("servers.checking");
+pub static TESTING: State<bool> = State::new("servers.testing");
 /// Servers being tested right now (rows show a spinner).
 pub static IN_FLIGHT: State<Vec<Id>> = State::new("servers.in-flight");
 
-pub fn health(snap: &Snapshot, server: Id) -> Option<Health> {
-    snap.get(&HEALTH).iter().find(|h| h.id == server).cloned()
+pub fn last_test(snap: &Snapshot, server: Id) -> Option<TestResult> {
+    snap.get(&RESULTS).iter().find(|h| h.id == server).cloned()
 }
-/// The stored test of a server, read by the checks of now.
+/// The stored test of a server, read by the checks of now: a check turned
+/// off since no longer counts in the rating.
 pub fn report(snap: &Snapshot, server: Id) -> Option<Report> {
-    let h = health(snap, server)?;
-    Some(Report {
-        ping_ms: h.ping_ms,
-        rating: h.rating,
-        checked: h.checked,
-        values: values(&checks(snap), &h.scores),
-    })
+    let h = last_test(snap, server)?;
+    Some(Report::of(&checks(snap), &h))
+}
+/// The rating of a server by its last test; `None` while untested.
+pub fn rating_of(snap: &Snapshot, server: Id) -> Option<u8> {
+    report(snap, server)?.rating
 }
 fn values(checks: &[Check], scores: &Scores) -> Vec<(&'static str, f64, bool)> {
     (checks.iter())
@@ -256,8 +285,8 @@ fn values(checks: &[Check], scores: &Scores) -> Vec<(&'static str, f64, bool)> {
 // ---- ops ---------------------------------------------------------------------
 
 /// Test every eligible server (job "Test servers").
-pub struct CheckAll;
-impl Op for CheckAll {
+pub struct TestAll;
+impl Op for TestAll {
     type Reply = ();
     fn job(&self) -> Option<JobSpec> {
         Some(JobSpec::new("Test servers").page(&crate::PLUGIN))
@@ -265,8 +294,8 @@ impl Op for CheckAll {
 }
 /// Test the servers without a result (job "Test new servers"), so new ones
 /// show a rating right away. One waiting run covers any number of loads.
-struct CheckNew;
-impl Op for CheckNew {
+struct TestNew;
+impl Op for TestNew {
     type Reply = ();
     fn job(&self) -> Option<JobSpec> {
         Some(
@@ -276,35 +305,25 @@ impl Op for CheckNew {
         )
     }
 }
-/// Full test of one server; stores and returns its health.
-pub struct CheckServer {
+/// Full test of one server; stores its health and returns the report.
+pub struct TestServer {
     pub id: Id,
 }
-impl Op for CheckServer {
-    type Reply = Option<Health>;
+impl Op for TestServer {
+    type Reply = Option<Report>;
 }
 /// Fast test without the slow checks, not stored (say, a candidate right
 /// before switching to it).
-pub struct QuickCheck {
+pub struct QuickTest {
     pub id: Id,
 }
-impl Op for QuickCheck {
+impl Op for QuickTest {
     type Reply = Option<Report>;
 }
 /// Emitted after Test all.
 #[derive(Clone, Debug)]
-pub struct Checked {
+pub struct Tested {
     pub servers: Vec<Id>,
-}
-/// Servers' own check: a short download through the server.
-pub struct Speed(Probe);
-impl Op for Speed {
-    type Reply = Option<Reading>;
-}
-impl CheckOp for Speed {
-    fn new(probe: Probe) -> Self {
-        Self(probe)
-    }
 }
 
 // ---- measuring -----------------------------------------------------------------
@@ -314,10 +333,16 @@ fn skipped(snap: &Snapshot, s: &Server) -> bool {
 }
 /// Latency through the probe: the best of two samples of the default probe
 /// URL (any answer counts: this is reachability); `None` when nothing answers.
-async fn latency(cx: &Cx, probe: &Probe) -> Option<u32> {
-    let first = probe.delay(cx, &probe.url, None, 2).await.ms()?;
+/// The best of two delay tests, or why the first one failed.
+async fn latency(cx: &Cx, probe: &Probe) -> std::result::Result<u32, &'static str> {
+    let first = match probe.delay(cx, &probe.url, None, 2).await {
+        Delay::Passed(ms) => ms,
+        Delay::Timeout => return Err("Timed out"),
+        Delay::WrongStatus => return Err("Unexpected answer"),
+        Delay::Failed => return Err("Connection failed"),
+    };
     let second = probe.delay(cx, &probe.url, None, 1).await.ms();
-    Some(second.map_or(first, |s| s.min(first)))
+    Ok(second.map_or(first, |s| s.min(first)))
 }
 /// Run `checks` through `probe` at the same time; a failed one does not count.
 async fn run(cx: &Cx, checks: &[Check], probe: &Probe) -> Result<Scores> {
@@ -339,16 +364,27 @@ async fn run(cx: &Cx, checks: &[Check], probe: &Probe) -> Result<Scores> {
     }
     Ok(Scores(scores))
 }
-/// The latency test with the quick checks at the same time: the best response
-/// time of all (`None`: nothing answered), and the quick checks' readings.
-async fn answer(cx: &Cx, checks: &[Check], probe: &Probe) -> Result<(Option<u32>, Scores)> {
+/// What the latency test and the quick checks, run at the same time, found.
+struct Answer {
+    /// The best response time of all; `None`: nothing answered.
+    ping: Option<u32>,
+    /// Why, when nothing answered.
+    failure: Option<String>,
+    scores: Scores,
+}
+async fn answer(cx: &Cx, checks: &[Check], probe: &Probe) -> Result<Answer> {
     let quick: Vec<Check> = checks.iter().filter(|c| c.spec.quick).cloned().collect();
     let (own, scores) = tokio::join!(cx.or_cancel(latency(cx, probe)), run(cx, &quick, probe));
-    let scores = scores?;
-    let ping = (own?.into_iter())
+    let (own, scores) = (own?, scores?);
+    let ping = (own.ok().into_iter())
         .chain(scores.0.values().filter_map(|r| r.delay_ms))
         .min();
-    Ok((ping, scores))
+    let failure = own.err().filter(|_| ping.is_none()).map(str::to_owned);
+    Ok(Answer {
+        ping,
+        failure,
+        scores,
+    })
 }
 
 /// 0–100: the weighted mean of latency and the checks' values; 0 when
@@ -366,51 +402,59 @@ fn rating(checks: &[Check], ping: Option<u32>, scores: &Scores) -> u8 {
     (100. * score / weight).round() as u8
 }
 
-async fn check_server(cx: Cx, op: CheckServer) -> Result<Option<Health>> {
+async fn check_server(cx: Cx, op: TestServer) -> Result<Option<Report>> {
     let snap = cx.snapshot();
     let Some(s) = server(&snap, op.id).filter(|s| !skipped(&snap, s)) else {
         return Ok(None);
     };
     let _testing = cx.mark_live(&IN_FLIGHT, s.id);
     let (probe, checks) = (Probe::of(&snap, &s, false), checks(&snap));
-    let (ping, mut scores) = answer(&cx, &checks, &probe).await?;
+    let Answer {
+        ping,
+        failure,
+        mut scores,
+    } = answer(&cx, &checks, &probe).await?;
     if ping.is_some() {
         let slow: Vec<Check> = checks.iter().filter(|c| !c.spec.quick).cloned().collect();
         scores.0.extend(run(&cx, &slow, &probe).await?.0);
     }
-    let h = Health {
+    let h = TestResult {
         id: s.id,
         ping_ms: ping,
-        rating: Some(rating(&checks, ping, &scores)),
         checked: Some(now()),
         scores,
+        failure,
     };
-    let stored = h.clone();
+    let report = Report::of(&checks, &h);
     // One write per server, so results show as they come: composing the
     // mihomo config is in memory, and an unchanged one is not reapplied.
     cx.write(move |w| {
-        if w.get(&SERVERS).iter().any(|x| x.id == stored.id) {
-            w.update(&HEALTH, |l| {
-                l.retain(|x| x.id != stored.id);
-                l.push(stored);
+        if w.get(&SERVERS).iter().any(|x| x.id == h.id) {
+            w.update(&RESULTS, |l| {
+                l.retain(|x| x.id != h.id);
+                l.push(h);
             });
         }
         Ok(())
     })
     .await?;
-    Ok(Some(h))
+    Ok(Some(report))
 }
 
 /// Latency and the quick checks; the others keep their last reading. Uses no
 /// check lane, so it never waits for Test all.
-async fn quick_check(cx: Cx, op: QuickCheck) -> Result<Option<Report>> {
+async fn quick_test(cx: Cx, op: QuickTest) -> Result<Option<Report>> {
     let snap = cx.snapshot();
     let Some(s) = server(&snap, op.id).filter(|s| !skipped(&snap, s)) else {
         return Ok(None);
     };
     let (probe, checks) = (Probe::of(&snap, &s, true), checks(&snap));
-    let (ping, fresh) = answer(&cx, &checks, &probe).await?;
-    let mut scores = health(&snap, s.id).map(|h| h.scores).unwrap_or_default();
+    let Answer {
+        ping,
+        failure,
+        scores: fresh,
+    } = answer(&cx, &checks, &probe).await?;
+    let mut scores = last_test(&snap, s.id).map(|h| h.scores).unwrap_or_default();
     for c in checks.iter().filter(|c| c.spec.quick) {
         scores.0.remove(c.spec.id);
     }
@@ -420,10 +464,12 @@ async fn quick_check(cx: Cx, op: QuickCheck) -> Result<Option<Report>> {
         rating: Some(rating(&checks, ping, &scores)),
         checked: Some(now()),
         values: values(&checks, &scores),
+        failure,
     }))
 }
 
-async fn speed(cx: Cx, Speed(probe): Speed) -> Result<Option<Reading>> {
+/// Servers' own check: a short download through the server.
+async fn speed(cx: Cx, probe: Probe) -> Result<Option<Reading>> {
     let lease = probe.lease(&cx).await?;
     let measured = cx.or_cancel(download_speed(lease.http())).await;
     lease.release().await;
@@ -465,9 +511,9 @@ async fn check_all(cx: &Cx, untested: bool) -> Result<()> {
     let mut ids: Vec<(Id, i64)> = snap
         .get(&SERVERS)
         .iter()
-        .filter(|s| !skipped(&snap, s) && !(untested && health(&snap, s.id).is_some()))
+        .filter(|s| !skipped(&snap, s) && !(untested && last_test(&snap, s.id).is_some()))
         .map(|s| {
-            let key = match health(&snap, s.id).and_then(|h| h.rating) {
+            let key = match rating_of(&snap, s.id) {
                 _ if Some(s.id) == selected => i64::MAX,
                 rating => rating.map_or(-1, i64::from),
             };
@@ -484,7 +530,7 @@ async fn check_all(cx: &Cx, untested: bool) -> Result<()> {
         let (cx, slots) = (cx.clone(), slots.clone());
         set.spawn(async move {
             let _slot = slots.acquire_owned().await;
-            (id, cx.call(CheckServer { id }).await)
+            (id, cx.call(TestServer { id }).await)
         });
     }
     let (mut checked, mut failures, mut done, mut answered) = (Vec::new(), 0, 0, 0);
@@ -502,12 +548,22 @@ async fn check_all(cx: &Cx, untested: bool) -> Result<()> {
         cx.progress(done, total);
     }
     if !checked.is_empty() {
+        // Tasks says what the pass found, not only that it ran.
+        cx.summary(match answered {
+            0 => "No server answered".to_owned(),
+            n => format!("{} of {} answered", n, checked.len()),
+        });
         info!(
-            "Tested {}: {answered} answer",
-            kit::plural(checked.len(), "server", "servers")
+            "Tested {}: {} answered",
+            kit::plural(checked.len(), "server", "servers"),
+            if answered == 0 {
+                "none".to_owned()
+            } else {
+                answered.to_string()
+            }
         );
     }
-    cx.emit(Checked { servers: checked });
+    cx.emit(Tested { servers: checked });
     if failures > 0 {
         bail!(
             "{} could not complete.",
@@ -517,42 +573,41 @@ async fn check_all(cx: &Cx, untested: bool) -> Result<()> {
     Ok(())
 }
 
-async fn check_all_servers(cx: Cx, _: CheckAll) -> Result<()> {
+async fn check_all_servers(cx: Cx, _: TestAll) -> Result<()> {
     /// Clears the flag however the pass ends: done, failed, cancelled or crashed.
     struct Pass(Cx);
     impl Drop for Pass {
         fn drop(&mut self) {
-            self.0.set_live(&CHECKING, false);
+            self.0.set_live(&TESTING, false);
         }
     }
-    cx.set_live(&CHECKING, true);
+    cx.set_live(&TESTING, true);
     let result = {
         let _pass = Pass(cx.clone());
         check_all(&cx, false).await
     };
     // Servers loaded while it ran: the loads saw a pass running and left them.
     let snap = cx.snapshot();
-    let untested = |s: &Server| !skipped(&snap, s) && health(&snap, s.id).is_none();
+    let untested = |s: &Server| !skipped(&snap, s) && last_test(&snap, s.id).is_none();
     // Not after Stop: that would test what the user just stopped.
     let stopped = result.as_ref().is_err_and(|e| e.cancelled());
     if !stopped && snap.get(&SERVERS).iter().any(untested) {
-        let _ = cx.spawn(CheckNew);
+        let _ = cx.spawn(TestNew);
     }
     result
 }
 
 pub(crate) fn register(p: &mut Setup) {
-    p.collection(&HEALTH);
-    p.editable_setting(&TESTING);
-    p.live(&CHECKING, || false);
+    p.collection(&RESULTS);
+    p.editable_setting(&TEST_SETTINGS);
+    p.live(&TESTING, || false);
     p.live(&IN_FLIGHT, Vec::new);
-    p.cascade(&SERVERS, &HEALTH, |h| h.id);
+    p.cascade(&SERVERS, &RESULTS, |h| h.id);
     p.handle(check_all_servers);
-    p.handle(|cx: Cx, _: CheckNew| async move { check_all(&cx, true).await });
+    p.handle(|cx: Cx, _: TestNew| async move { check_all(&cx, true).await });
     p.handle(check_server);
-    p.handle(quick_check);
-    p.handle(speed);
-    add_check::<Speed>(
+    p.handle(quick_test);
+    add_check(
         p,
         CheckSpec {
             id: "speed",
@@ -561,11 +616,12 @@ pub(crate) fn register(p: &mut Setup) {
             quick: false,
         },
         |_| true,
+        speed,
     );
     // New servers get a rating right away; a running Test all tests them when it ends.
     p.on(|cx: Cx, e: crate::ServersChanged| async move {
-        if !e.added.is_empty() && !*cx.live(&CHECKING) {
-            cx.spawn(CheckNew)?;
+        if !e.added.is_empty() && !*cx.live(&TESTING) {
+            cx.spawn(TestNew)?;
         }
         Ok(())
     });
@@ -574,17 +630,17 @@ pub(crate) fn register(p: &mut Setup) {
         // Nothing to test without servers.
         |s| {
             (!s.get(&SERVERS).is_empty())
-                .then(|| Duration::from_secs(s.get(&TESTING).check_secs.into()))
+                .then(|| Duration::from_secs(s.get(&TEST_SETTINGS).check_secs.into()))
         },
-        || CheckAll,
+        || TestAll,
     );
     p.hook(&crate::EXCLUDE, |snap, s| {
-        health(snap, s.id)?.unreachable().then(|| Exclusion {
-            reason: "Failed the last test".into(),
+        let h = last_test(snap, s.id).filter(|h| h.unreachable())?;
+        Some(Exclusion {
+            reason: h.failed_text(),
             group: "Failed",
             permanent: false,
         })
     });
-    p.hook(&crate::FREEZE, |snap, _| *snap.live(&CHECKING));
     view::register(p);
 }

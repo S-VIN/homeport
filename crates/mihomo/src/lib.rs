@@ -9,9 +9,9 @@ pub mod supervisor;
 pub use config::*;
 pub use ipnet;
 pub use process::{
-    ApplyReport, BINARY, CHECK_LANES, Connection, Connections, Controller, Delay, Metadata, Mihomo,
-    RuleSetStatus, bundled, bundled_version, executable, installed, installed_update,
-    installed_version_file, local_address, newer, version_of,
+    ApplyReport, BINARY, CHECK_LANES, Connection, Connections, Controller, Delay, LogLevel,
+    LogLine, LogStream, Metadata, Mihomo, RuleSetStatus, bundled, bundled_version, executable,
+    installed, installed_update, installed_version_file, local_address, newer, version_of,
 };
 
 #[cfg(windows)]

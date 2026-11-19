@@ -247,6 +247,12 @@ pub fn task_button(
     };
     let width = measure(ui, idle).max(measure(ui, &sample)).ceil();
     let response = match running {
+        // In a page header on a phone the icon alone, like [`tool_button`]s beside it.
+        None if compact_header(ui) => {
+            let r = Button::secondary("").icon(icon).enabled(enabled).show(ui);
+            r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, idle));
+            r.on_hover_text(idle)
+        }
         None => Button::secondary(idle)
             .icon(icon)
             .width(width)

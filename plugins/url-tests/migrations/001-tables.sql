@@ -1,0 +1,2 @@
+CREATE TABLE url_tests (id TEXT NOT NULL PRIMARY KEY, url TEXT NOT NULL, expected TEXT NOT NULL) STRICT;
+CREATE TABLE url_tests_results (id TEXT NOT NULL PRIMARY KEY, server TEXT NOT NULL, test TEXT NOT NULL, passed INT NOT NULL, delay_ms INT, failure TEXT) STRICT;

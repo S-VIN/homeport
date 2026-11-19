@@ -42,10 +42,10 @@ impl Ui {
         self.traffic();
         self.draw(events);
     }
-    /// Sample connections, when the Connections plugin runs.
+    /// Sample connections, when the Statistics plugin runs.
     fn traffic(&mut self) {
         let k = self.host.kernel();
-        if !k.plugins().iter().any(|p| p.id == "connections") {
+        if !k.plugins().iter().any(|p| p.id == "statistics") {
             return;
         }
         let servers = k.snapshot().get(&plugin_servers::SERVERS);
@@ -53,11 +53,15 @@ impl Ui {
             .first()
             .map(|s| s.id.to_string())
             .unwrap_or_else(|| "DIRECT".into());
-        k.cx_for("connections")
-            .update_live(&plugin_connections::TRAFFIC, |t| {
+        k.cx_for("statistics")
+            .update_live(&plugin_statistics::TRAFFIC, |t| {
                 t.online = !self.offline;
-                t.down_rate = if self.offline { 0 } else { 1_240_000 };
-                t.up_rate = if self.offline { 0 } else { 42_000 };
+                let rate = if self.offline {
+                    (0, 0)
+                } else {
+                    (1_240_000, 42_000)
+                };
+                t.speed = std::iter::repeat_n(rate, 30).collect();
                 t.down_total = 42_000_000;
                 t.up_total = 1_700_000;
                 t.conns = [
@@ -69,7 +73,7 @@ impl Ui {
                 ]
                 .iter()
                 .enumerate()
-                .map(|(i, host)| plugin_connections::Conn {
+                .map(|(i, host)| plugin_statistics::Conn {
                     id: i.to_string(),
                     target: format!("{host}:443"),
                     network: "TCP".into(),
@@ -284,7 +288,7 @@ async fn shell_navigation_connections_and_configuration_fit_supported_sizes() {
         .await
         .unwrap();
     let source = homeport_kernel::Id::random();
-    let proxies = plugin_subscriptions::formats::uri::parse_links("vless://00000000-0000-0000-0000-000000000001@example.org:443?security=tls#%F0%9F%87%AB%F0%9F%87%AE%20Helsinki%20%E2%9A%A1\nvless://00000000-0000-0000-0000-000000000002@example.net:443?security=tls#%F0%9F%87%A9%F0%9F%87%AA%20Frankfurt\nvless://00000000-0000-0000-0000-000000000003@example.com:443?security=tls#%F0%9F%9A%80%20A%20very%20long%20server%20name%20that%20must%20truncate").unwrap();
+    let proxies = plugin_subscriptions::formats::uri::parse_links("vless://00000000-0000-0000-0000-000000000001@example.org:443?security=tls#%F0%9F%87%AB%F0%9F%87%AE%20Helsinki%20%E2%9A%A1\nvless://00000000-0000-0000-0000-000000000002@example.net:443?security=tls#%F0%9F%87%A9%F0%9F%87%AA%20Frankfurt\nvless://00000000-0000-0000-0000-000000000003@example.com:443?security=tls#%F0%9F%9A%80%20A%20very%20long%20server%20name%20that%20must%20truncate").unwrap().proxies;
     host.kernel()
         .cx_for("servers")
         .call(plugin_servers::ReplaceFromSource {
@@ -303,13 +307,14 @@ async fn shell_navigation_connections_and_configuration_fit_supported_sizes() {
             }
             for page in [
                 "Servers",
-                "Connections",
+                "Statistics",
                 "Plugins",
                 "Settings",
                 "Subscriptions",
             ] {
                 ui.navigate(page);
-                if page == "Connections" {
+                if page == "Statistics" {
+                    ui.click("Connections");
                     let a = ui
                         .text("alpha.example:443")
                         .expect("first connection visible");
@@ -326,7 +331,7 @@ async fn shell_navigation_connections_and_configuration_fit_supported_sizes() {
                 if page == "Servers" {
                     // Added columns: the primary one always, secondary ones off a phone.
                     assert!(ui.text("Rating").is_some(), "{size:?}");
-                    assert_eq!(ui.text("Latency").is_some(), size[0] >= 480., "{size:?}");
+                    assert_eq!(ui.text("Latency").is_some(), size[0] >= 520., "{size:?}");
                 }
                 if page == "Settings" {
                     assert!(ui.text("Backups").is_none());
@@ -343,7 +348,8 @@ async fn shell_navigation_connections_and_configuration_fit_supported_sizes() {
                     ui.capture(Path::new(dir), page);
                 }
             }
-            ui.navigate("Connections");
+            ui.navigate("Statistics");
+            ui.click("Connections");
             ui.offline = true;
             ui.frame(vec![]);
             if let Some(dir) = &directory {
@@ -611,10 +617,10 @@ async fn popup_review_scenarios() {
                     "subscriptions"=>ui.navigate("Subscriptions"),
                     "plugins"=>ui.navigate("Plugins"),
                     "settings"=>ui.navigate("Settings"),
-                    "connections"=>ui.navigate("Connections"),
+                    "connections"=>{ui.navigate("Statistics");ui.click("Connections");},
                     "local-proxy"=>ui.navigate("Local proxy"),
                     "routing"=>ui.navigate("Routing"),
-                    "checks"=>ui.navigate("Tests"),
+                    "checks"=>ui.navigate("Test URLs"),
                     "deploy"=>ui.navigate("Install to server"),
                     "system-proxy-help"=>{ui.navigate("Local proxy");ui.reveal("System proxy");ui.hover("System proxy");},
                     "subscription-tooltip"=>{ui.navigate("Subscriptions");let label=if std::env::var_os("HOMEPORT_TEST_SUBSCRIPTION_URLS").is_some(){"allvsub.cc"}else{"Helsinki ⚡"}; if ui.text(label).is_some(){ui.hover(label);}else{continue;}},
@@ -692,16 +698,16 @@ async fn native_quit_is_explicit_and_recreated_windows_preserve_drafts() {
             ui.settle();
             ui.navigate("Settings");
             assert!(
-                ui.text("Quit homeport").is_none(),
+                ui.text("Quit Homeport").is_none(),
                 "web sessions cannot quit the host"
             );
             ui.session.set_exit_available(true);
             ui.settle();
-            ui.reveal("Quit homeport");
+            ui.reveal("Quit Homeport");
             if let Some(path) = std::env::var_os("HOMEPORT_CAPTURE_DIR") {
                 ui.capture(Path::new(&path), "Native-settings-quit");
             }
-            ui.click("Quit homeport");
+            ui.click("Quit Homeport");
             assert!(ui.session.take_exit_request());
             assert!(!ui.session.take_exit_request());
             assert!(
@@ -731,15 +737,16 @@ async fn native_quit_is_explicit_and_recreated_windows_preserve_drafts() {
 /// page, the status bar and the panels draw.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_page_draws_with_other_plugin_sets() {
-    const PAGES: [&str; 13] = [
+    const PAGES: [&str; 14] = [
         "Servers",
         "Subscriptions",
-        "Tests",
+        "Test URLs",
         "Exclude by name",
         "Routing",
-        "Connections",
+        "Statistics",
         "Logs",
         "Local proxy",
+        "DNS",
         "Chain exit",
         "VLESS inbound",
         "Install to server",

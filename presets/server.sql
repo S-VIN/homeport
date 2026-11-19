@@ -3,7 +3,6 @@
 
 INSERT INTO kernel_plugins (id, enabled) VALUES
   ('vless-inbound', 1),
-  ('connections', 1),
   ('logs', 1),
   ('statistics', 1);
 

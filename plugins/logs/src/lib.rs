@@ -3,7 +3,9 @@
 //! [`logging`] lines) and, like the Logs page of other Clash-family apps, what
 //! the core connected, refused or failed. Core connections are read only while
 //! a window or browser tab is open; warnings and errors always.
-use homeport_kernel::{core::Labels, kit, kit::theme, logging, prelude::*};
+mod ui;
+
+use homeport_kernel::{core::Labels, logging, mihomo, prelude::*};
 use std::time::Duration;
 
 pub static PLUGIN: Plugin = Plugin {
@@ -25,12 +27,12 @@ pub enum Level {
     Warning,
     Error,
 }
-impl Level {
-    fn of(kind: &str) -> Level {
-        match kind {
-            "warning" => Level::Warning,
-            "error" | "fatal" => Level::Error,
-            _ => Level::Info,
+impl From<mihomo::LogLevel> for Level {
+    fn from(level: mihomo::LogLevel) -> Self {
+        match level {
+            mihomo::LogLevel::Debug | mihomo::LogLevel::Info => Level::Info,
+            mihomo::LogLevel::Warning => Level::Warning,
+            mihomo::LogLevel::Error => Level::Error,
         }
     }
 }
@@ -59,18 +61,16 @@ impl Op for Clear {
 }
 
 /// One line of the stream; `None` for an info line nobody is reading.
-fn line(raw: &[u8], labels: &Labels, reading: bool) -> Option<Line> {
-    let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
-    let level = Level::of(v["type"].as_str().unwrap_or(""));
+fn line(raw: mihomo::LogLine, labels: &Labels, reading: bool) -> Option<Line> {
+    let level = Level::from(raw.level);
     if level == Level::Info && !reading {
         return None;
     }
-    let text = v["payload"].as_str().unwrap_or("");
     Some(Line {
         at: now(),
         level,
-        internal: internal(text),
-        text: readable(text, labels),
+        internal: internal(&raw.payload),
+        text: readable(&raw.payload, labels),
     })
 }
 
@@ -96,7 +96,7 @@ fn internal(text: &str) -> bool {
     };
     // `InName(checks-3)` splits in two.
     let pair = |p: &[&str]| match p[0] {
-        "using" | "dial" => p[1].starts_with("test-"),
+        "using" | "dial" => homeport_kernel::mihomo::config::internal_group(p[1]),
         "InName" => homeport_kernel::mihomo::config::internal_listener(p[1]),
         _ => false,
     };
@@ -177,21 +177,15 @@ fn publish(cx: &Cx, fresh: &mut Vec<Line>) {
 async fn follow(cx: Cx) -> Result<()> {
     let mut changes = cx.core().changes();
     loop {
-        if let Ok(mut stream) = cx.core().logs("info").await {
-            let (mut raw, mut fresh) = (Vec::new(), Vec::new());
+        if let Ok(mut stream) = cx.core().logs(mihomo::LogLevel::Info).await {
+            let mut fresh = Vec::new();
             let mut flush = tokio::time::interval(Duration::from_millis(250));
             flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
-                    chunk = stream.chunk() => {
-                        let Ok(Some(chunk)) = chunk else { break };
-                        // Bytes, not text: a character may span two chunks.
-                        raw.extend_from_slice(&chunk);
-                        let (labels, reading) = (cx.core().labels(), cx.ui_open());
-                        while let Some(end) = raw.iter().position(|b| *b == b'\n') {
-                            let bytes: Vec<u8> = raw.drain(..=end).collect();
-                            fresh.extend(line(&bytes, &labels, reading));
-                        }
+                    raw = stream.next() => {
+                        let Some(raw) = raw else { break };
+                        fresh.extend(line(raw, &cx.core().labels(), cx.ui_open()));
                         let over = fresh.len().saturating_sub(KEEP);
                         fresh.drain(..over);
                     }
@@ -239,284 +233,12 @@ fn setup(p: &mut Setup) -> Result<()> {
     });
     p.task("follow", follow);
     p.task("follow-app", follow_app);
-    p.page::<LogsPage>(PageSpec {
+    p.page::<ui::LogsPage>(PageSpec {
         title: "Logs",
         icon: Icon::Logs,
         order: 37,
     });
     Ok(())
-}
-
-/// Whose lines the page shows.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Source {
-    #[default]
-    All,
-    /// homeport and its plugins.
-    App,
-    /// mihomo.
-    Core,
-}
-
-/// What the page shows, kept per window: the lowest level, whose lines, and
-/// the core's lines from homeport's own work.
-#[derive(Default)]
-struct LogsPage {
-    min: Level,
-    source: Source,
-    all: bool,
-}
-impl Page for LogsPage {
-    fn ui(&mut self, ui: &mut egui::Ui, cx: &mut UiCx) {
-        page(ui, cx, self);
-    }
-}
-
-/// One line of either log, as the page draws it.
-struct Row<'a> {
-    at: u64,
-    level: Level,
-    /// The writing plugin of an app line; `None` for the core's.
-    source: Option<&'static str>,
-    text: &'a str,
-    count: u32,
-}
-fn app_level(level: logging::Level) -> Level {
-    match level {
-        logging::Level::Error => Level::Error,
-        logging::Level::Warn => Level::Warning,
-        _ => Level::Info,
-    }
-}
-
-fn page(ui: &mut egui::Ui, cx: &mut UiCx, view: &mut LogsPage) {
-    let (lines, app) = (cx.live(&LINES), cx.live(&APP));
-    let LogsPage { min, source, all } = *view;
-    let core = lines
-        .iter()
-        .filter(|l| source != Source::App && l.level >= min && (all || !l.internal))
-        .map(|l| Row {
-            at: l.at,
-            level: l.level,
-            source: None,
-            text: &l.text,
-            count: 1,
-        });
-    let own = app
-        .iter()
-        .filter(|e| source != Source::Core && app_level(e.level) >= min)
-        .map(|e| Row {
-            at: e.at,
-            level: app_level(e.level),
-            source: Some(e.source),
-            text: &e.text,
-            count: e.count,
-        });
-    let mut shown: Vec<Row> = core.chain(own).collect();
-    // Both logs are in time order: a stable sort interleaves them.
-    shown.sort_by_key(|r| r.at);
-    let counter = kit::count(shown.len(), "line", "lines");
-    let mut clear = false;
-    cx.page_header(ui, &counter, |ui, _| {
-        clear = kit::Button::secondary("Clear")
-            .icon(Icon::Delete)
-            .enabled(!lines.is_empty() || !app.is_empty())
-            .show(ui)
-            .clicked();
-    });
-    let options = [
-        (Level::Info, "All"),
-        (Level::Warning, "Warnings"),
-        (Level::Error, "Errors"),
-    ];
-    let sources = [
-        (Source::All, "All"),
-        (Source::App, "App"),
-        (Source::Core, "Core"),
-    ];
-    // What does not fit side by side goes to the next line.
-    ui.horizontal_wrapped(|ui| {
-        kit::segmented(ui, &mut view.min, &options);
-        ui.add_space(theme::SPACE_L);
-        kit::segmented(ui, &mut view.source, &sources);
-        if source != Source::App {
-            ui.add_space(theme::SPACE_L);
-            kit::toggle(ui, &mut view.all, "Server tests and reloads")
-                .on_hover_text("The core's lines from server tests and configuration reloads");
-        }
-    });
-    ui.add_space(theme::SPACE_M);
-    if clear {
-        cx.run(Clear);
-    }
-    // The core's lines from homeport's work the toggle hides at this level.
-    let hidden = lines
-        .iter()
-        .filter(|l| source != Source::App && l.level >= min && l.internal && !all)
-        .count();
-    let mut show_hidden = false;
-    kit::list_card(ui, |ui| {
-        if shown.is_empty() {
-            let title = match (min, source) {
-                _ if lines.is_empty() && app.is_empty() => "No log lines yet",
-                (Level::Info, Source::Core) => "No traffic lines",
-                (Level::Info, _) => "No log lines",
-                (Level::Warning, _) => "No warnings",
-                (Level::Error, _) => "No errors",
-            };
-            let next = match hidden {
-                0 if min > Level::Info => "Problems appear here when they happen.".to_owned(),
-                0 => "New lines appear here as homeport works.".to_owned(),
-                n => format!(
-                    "{} from server tests and reloads hidden.",
-                    kit::plural(n, "line", "lines")
-                ),
-            };
-            kit::empty_with(ui, Icon::Logs, title, &next);
-            if hidden > 0 {
-                ui.vertical_centered(|ui| {
-                    show_hidden = kit::Button::secondary("Show them").show(ui).clicked();
-                });
-                ui.add_space(theme::SPACE_XL);
-            }
-            return;
-        }
-        let pal = kit::colors(ui);
-        // The widest age, so every message starts at the same edge.
-        let font = egui::FontId::proportional(theme::SMALL);
-        let age_width = ui.fonts_mut(|f| {
-            f.layout_no_wrap("59\u{a0}min ago".into(), font.clone(), pal.muted)
-                .size()
-                .x
-        }) + theme::SPACE_S;
-        // Plugin names get a column of their own, so every message starts at one edge.
-        const SOURCE_MAX: f32 = 140.;
-        let source_width = ui.fonts_mut(|f| {
-            (shown.iter().filter_map(|r| r.source))
-                .map(|s| f.layout_no_wrap(s.into(), font.clone(), pal.muted).size().x)
-                .fold(0., f32::max)
-        });
-        let source_width = match source_width {
-            0. => 0.,
-            w => w.min(SOURCE_MAX) + theme::SPACE_M,
-        };
-        let phone = kit::phone(ui);
-        // The scroll edge keeps an inset from the card's border.
-        let inset = theme::INSET - theme::SPACE_S;
-        egui::Frame::NONE
-            .inner_margin(egui::Margin::symmetric(0, theme::SPACE_S as i8))
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("log-lines")
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        egui::Frame::NONE
-                            .inner_margin(egui::Margin::symmetric(inset as i8, 0))
-                            .show(ui, |ui| {
-                                ui.spacing_mut().item_spacing.y = theme::SPACE_XS;
-                                // An age shows once for its run of lines, and again on
-                                // the first visible line when its run starts above.
-                                let mut last_age = String::new();
-                                let mut age_visible = false;
-                                for l in shown {
-                                    let ink = match l.level {
-                                        Level::Info => pal.foreground,
-                                        Level::Warning => pal.warning,
-                                        Level::Error => pal.danger,
-                                    };
-                                    let age_text = kit::age(l.at);
-                                    // Mostly in view: a line cut at the top keeps its age.
-                                    let visible = ui.cursor().top() + theme::SMALL / 2.
-                                        >= ui.clip_rect().top();
-                                    let repeated =
-                                        age_text == last_age && (age_visible || !visible);
-                                    age_visible |= visible;
-                                    last_age = age_text.clone();
-                                    let age = egui::RichText::new(if repeated {
-                                        String::new()
-                                    } else {
-                                        age_text
-                                    })
-                                    .font(font.clone())
-                                    .color(pal.muted);
-                                    // Words wrap whole; one longer than the line breaks anywhere.
-                                    // An app line starts with its plugin and ends with its repeats.
-                                    let text = |width: f32, prefix: bool| {
-                                        let mut job = egui::text::LayoutJob::default();
-                                        job.wrap.max_width = width;
-                                        let format =
-                                            |color| egui::TextFormat::simple(font.clone(), color);
-                                        if let Some(source) = l.source.filter(|_| prefix) {
-                                            job.append(
-                                                &format!("{source}  "),
-                                                0.,
-                                                format(pal.muted),
-                                            );
-                                        }
-                                        job.append(l.text, 0., format(ink));
-                                        if l.count > 1 {
-                                            job.append(
-                                                &format!("  ×{}", l.count),
-                                                0.,
-                                                format(pal.muted),
-                                            );
-                                        }
-                                        job
-                                    };
-                                    if phone {
-                                        // The age on its own line gives the text the full width.
-                                        if !repeated {
-                                            ui.label(age);
-                                        }
-                                        kit::text_label(
-                                            ui,
-                                            text(ui.available_width(), true),
-                                            true,
-                                            false,
-                                        );
-                                        ui.add_space(theme::SPACE_S);
-                                        continue;
-                                    }
-                                    // Age on the left in the same type, so both share the
-                                    // first line; wrapped text keeps its own column.
-                                    ui.horizontal_top(|ui| {
-                                        ui.allocate_ui_with_layout(
-                                            egui::vec2(age_width, 0.),
-                                            egui::Layout::top_down(egui::Align::Min),
-                                            |ui| {
-                                                ui.set_width(age_width);
-                                                ui.label(age);
-                                            },
-                                        );
-                                        if source_width > 0. {
-                                            ui.allocate_ui_with_layout(
-                                                egui::vec2(source_width, 0.),
-                                                egui::Layout::top_down(egui::Align::Min),
-                                                |ui| {
-                                                    ui.set_width(source_width);
-                                                    let name = egui::RichText::new(
-                                                        l.source.unwrap_or_default(),
-                                                    )
-                                                    .font(font.clone())
-                                                    .color(pal.muted);
-                                                    ui.add(egui::Label::new(name).truncate());
-                                                },
-                                            );
-                                        }
-                                        kit::text_label(
-                                            ui,
-                                            text(ui.available_width(), false),
-                                            true,
-                                            false,
-                                        );
-                                    });
-                                }
-                            });
-                    });
-            });
-    });
-    view.all |= show_hidden;
 }
 
 #[cfg(test)]

@@ -7,15 +7,12 @@ use std::{marker::PhantomData, sync::Arc};
 /// window zones ([`crate::shell`]); plugins define zones on their own screens.
 pub struct Slot<P: 'static> {
     pub id: &'static str,
-    /// One line for documentation: where the zone is and what belongs there.
-    pub about: &'static str,
     _p: PhantomData<fn(&P)>,
 }
 impl<P> Slot<P> {
-    pub const fn new(id: &'static str, about: &'static str) -> Self {
+    pub const fn new(id: &'static str) -> Self {
         Self {
             id,
-            about,
             _p: PhantomData,
         }
     }

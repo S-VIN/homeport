@@ -161,6 +161,16 @@ pub(super) fn toast(
         })
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
+            // A plain confirmation ("Address copied") is one quiet line: the
+            // action that caused it is in sight, it leaves by itself.
+            if !n.error && action.is_none() && link.is_none() {
+                kit::row_line(ui, theme::CONTROL, |ui| {
+                    kit::icon(ui, icon, 16., tone);
+                    let text = if n.text.is_empty() { &n.title } else { &n.text };
+                    kit::truncated(ui, RichText::new(text).color(p.foreground), None);
+                });
+                return;
+            }
             kit::row_line(ui, theme::CONTROL, |ui| {
                 kit::icon(ui, icon, 16., tone);
                 let width = (ui.available_width() - theme::CONTROL - theme::HORIZONTAL_GAP).max(0.);

@@ -1,7 +1,7 @@
 //! UI side of a plugin: ordinary egui code with direct access to state and ops.
 //! The same code draws the desktop window and every browser session.
 mod list_editor;
-pub use list_editor::{Column, ListEditor};
+pub use list_editor::{Field, ListEditor};
 
 use crate::{Kernel, Op, Run, RunId, Snapshot, State, core::CoreStatus, kit::Icon, slot::Slot};
 use std::{
@@ -294,7 +294,7 @@ impl<'a> UiCx<'a> {
         )
     }
     /// The state of the op `O` submitted under `key`, with its reply
-    /// (`cx.request::<CheckServer>(key)`). It stays until the next submit; an
+    /// (`cx.request::<TestServer>(key)`). It stays until the next submit; an
     /// op that was overtaken (a stale result) leaves it `Idle`.
     pub fn request<O: crate::Op>(&self, key: impl Hash + std::fmt::Debug) -> Request<O::Reply>
     where

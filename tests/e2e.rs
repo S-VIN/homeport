@@ -1,10 +1,10 @@
 //! End-to-end tests with the bundled mihomo and local HTTP fixtures.
 use homeport_kernel::{Host, Id, Kernel, list::Add, list::Remove};
-use plugin_health_checks as health;
 use plugin_local_proxy::{PROXY, Proxy, SaveProxy};
 use plugin_routing::{RULES, Route, Rule};
 use plugin_servers::{SELECTED, SERVERS, Select};
 use plugin_subscriptions::{Parse, RefreshAll, SOURCES, Source};
+use plugin_url_tests as url_tests;
 use std::{
     sync::{
         Arc, RwLock,
@@ -140,18 +140,19 @@ async fn formats_are_claimed_by_their_plugins() {
         link.to_string(),
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(link),
     ] {
-        let p = parse(body).await.unwrap().pop().unwrap();
+        let p = parse(body).await.unwrap().proxies.pop().unwrap();
         assert_eq!(p.name, "West");
         assert_eq!(p.options["ws-opts"]["headers"]["Host"], "cdn.example");
     }
     let xray = r#"[{"remarks":"Lab","outbounds":[{"protocol":"freedom"},{"protocol":"shadowsocks","settings":{"servers":[{"address":"127.0.0.1","port":1234,"method":"aead_aes_128_gcm","password":"example","uot":true}]}}]},{"protocol":"hysteria","settings":{"address":"node","port":443,"version":2},"streamSettings":{"network":"hysteria","security":"tls","tlsSettings":{"serverName":"node"},"hysteriaSettings":{"auth":"example"},"finalmask":{"quicParams":{"brutalUp":100}}}}]"#;
-    let peers = parse(xray.into()).await.unwrap();
+    let peers = parse(xray.into()).await.unwrap().proxies;
     assert_eq!(peers.len(), 2);
     assert_eq!(peers[0].options["cipher"], "aes-128-gcm");
     let clash =
         parse("proxies:\n  - { name: a, type: http, server: localhost, port: 8080 }".into())
             .await
-            .unwrap();
+            .unwrap()
+            .proxies;
     assert_eq!(clash[0].server, "localhost");
     assert!(
         parse("proxies:\n  - { name: bad, type: http, server: localhost, port: 0 }".into())
@@ -159,7 +160,7 @@ async fn formats_are_claimed_by_their_plugins() {
             .is_err()
     );
     assert!(
-        parse("Cg==".into()).await.unwrap().is_empty(),
+        parse("Cg==".into()).await.unwrap().proxies.is_empty(),
         "Base64 of an empty document is an empty subscription"
     );
     for invalid in ["=", "====", "eA==", "not a subscription!"] {
@@ -184,7 +185,7 @@ async fn formats_are_claimed_by_their_plugins() {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(profile.to_string())
     );
     add(&key).await.unwrap();
-    let wg = parse(key).await.unwrap().pop().unwrap();
+    let wg = parse(key).await.unwrap().proxies.pop().unwrap();
     assert_eq!((wg.name.as_str(), wg.port), ("Office", 41820));
     assert_eq!(wg.options["amnezia-wg-option"]["jc"], 4);
     host.shutdown().await;
@@ -337,7 +338,7 @@ async fn real_core_refresh_select_route_listeners_and_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn health_checks_use_the_isolated_route() {
+async fn url_tests_use_the_isolated_route() {
     let dir = tempfile::tempdir().unwrap();
     let (host, inbound) = start(dir.path()).await;
     let k = host.kernel();
@@ -356,26 +357,26 @@ async fn health_checks_use_the_isolated_route() {
         .unwrap();
     until(&k, "servers", |k| !k.snapshot().get(&SERVERS).is_empty()).await;
     let server = k.snapshot().get(&SERVERS)[0].clone();
-    k.cx_for("health-checks")
+    k.cx_for("url-tests")
         .call(Add::new(
-            &health::TESTS,
-            health::Test {
+            &url_tests::TESTS,
+            url_tests::Test {
                 id: Id::random(),
                 url: format!("http://127.0.0.1:{origin}/generate_204"),
-                expected: health::Expected::NoContent,
+                expected: url_tests::Expected::NoContent,
             },
         ))
         .await
         .unwrap();
     let h = k
         .cx_for("servers")
-        .call(plugin_servers::CheckServer { id: server.id })
+        .call(plugin_servers::TestServer { id: server.id })
         .await
         .unwrap()
         .unwrap();
     assert!(h.ping_ms.is_some());
     assert!(h.rating.unwrap() > 0);
-    let results = k.snapshot().get(&health::RESULTS);
+    let results = k.snapshot().get(&url_tests::RESULTS);
     assert!(
         results.iter().all(|r| r.passed && r.server == server.id),
         "{results:?}"
@@ -393,7 +394,7 @@ async fn health_checks_use_the_isolated_route() {
         .await
         .unwrap();
     until(&k, "cascade", |k| {
-        k.snapshot().get(&plugin_servers::HEALTH).is_empty()
+        k.snapshot().get(&plugin_servers::RESULTS).is_empty()
     })
     .await;
     host.shutdown().await;
@@ -415,26 +416,27 @@ async fn tests_go_through_the_chain_exit() {
         .cx_for("subscriptions")
         .call(Parse { source, body })
         .await
-        .unwrap();
+        .unwrap()
+        .proxies;
     let replace = plugin_servers::ReplaceFromSource {
         source,
         proxies,
         guard: None,
     };
     k.cx_for("subscriptions").call(replace).await.unwrap();
-    k.cx_for("health-checks")
+    k.cx_for("url-tests")
         .call(Add::new(
-            &health::TESTS,
-            health::Test {
+            &url_tests::TESTS,
+            url_tests::Test {
                 id: Id::random(),
                 url: format!("http://127.0.0.1:{origin}/generate_204"),
-                expected: health::Expected::NoContent,
+                expected: url_tests::Expected::NoContent,
             },
         ))
         .await
         .unwrap();
     let id = k.snapshot().get(&SERVERS)[0].id;
-    let test = || k.cx_for("servers").call(plugin_servers::CheckServer { id });
+    let test = || k.cx_for("servers").call(plugin_servers::TestServer { id });
     assert!(
         test().await.unwrap().unwrap().rating.unwrap() > 0,
         "alone it works"
@@ -444,11 +446,7 @@ async fn tests_go_through_the_chain_exit() {
         "vless://5783a3e7-e373-51cd-8642-c83782b807c5@127.0.0.1:{}?type=tcp#Exit",
         free_port().await
     );
-    let exit = Exit {
-        id: Id::random(),
-        name: String::new(),
-        link,
-    };
+    let exit = Exit::new(link);
     k.cx_for("chain-exit")
         .call(Add::new(&EXITS, exit))
         .await
@@ -462,7 +460,7 @@ async fn tests_go_through_the_chain_exit() {
     let path = k.snapshot().first(&plugin_servers::TEST_PATH, &server);
     assert_eq!(path, Some(format!("via-{id}")));
     let h = test().await.unwrap().unwrap();
-    assert!(h.unreachable(), "through the dead exit: {h:?}");
+    assert!(h.ping_ms.is_none(), "through the dead exit: {h:?}");
     host.shutdown().await;
 }
 
@@ -503,7 +501,8 @@ async fn new_servers_of_every_subscription_are_tested() {
                 .cx_for("subscriptions")
                 .call(Parse { source, body })
                 .await
-                .unwrap();
+                .unwrap()
+                .proxies;
             k.cx_for("subscriptions")
                 .call(plugin_servers::ReplaceFromSource {
                     source,
@@ -516,16 +515,16 @@ async fn new_servers_of_every_subscription_are_tested() {
     };
     tokio::join!(load("First"), load("Second"));
     // A source that loads while a full pass runs is tested after it.
-    let pass = k.cx_for("servers").call(plugin_servers::CheckAll);
+    let pass = k.cx_for("servers").call(plugin_servers::TestAll);
     let (passed, ()) = tokio::join!(pass, load("Third"));
     passed.unwrap();
     until(&k, "every server tested", |k| {
         let snap = k.snapshot();
         let servers = snap.get(&SERVERS);
         servers.len() == 3
-            && servers
-                .iter()
-                .all(|s| plugin_servers::health(&snap, s.id).is_some_and(|h| h.checked.is_some()))
+            && servers.iter().all(|s| {
+                plugin_servers::last_test(&snap, s.id).is_some_and(|h| h.checked.is_some())
+            })
     })
     .await;
     host.shutdown().await;
@@ -545,7 +544,7 @@ async fn missing_dependencies_disable_dependents() {
         "vless-inbound requires routing"
     );
     // Tests and the chain only need servers.
-    assert!(ids.contains(&"health-checks") && ids.contains(&"chain-exit"));
+    assert!(ids.contains(&"url-tests") && ids.contains(&"chain-exit"));
     host.shutdown().await;
 }
 
@@ -578,19 +577,19 @@ async fn auto_select_picks_a_healthy_server_and_manual_choice_turns_it_off() {
             .unwrap()
             .id
     };
-    k.cx_for("health-checks")
+    k.cx_for("url-tests")
         .call(Add::new(
-            &health::TESTS,
-            health::Test {
+            &url_tests::TESTS,
+            url_tests::Test {
                 id: Id::random(),
                 url: format!("http://127.0.0.1:{origin}/"),
-                expected: health::Expected::NoContent,
+                expected: url_tests::Expected::NoContent,
             },
         ))
         .await
         .unwrap();
     k.cx_for("servers")
-        .call(plugin_servers::CheckAll)
+        .call(plugin_servers::TestAll)
         .await
         .unwrap();
     // A failed test only warns: the dead server can still be connected by
@@ -635,19 +634,19 @@ async fn auto_select_fails_over_when_the_connected_server_dies() {
         .await
         .unwrap();
     until(&k, "servers", |k| k.snapshot().get(&SERVERS).len() == 2).await;
-    k.cx_for("health-checks")
+    k.cx_for("url-tests")
         .call(Add::new(
-            &health::TESTS,
-            health::Test {
+            &url_tests::TESTS,
+            url_tests::Test {
                 id: Id::random(),
                 url: format!("http://127.0.0.1:{origin}/"),
-                expected: health::Expected::Success,
+                expected: url_tests::Expected::Success,
             },
         ))
         .await
         .unwrap();
     k.cx_for("servers")
-        .call(plugin_servers::CheckAll)
+        .call(plugin_servers::TestAll)
         .await
         .unwrap();
     k.cx_for("servers").call(SetAuto(true)).await.unwrap();

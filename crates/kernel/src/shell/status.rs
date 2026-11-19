@@ -3,6 +3,10 @@ use super::*;
 
 /// "Saving…" / "Saved ✓" after a change.
 pub(super) fn save_state(ui: &mut egui::Ui, cx: &mut UiCx, p: &kit::Palette) {
+    // On Plugins the header offers "Restart now" itself.
+    if cx.k.restart_pending() && cx.s.page == PLUGINS_PAGE {
+        return;
+    }
     if cx.k.restart_pending() {
         if kit::chip(
             ui,
@@ -56,7 +60,7 @@ pub(super) fn activity_button(
     };
     let ink = if a.running > 0 { p.accent } else { p.faint };
     let r = kit::chip(ui, Some(Lead::Icon(Icon::Tasks, ink)), text, &a.tip);
-    a.mark(ui, p, r.rect.left_center() + vec2(15., -5.));
+    a.mark(ui, p, r.rect.left_center() + vec2(19., -7.));
     if r.clicked() {
         a.toggle(cx);
     }
@@ -107,7 +111,9 @@ impl Activity {
     /// A dot on the icon while a failure waits to be seen.
     pub fn mark(&self, ui: &egui::Ui, p: &kit::Palette, at: egui::Pos2) {
         if self.unseen {
-            ui.painter().circle_filled(at, 3.5, p.danger);
+            // Ringed in the bar's color, so it never merges with the icon.
+            ui.painter().circle_filled(at, 4.5, p.background);
+            ui.painter().circle_filled(at, 3., p.warning);
         }
     }
     pub fn toggle(&self, cx: &mut UiCx) {
@@ -287,7 +293,7 @@ pub fn panel_title(ui: &mut egui::Ui, title: &str, right: impl FnOnce(&mut egui:
     ui.add_space(2.);
 }
 
-/// Panel title with an "Open" button that opens `plugin`'s page (hidden on that page).
+/// Panel title with an "Open <page>" button that opens `plugin`'s page (hidden on that page).
 pub fn panel_title_page(
     ui: &mut egui::Ui,
     cx: &mut UiCx,
@@ -295,9 +301,13 @@ pub fn panel_title_page(
     plugin: &'static crate::Plugin,
 ) {
     let mut open = false;
+    let page = (cx.k.reg.pages.iter())
+        .find(|e| cx.k.reg.plugins[e.plugin].id == plugin.id)
+        .map_or(plugin.name, |e| e.spec.title);
+    let label = format!("Open {page}");
     panel_title(ui, title, |ui| {
         if !cx.on_page(plugin) {
-            open = kit::Button::ghost("Open")
+            open = kit::Button::ghost(&label)
                 .tone(Tone::Accent)
                 .show(ui)
                 .clicked();

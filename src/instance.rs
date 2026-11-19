@@ -72,7 +72,7 @@ impl Instance {
                     }
                     if Instant::now() >= deadline {
                         return Err(io::Error::other(
-                            "homeport is already running but is not responding. It may still be starting or shutting down.",
+                            "Homeport is already running but is not responding. It may still be starting or shutting down.",
                         ));
                     }
                     std::thread::sleep(Duration::from_millis(80));

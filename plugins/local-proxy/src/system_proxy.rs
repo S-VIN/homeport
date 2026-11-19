@@ -354,7 +354,7 @@ mod platform {
     fn read_proxy(get: &str, service: &str) -> Result<Option<String>, String> {
         let raw = output("networksetup", &[get, service])?;
         if value(&raw, "Authenticated Proxy Enabled:") == "1" {
-            return Err("An authenticated system proxy is configured. Configure your apps to use an homeport proxy port directly to preserve its credentials.".into());
+            return Err("An authenticated system proxy is configured. Configure your apps to use a Homeport proxy port directly to preserve its credentials.".into());
         }
         let on = if value(&raw, "Enabled:") == "Yes" {
             "on"
