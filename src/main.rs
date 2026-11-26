@@ -24,7 +24,7 @@ use std::{sync::atomic::Ordering, time::Duration};
 
 type LaunchResult = Result<(), Box<dyn std::error::Error>>;
 
-const USAGE: &str = "Usage: homeport [desktop|background|web]";
+const USAGE: &str = "Usage: homeport [desktop|background|web|--version]";
 /// The profile folder instead of the user data directory (Docker, tests).
 const DATA_DIR_ENV: &str = "HOMEPORT_DATA_DIR";
 /// IP:PORT of the web UI; in desktop mode it serves the browser next to the window.
@@ -154,6 +154,12 @@ fn main() -> LaunchResult {
         [Some("desktop")] => (false, false),
         [Some("background")] => (false, true),
         [Some("web")] => (true, false),
+        // Read by install-to-server on the servers it manages.
+        [Some("--version")] => {
+            attach_console();
+            println!("homeport {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         _ => {
             attach_console();
             return Err(USAGE.into());

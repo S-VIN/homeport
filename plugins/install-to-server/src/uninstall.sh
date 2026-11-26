@@ -1,7 +1,7 @@
 # Removes homeport and what install.sh added to the server, as its manifest
-# lists it; what the server had before stays. Runs as root; the client puts
-# DEST (the installation it knows, also without a manifest), STAGE and HOME_DIR
-# (the home folder of the SSH login) in front.
+# lists it, and the panel file; what the server had before stays. Runs as
+# root; the client puts DEST (the installation it knows, also without a
+# manifest), STAGE and HOME_DIR (the home folder of the SSH login) in front.
 # The client reads "::step::" and "::error::" lines like install.sh's.
 #
 # Every step may run again: a failed or interrupted run is finished by the next.
@@ -60,6 +60,7 @@ step 'Removing the installation folder'
   d=$folder
   while rmdir -- "$d" 2>/dev/null && [ "$d" != "$created" ]; do d=$(dirname "$d"); done
 done
+rm -f -- "$HOME_DIR/homeport-panel.txt"
 for d in /tmp/homeport-install.*; do
   if [ "$d" != "$STAGE" ] && [ -d "$d" ]; then rm -rf -- "$d"; fi
 done

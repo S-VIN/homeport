@@ -1,1 +1,1 @@
-CREATE TABLE install_to_server_deployments (id TEXT NOT NULL PRIMARY KEY, host TEXT NOT NULL, ssh_port INT NOT NULL, ssh_login TEXT NOT NULL, directory TEXT NOT NULL, panel TEXT NOT NULL, login TEXT NOT NULL, password TEXT NOT NULL, ready INT NOT NULL) STRICT;
+CREATE TABLE install_to_server_servers (id TEXT NOT NULL PRIMARY KEY, host TEXT NOT NULL, ssh_port INT NOT NULL, ssh_login TEXT NOT NULL, system TEXT NOT NULL, sudo_password INT NOT NULL, panel TEXT NOT NULL, login TEXT NOT NULL, password TEXT NOT NULL, directory TEXT NOT NULL, ready INT NOT NULL) STRICT;

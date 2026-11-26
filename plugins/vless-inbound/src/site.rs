@@ -11,7 +11,10 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::Full;
 use hyper::{Request, Response, StatusCode, body::Incoming, header};
-use hyper_util::{rt::TokioExecutor, rt::TokioIo, server::conn::auto};
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo, TokioTimer},
+    server::conn::auto,
+};
 use rustls_acme::{
     AcmeConfig, EventOk, ResolvesServerCertAcme,
     caches::DirCache,
@@ -23,8 +26,8 @@ use rustls_acme::{
         sign::CertifiedKey,
     },
 };
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
-use tokio::net::TcpListener;
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use tokio::{net::TcpListener, time::timeout};
 
 /// What the site needs; a change restarts it.
 #[derive(Clone, Debug, PartialEq)]
@@ -154,12 +157,20 @@ pub async fn run(
     Ok(())
 }
 
+/// Limits that keep abandoned connections (scanners, probes relayed by mihomo)
+/// from holding file descriptors forever.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Waiting for a request's headers, including idle keep-alive between requests.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Any connection, also an idle HTTP/2 one, is closed after this.
+const CONNECTION_LIFETIME: Duration = Duration::from_secs(300);
+
 async fn serve(listener: TcpListener, tls: Option<tokio_rustls::TlsAcceptor>, domain: String) {
     let domain: Arc<str> = domain.into();
     loop {
         let Ok((tcp, _)) = listener.accept().await else {
             // E.g. out of file descriptors: back off instead of spinning.
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
         let (tls, domain) = (tls.clone(), domain.clone());
@@ -169,20 +180,29 @@ async fn serve(listener: TcpListener, tls: Option<tokio_rustls::TlsAcceptor>, do
                 let domain = domain.clone();
                 async move { Ok::<_, std::convert::Infallible>(respond(&req, &domain, secure)) }
             });
-            let builder = auto::Builder::new(TokioExecutor::new());
-            match tls {
-                Some(tls) => {
-                    // ACME validation connections end after the handshake; that is fine.
-                    if let Ok(stream) = tls.accept(tcp).await {
+            let mut builder = auto::Builder::new(TokioExecutor::new());
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(HEADER_TIMEOUT);
+            let connection = async {
+                match tls {
+                    Some(tls) => {
+                        // ACME validation connections end after the handshake; that is fine.
+                        let Ok(Ok(stream)) = timeout(HANDSHAKE_TIMEOUT, tls.accept(tcp)).await
+                        else {
+                            return;
+                        };
                         let _ = builder
                             .serve_connection(TokioIo::new(stream), service)
                             .await;
                     }
+                    None => {
+                        let _ = builder.serve_connection(TokioIo::new(tcp), service).await;
+                    }
                 }
-                None => {
-                    let _ = builder.serve_connection(TokioIo::new(tcp), service).await;
-                }
-            }
+            };
+            let _ = timeout(CONNECTION_LIFETIME, connection).await;
         });
     }
 }
@@ -326,6 +346,39 @@ fn not_found() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A probe that connects and never sends a TLS hello must not hold a file
+    /// descriptor forever (the server ran out of them in production).
+    #[tokio::test]
+    async fn a_silent_connection_is_closed_after_the_handshake_timeout() {
+        use tokio::io::AsyncReadExt;
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let spec = super::Spec {
+            domain: "node.test".into(),
+            port,
+            acme: false,
+            contact: None,
+            cache: std::env::temp_dir(),
+            redirect_http: false,
+        };
+        tokio::spawn(super::run(spec, |_| {}));
+        let mut tcp = loop {
+            match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(tcp) => break tcp,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        };
+        let limit = super::HANDSHAKE_TIMEOUT + std::time::Duration::from_secs(5);
+        let read = tokio::time::timeout(limit, tcp.read(&mut [0; 1])).await;
+        assert!(
+            matches!(read, Ok(Ok(0) | Err(_))),
+            "the site keeps an idle connection open: {read:?}"
+        );
+    }
+
     #[test]
     fn the_home_page_lists_ten_jokes_and_can_add_more() {
         let page = super::home("node.example.com");

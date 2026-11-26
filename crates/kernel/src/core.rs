@@ -396,6 +396,11 @@ impl CoreApi {
     /// Route a free check lane to `target` until the lease is released
     /// (waits while every lane is in use).
     pub async fn lease(&self, target: Target) -> Result<Lease> {
+        // Placeholder until routing hands out the lane's client; built before the
+        // lane is taken so a failure (e.g. out of file descriptors) is just an error.
+        let http = crate::mihomo::http()
+            .build()
+            .map_err(|e| Error::msg(format!("Cannot create an HTTP client: {e}")))?;
         let permit = self
             .core
             .lanes
@@ -414,7 +419,7 @@ impl CoreApi {
         // caller giving up while routing) resets and returns the lane.
         let mut lease = Lease {
             core: self.core.clone(),
-            http: crate::mihomo::http().build().expect("an HTTP client"),
+            http,
             lane,
             permit: Some(permit),
         };

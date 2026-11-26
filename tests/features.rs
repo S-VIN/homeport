@@ -315,69 +315,100 @@ async fn failed_tunnel_authorization_keeps_the_saved_setting_and_proxy() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_server_installation_that_cannot_start_explains_why_and_saves_nothing() {
-    use plugin_install_to_server::{DEPLOYMENTS, Install, PROGRESS, Status, deploy::Options};
+async fn connecting_a_server_that_cannot_be_reached_explains_why_and_saves_nothing() {
+    use plugin_install_to_server::{ACTIVITY, Connect, SERVERS, Status, deploy::Access};
     let dir = tempfile::tempdir().unwrap();
     let host = start(dir.path()).await;
     let k = host.kernel();
     let cx = k.cx_for("install-to-server");
-    let error = cx.call(Install(Options::default())).await.unwrap_err();
+    let error = cx.call(Connect(Access::default())).await.unwrap_err();
     assert_eq!(error.message, "Enter the server address.");
     // A port nothing listens on: SSH is unreachable.
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let options = Options {
+    let access = Access {
         host: "127.0.0.1".into(),
         ssh_port: closed.local_addr().unwrap().port(),
         password: "secret".into(),
-        ..Options::default()
+        ..Access::default()
     };
     drop(closed);
-    let error = cx.call(Install(options)).await.unwrap_err();
+    let error = cx.call(Connect(access)).await.unwrap_err();
     assert!(
         error.message.contains("does not answer over SSH"),
         "{error}"
     );
-    assert_eq!(*k.snapshot().live(&PROGRESS), Status::Failed(error.message));
-    assert!(k.snapshot().get(&DEPLOYMENTS).is_empty());
+    let activity = k.snapshot().live(&ACTIVITY);
+    assert_eq!(
+        (activity.server, &activity.status),
+        (None, &Status::Failed(error.message))
+    );
+    assert!(k.snapshot().get(&SERVERS).is_empty());
     host.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn uninstalling_from_an_unreachable_server_keeps_its_record() {
-    use plugin_install_to_server::{DEPLOYMENTS, Deployment, REMOVAL, Status, Uninstall};
+async fn actions_on_an_unreachable_server_keep_its_card() {
+    use plugin_install_to_server::{
+        ACTIVITY, Clean, Install, Logs, Restart, SERVERS, Server, Status, deploy::Settings,
+    };
     let dir = tempfile::tempdir().unwrap();
     let host = start(dir.path()).await;
     let k = host.kernel();
     let cx = k.cx_for("install-to-server");
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let record = Deployment {
+    let record = Server {
         id: Id::random(),
         host: "127.0.0.1".into(),
         ssh_port: closed.local_addr().unwrap().port(),
         ssh_login: "root".into(),
-        directory: "/root/homeport".into(),
+        system: "Debian GNU/Linux 13 on x86_64".into(),
+        sudo_password: false,
         panel: "https://panel.example.com:8443".into(),
         login: "admin".into(),
         password: "panel".into(),
+        directory: "/root/homeport".into(),
         ready: true,
     };
     drop(closed);
-    cx.call(Add::new(&DEPLOYMENTS, record.clone()))
-        .await
-        .unwrap();
-    let uninstall = |password: &str| Uninstall {
-        id: record.id,
-        login: "root".into(),
-        password: password.into(),
-    };
-    let error = cx.call(uninstall("")).await.unwrap_err();
-    assert_eq!(error.message, "Enter the SSH login and password.");
-    let error = cx.call(uninstall("secret")).await.unwrap_err();
-    assert!(
-        error.message.contains("does not answer over SSH"),
-        "{error}"
-    );
-    assert_eq!(*k.snapshot().live(&REMOVAL), Status::Failed(error.message));
-    assert_eq!(*k.snapshot().get(&DEPLOYMENTS), vec![record]);
+    cx.call(Add::new(&SERVERS, record.clone())).await.unwrap();
+    let id = record.id;
+    let settings = Settings::default();
+    let errors = [
+        cx.call(Clean {
+            id,
+            sudo: String::new(),
+        })
+        .await,
+        cx.call(Restart {
+            id,
+            sudo: String::new(),
+        })
+        .await,
+        cx.call(Logs {
+            id,
+            sudo: String::new(),
+        })
+        .await,
+        cx.call(Install {
+            id,
+            settings,
+            sudo: String::new(),
+        })
+        .await,
+    ];
+    for error in errors {
+        let error = error.unwrap_err();
+        assert!(
+            error.message.contains("does not answer over SSH"),
+            "{error}"
+        );
+        let activity = k.snapshot().live(&ACTIVITY);
+        assert_eq!(activity.server, Some(id));
+    }
+    assert!(matches!(
+        k.snapshot().live(&ACTIVITY).status,
+        Status::Failed(_)
+    ));
+    assert_eq!(*k.snapshot().get(&SERVERS), vec![record]);
     host.shutdown().await;
 }
